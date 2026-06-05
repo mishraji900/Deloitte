@@ -1,9 +1,22 @@
 # =============================================================================
 # JE Matching Pipeline — Databricks PySpark Serverless
 # Primary Key : Company Description || Vendor Number
-# Fix applied : iterative passes use amount_diff >= 0 (not <= 1)
-#               so a credit of -300 correctly matches sales of +300
-#               even when other sales (+500, +200) exist in the same PK group
+#
+# KEY CHANGE vs previous version
+# ───────────────────────────────
+# Each match step (5, 6, 7, 8) now runs EXHAUSTIVELY inside a loop:
+#
+#   Iteration 1 → find pairs → extract → remove from working set
+#   Iteration 2 → find pairs on remainder → extract → remove
+#   ...
+#   Iteration N → zero new pairs found → exit loop, move to next step
+#
+# All pairs collected across iterations of one step are unioned into
+# that step's output dataset before moving on.
+#
+# This ensures e.g. A(sale) A(sale) B(sale) A(credit) correctly yields
+# one matched pair per iteration until credits are exhausted, rather than
+# stopping after the first pass.
 # =============================================================================
 
 from pyspark.sql import functions as F, Window
@@ -40,9 +53,9 @@ def materialize_df(df, name, repartition_key=None, num_partitions=NUM_PARTITIONS
 
 def debug_count(label, df):
     if df is not None:
-        print(f"  [COUNT] {label:<50} {df.count():>10,}")
+        print(f"  [COUNT] {label:<55} {df.count():>10,}")
     else:
-        print(f"  [COUNT] {label:<50}       None")
+        print(f"  [COUNT] {label:<55}       None")
 
 
 def debug_group_count(df, col_name, label, limit=20):
@@ -102,28 +115,24 @@ def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df, name):
 
 
 # =============================================================================
-# CORE MATCHING FUNCTION
+# CORE SINGLE-PASS MATCHING FUNCTION
 #
-# HOW PAIRWISE MATCHING WORKS HERE
-# ─────────────────────────────────
+# HOW PAIRWISE MATCHING WORKS
+# ────────────────────────────
 # The join produces one row per (sales_row, credit_row) combination inside
-# each primary_key group — it is already pairwise.
-#
-# Example after join:
-#   sales A (+500)  × credit X (-300)  → amount_diff = 200
-#   sales B (+300)  × credit X (-300)  → amount_diff = 0    ← best for X
-#   sales C (+200)  × credit X (-300)  → amount_diff = 100
+# each primary_key group — already pairwise.
 #
 # Step 1 (w_sales)  : for each sales row, pick the credit that minimises diff
 # Step 2 (w_credit) : for each credit row, among sales rows that picked it,
-#                     keep only the best sales row → enforces 1-to-1
-#
-# So credit X is matched to sales B (diff=0), regardless of A and C existing.
+#                     keep only the best sales → enforces 1-to-1
 # =============================================================================
 
 def rank_based_match(sales_df, credit_df, condition_fn, match_label):
-    print(f"\n[MATCH] {match_label}")
-
+    """
+    Single pass: find the best 1-to-1 pairs given condition_fn.
+    Returns (pairs_df | None, remaining_sales_df, remaining_credit_df).
+    Does NOT loop — looping is handled by exhaustive_match below.
+    """
     candidates_joined = (
         sales_df.alias("s")
         .join(credit_df.alias("c"), on="primary_key", how="inner")
@@ -140,7 +149,6 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
 
     # Cheap existence check — limit(1) avoids full scan
     if candidates.limit(1).count() == 0:
-        print(f"  [{match_label}] No qualifying pairs.")
         return None, sales_df, credit_df
 
     # ── Step 1: best credit for each sales row ─────────────────────────────
@@ -157,7 +165,7 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
         .filter(F.col("rn_sales") == 1)
     )
 
-    # ── Step 2: best sales row for each credit row (enforces 1-to-1) ───────
+    # ── Step 2: best sales for each credit row (enforces 1-to-1) ───────────
     w_credit = Window.partitionBy("primary_key", "c.credit_row_id").orderBy(
         F.col("amount_diff").asc(),
         F.col("month_lag").asc(),
@@ -188,12 +196,11 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
     )
 
     if confirmed_pairs.limit(1).count() == 0:
-        print(f"  [{match_label}] No 1-to-1 pairs after ranking.")
         return None, sales_df, credit_df
 
     # Materialise to break lineage before anti-joins
     confirmed_pairs = materialize_df(
-        confirmed_pairs, f"matched_{match_label}", "primary_key"
+        confirmed_pairs, f"matched_{match_label}_iter", "primary_key"
     )
 
     matched_s_ids = confirmed_pairs.select("sales_row_id").distinct()
@@ -202,11 +209,87 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
     remaining_sales  = sales_df.join(matched_s_ids,  on="sales_row_id",  how="left_anti")
     remaining_credit = credit_df.join(matched_c_ids, on="credit_row_id", how="left_anti")
 
-    debug_count(f"{match_label} - confirmed pairs", confirmed_pairs)
-    debug_count(f"{match_label} - remaining sales",  remaining_sales)
-    debug_count(f"{match_label} - remaining credit", remaining_credit)
+    remaining_sales  = materialize_df(remaining_sales,  f"rem_s_{match_label}_iter", "primary_key")
+    remaining_credit = materialize_df(remaining_credit, f"rem_c_{match_label}_iter", "primary_key")
 
     return confirmed_pairs, remaining_sales, remaining_credit
+
+
+# =============================================================================
+# EXHAUSTIVE MATCH — loops rank_based_match until no new pairs are found
+#
+# BEHAVIOUR
+# ─────────
+# Iteration 1: finds pairs P1, removes them → remainder R1
+# Iteration 2: finds pairs P2 from R1, removes them → remainder R2
+# ...
+# Iteration N: finds zero pairs → exit
+#
+# Final output dataset = union(P1, P2, ... P_{N-1})
+# Final remainders     = R_{N-1}  (passed to next step)
+#
+# Each iteration materialises pairs + remainders to disk so Spark's
+# lineage graph never grows beyond a single hop — safe at 1M+ rows.
+# =============================================================================
+
+def exhaustive_match(sales_df, credit_df, condition_fn, match_label):
+    print(f"\n[EXHAUSTIVE MATCH] {match_label}")
+
+    accumulated_pairs = []   # list of DataFrames, one per successful iteration
+    current_sales  = sales_df
+    current_credit = credit_df
+    iteration      = 0
+
+    while True:
+        iteration += 1
+        iter_label = f"{match_label}_i{iteration}"
+        print(f"  [{match_label}] Iteration {iteration} ...")
+
+        pairs, rem_sales, rem_credit = rank_based_match(
+            current_sales,
+            current_credit,
+            condition_fn,
+            iter_label,
+        )
+
+        if pairs is None:
+            # Zero new pairs — this step is exhausted
+            print(f"  [{match_label}] No pairs found at iteration {iteration}. Exiting loop.")
+            break
+
+        pair_count = pairs.count()
+        print(f"  [{match_label}] Iteration {iteration}: {pair_count:,} pairs found.")
+
+        if pair_count == 0:
+            # Defensive: pairs df exists but is empty
+            break
+
+        # Relabel match_type to the step label (strip the _iN suffix for output)
+        pairs = pairs.withColumn("match_type", F.lit(match_label))
+        pairs = materialize_df(pairs, f"pairs_{iter_label}", "primary_key")
+
+        accumulated_pairs.append(pairs)
+        current_sales  = rem_sales
+        current_credit = rem_credit
+
+    # ── Union all iterations into one output dataset ────────────────────────
+    if not accumulated_pairs:
+        print(f"  [{match_label}] Total pairs: 0")
+        return None, sales_df, credit_df
+
+    all_pairs = accumulated_pairs[0]
+    for p in accumulated_pairs[1:]:
+        all_pairs = all_pairs.unionByName(p)
+
+    # Final materialise of the unioned pairs
+    all_pairs = materialize_df(all_pairs, f"ALL_PAIRS_{match_label}", "primary_key")
+
+    total = all_pairs.count()
+    print(f"  [{match_label}] Total pairs across {iteration - 1} iteration(s): {total:,}")
+    print(f"  [{match_label}] Remaining sales : {current_sales.count():,}")
+    print(f"  [{match_label}] Remaining credit: {current_credit.count():,}")
+
+    return all_pairs, current_sales, current_credit
 
 
 # =============================================================================
@@ -285,20 +368,16 @@ pk_window = Window.partitionBy("primary_key")
 je_prep_counted        = je_prep.withColumn("pk_row_count", F.count("*").over(pk_window))
 exact_ref_pool_counted = exact_ref_pool.withColumn("pk_row_count", F.count("*").over(pk_window))
 
-# ── Unique PK rows ─────────────────────────────────────────────────────────
+# ── Unique PK rows ──────────────────────────────────────────────────────────
 unique_pk = je_prep_counted.filter(F.col("pk_row_count") == 1)
 
-DATASET_1_OTHER_UNIQUE_PK = unique_pk.filter(
+DATASET_1_OTHER_UNIQUE_PK            = unique_pk.filter(
     ~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")
 )
-DATASET_2A_UNIQUE_PK_SALES_INVOICES = unique_pk.filter(
-    F.col("cat_clean") == "SALES INVOICES"
-)
-DATASET_2B_UNIQUE_PK_CREDIT_MEMOS = unique_pk.filter(
-    F.col("cat_clean") == "CREDIT MEMOS"
-)
+DATASET_2A_UNIQUE_PK_SALES_INVOICES  = unique_pk.filter(F.col("cat_clean") == "SALES INVOICES")
+DATASET_2B_UNIQUE_PK_CREDIT_MEMOS    = unique_pk.filter(F.col("cat_clean") == "CREDIT MEMOS")
 
-# ── Duplicate PK — full population (for iterative passes) ─────────────────
+# ── Duplicate PK — full population (for iterative passes) ──────────────────
 duplicate_pk_groups_all = (
     je_prep_counted
     .filter(F.col("pk_row_count") > 1)
@@ -306,7 +385,7 @@ duplicate_pk_groups_all = (
     .filter(F.col("usd_net_dec") != 0)
 )
 
-# ── Duplicate PK — exact-ref population (for exact passes only) ───────────
+# ── Duplicate PK — exact-ref population (for exact passes only) ────────────
 duplicate_pk_groups_exact = (
     exact_ref_pool_counted
     .filter(F.col("pk_row_count") > 1)
@@ -314,11 +393,11 @@ duplicate_pk_groups_exact = (
     .filter(F.col("usd_net_dec") != 0)
 )
 
-DATASET_1_OTHER_UNIQUE_PK           = materialize_df(DATASET_1_OTHER_UNIQUE_PK,          "DATASET_1_OTHER_UNIQUE_PK",          "primary_key")
-DATASET_2A_UNIQUE_PK_SALES_INVOICES = materialize_df(DATASET_2A_UNIQUE_PK_SALES_INVOICES,"DATASET_2A_UNIQUE_PK_SALES_INVOICES", "primary_key")
-DATASET_2B_UNIQUE_PK_CREDIT_MEMOS   = materialize_df(DATASET_2B_UNIQUE_PK_CREDIT_MEMOS,  "DATASET_2B_UNIQUE_PK_CREDIT_MEMOS",   "primary_key")
-duplicate_pk_groups_all             = materialize_df(duplicate_pk_groups_all,             "duplicate_pk_groups_all",             "primary_key")
-duplicate_pk_groups_exact           = materialize_df(duplicate_pk_groups_exact,           "duplicate_pk_groups_exact",           "primary_key")
+DATASET_1_OTHER_UNIQUE_PK           = materialize_df(DATASET_1_OTHER_UNIQUE_PK,           "DATASET_1_OTHER_UNIQUE_PK",           "primary_key")
+DATASET_2A_UNIQUE_PK_SALES_INVOICES = materialize_df(DATASET_2A_UNIQUE_PK_SALES_INVOICES,  "DATASET_2A_UNIQUE_PK_SALES_INVOICES",  "primary_key")
+DATASET_2B_UNIQUE_PK_CREDIT_MEMOS   = materialize_df(DATASET_2B_UNIQUE_PK_CREDIT_MEMOS,    "DATASET_2B_UNIQUE_PK_CREDIT_MEMOS",    "primary_key")
+duplicate_pk_groups_all             = materialize_df(duplicate_pk_groups_all,              "duplicate_pk_groups_all",              "primary_key")
+duplicate_pk_groups_exact           = materialize_df(duplicate_pk_groups_exact,            "duplicate_pk_groups_exact",            "primary_key")
 
 debug_count("duplicate_pk_groups_all",   duplicate_pk_groups_all)
 debug_count("duplicate_pk_groups_exact", duplicate_pk_groups_exact)
@@ -372,22 +451,21 @@ credit_exact = materialize_df(
     "credit_exact", "primary_key"
 )
 
-debug_count("sales_all",   sales_all)
-debug_count("credit_all",  credit_all)
-debug_count("sales_exact", sales_exact)
-debug_count("credit_exact",credit_exact)
+debug_count("sales_all",    sales_all)
+debug_count("credit_all",   credit_all)
+debug_count("sales_exact",  sales_exact)
+debug_count("credit_exact", credit_exact)
 
 
 # =============================================================================
-# STEP 5 — NEXT-MONTH EXACT MATCH
-# Conditions: month_lag=1, eff_dt order respected, amount_diff <= 1
-# Invoice ref match is implicit because both sides come from exact_ref_pool
-# (rows with non-blank invoice refs under same PK will naturally pair on ref
-#  via the amount+date tiebreak — if you want hard ref equality add it below)
+# STEP 5 — NEXT-MONTH EXACT MATCH  (exhaustive loop)
+#
+# Conditions : month_lag = 1, eff_dt order respected, amount_diff <= 1
+# Loops until no new pairs are found within these conditions.
 # =============================================================================
-print("\n[STEP 5] Next-month exact match...")
+print("\n[STEP 5] Next-month exact match (exhaustive)...")
 
-DATASET_3_1_NEXT_MONTH_MATCHES, rem_sales_exact_1, rem_credit_exact_1 = rank_based_match(
+DATASET_3_1_NEXT_MONTH_MATCHES, rem_sales_exact_1, rem_credit_exact_1 = exhaustive_match(
     sales_exact,
     credit_exact,
     condition_fn=lambda df: df.filter(
@@ -403,12 +481,13 @@ rem_credit_exact_1 = materialize_df(rem_credit_exact_1, "rem_credit_exact_1", "p
 
 
 # =============================================================================
-# STEP 6 — SAME-MONTH EXACT MATCH
-# Conditions: month_lag=0, eff_dt order respected, amount_diff <= 1
+# STEP 6 — SAME-MONTH EXACT MATCH  (exhaustive loop)
+#
+# Conditions : month_lag = 0, eff_dt order respected, amount_diff <= 1
 # =============================================================================
-print("\n[STEP 6] Same-month exact match...")
+print("\n[STEP 6] Same-month exact match (exhaustive)...")
 
-DATASET_3_2T_SAME_MONTH_MATCHES, rem_sales_exact_2, rem_credit_exact_2 = rank_based_match(
+DATASET_3_2T_SAME_MONTH_MATCHES, rem_sales_exact_2, rem_credit_exact_2 = exhaustive_match(
     rem_sales_exact_1,
     rem_credit_exact_1,
     condition_fn=lambda df: df.filter(
@@ -427,7 +506,7 @@ rem_credit_exact_2 = materialize_df(rem_credit_exact_2, "rem_credit_exact_2", "p
 # STEP 6B — CARRY EXACT-MATCH RESULTS BACK TO FULL POPULATION
 #
 # Exact passes ran on the exact_ref sub-population.
-# Before iterative passes, remove those matched IDs from sales_all/credit_all
+# Remove those matched IDs from sales_all / credit_all before iterative passes
 # so the same rows are never matched twice.
 # =============================================================================
 print("\n[STEP 6B] Removing exact-match IDs from full population...")
@@ -446,7 +525,7 @@ if matched_dfs:
     exact_s_ids = exact_s_ids.distinct()
     exact_c_ids = exact_c_ids.distinct()
 
-    sales_for_iter  = sales_all.join(exact_s_ids,  on="sales_row_id",  how="left_anti")
+    sales_for_iter  = sales_all.join(exact_s_ids, on="sales_row_id",  how="left_anti")
     credit_for_iter = credit_all.join(exact_c_ids, on="credit_row_id", how="left_anti")
 else:
     sales_for_iter  = sales_all
@@ -458,7 +537,7 @@ credit_for_iter = materialize_df(credit_for_iter, "credit_for_iter", "primary_ke
 debug_count("sales_for_iter  (into iterative passes)", sales_for_iter)
 debug_count("credit_for_iter (into iterative passes)", credit_for_iter)
 
-# Snapshot of what's unmatched after exact passes
+# Snapshot of unmatched after exact passes
 DATASET_3_2_REMAIN_UNMATCHED_GROUPS = build_unmatched_rows(
     duplicate_pk_groups_all,
     sales_for_iter,
@@ -468,32 +547,20 @@ DATASET_3_2_REMAIN_UNMATCHED_GROUPS = build_unmatched_rows(
 
 
 # =============================================================================
-# STEP 7 — LAG 1-TO-2 MONTH ITERATIVE MATCH
+# STEP 7 — LAG 1-TO-2 MONTH ITERATIVE MATCH  (exhaustive loop)
 #
-# KEY FIX vs original code
-# ────────────────────────
-# amount_diff condition is removed (no upper cap).
-# Rationale: with 3 sales invoices (+500, +300, +200) and 1 credit (-300),
-# the pairwise join correctly produces:
-#   (+500, -300) → diff 200
-#   (+300, -300) → diff 0    ← wins on tiebreak
-#   (+200, -300) → diff 100
-# The rank_based_match picks diff=0 automatically.
-# Capping at <= 1 would EXCLUDE the diff=200 and diff=100 rows from
-# consideration, which is fine for exact match but wrong here — we want
-# the matcher to SEE all pairs and pick the best one naturally.
-#
-# Conditions kept: month_lag between 1-2, eff_dt order respected.
+# No amount_diff cap — ranker picks the best pair naturally.
+# Conditions : month_lag between 1-2, eff_dt order respected.
 # =============================================================================
-print("\n[STEP 7] Lag 1-to-2 month iterative match...")
+print("\n[STEP 7] Lag 1-to-2 month iterative match (exhaustive)...")
 
-DATASET_2_1_REMAIN_1, rem_sales_3, rem_credit_3 = rank_based_match(
+DATASET_2_1_REMAIN_1, rem_sales_3, rem_credit_3 = exhaustive_match(
     sales_for_iter,
     credit_for_iter,
     condition_fn=lambda df: df.filter(
         (F.col("month_lag").between(1, 2)) &
         (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt"))
-        # ↑ NO amount_diff cap — let the ranker pick the best pair naturally
+        # No amount_diff cap — let the ranker pick the best pair naturally
     ),
     match_label="LAG_1_2_MONTH",
 )
@@ -503,20 +570,20 @@ rem_credit_3 = materialize_df(rem_credit_3, "rem_credit_3", "primary_key")
 
 
 # =============================================================================
-# STEP 8 — SAME-MONTH ITERATIVE MATCH
+# STEP 8 — SAME-MONTH ITERATIVE MATCH  (exhaustive loop)
 #
-# Same fix: no amount_diff cap.
-# Conditions: month_lag=0, eff_dt order respected.
+# No amount_diff cap.
+# Conditions : month_lag = 0, eff_dt order respected.
 # =============================================================================
-print("\n[STEP 8] Same-month iterative match...")
+print("\n[STEP 8] Same-month iterative match (exhaustive)...")
 
-DATASET_2_2_REMAIN_2T, rem_sales_final, rem_credit_final = rank_based_match(
+DATASET_2_2_REMAIN_2T, rem_sales_final, rem_credit_final = exhaustive_match(
     rem_sales_3,
     rem_credit_3,
     condition_fn=lambda df: df.filter(
         (F.col("month_lag") == 0) &
         (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt"))
-        # ↑ NO amount_diff cap
+        # No amount_diff cap
     ),
     match_label="SAME_MONTH_ITERATIVE",
 )
@@ -559,15 +626,34 @@ write_table(REMAIN_UNMATCHED_GROUPS,              "REMAIN_UNMATCHED_GROUPS")
 # STEP 11 — FINAL AUDIT
 # =============================================================================
 print("\n=== FINAL AUDIT ===")
-debug_count("DATASET_EXC_1",                      DATASET_EXC_1)
-debug_count("DATASET_1_OTHER_UNIQUE_PK",           DATASET_1_OTHER_UNIQUE_PK)
-debug_count("DATASET_2A_UNIQUE_PK_SALES_INVOICES", DATASET_2A_UNIQUE_PK_SALES_INVOICES)
-debug_count("DATASET_2B_UNIQUE_PK_CREDIT_MEMOS",   DATASET_2B_UNIQUE_PK_CREDIT_MEMOS)
-debug_count("DATASET_3_1_NEXT_MONTH_MATCHES",      DATASET_3_1_NEXT_MONTH_MATCHES)
-debug_count("DATASET_3_2T_SAME_MONTH_MATCHES",     DATASET_3_2T_SAME_MONTH_MATCHES)
-debug_count("DATASET_3_2_REMAIN_UNMATCHED_GROUPS", DATASET_3_2_REMAIN_UNMATCHED_GROUPS)
-debug_count("DATASET_2_1_REMAIN_1",                DATASET_2_1_REMAIN_1)
-debug_count("DATASET_2_2_REMAIN_2T",               DATASET_2_2_REMAIN_2T)
-debug_count("REMAIN_UNMATCHED_GROUPS",             REMAIN_UNMATCHED_GROUPS)
+debug_count("DATASET_EXC_1",                       DATASET_EXC_1)
+debug_count("DATASET_1_OTHER_UNIQUE_PK",            DATASET_1_OTHER_UNIQUE_PK)
+debug_count("DATASET_2A_UNIQUE_PK_SALES_INVOICES",  DATASET_2A_UNIQUE_PK_SALES_INVOICES)
+debug_count("DATASET_2B_UNIQUE_PK_CREDIT_MEMOS",    DATASET_2B_UNIQUE_PK_CREDIT_MEMOS)
+debug_count("DATASET_3_1_NEXT_MONTH_MATCHES",       DATASET_3_1_NEXT_MONTH_MATCHES)
+debug_count("DATASET_3_2T_SAME_MONTH_MATCHES",      DATASET_3_2T_SAME_MONTH_MATCHES)
+debug_count("DATASET_3_2_REMAIN_UNMATCHED_GROUPS",  DATASET_3_2_REMAIN_UNMATCHED_GROUPS)
+debug_count("DATASET_2_1_REMAIN_1",                 DATASET_2_1_REMAIN_1)
+debug_count("DATASET_2_2_REMAIN_2T",                DATASET_2_2_REMAIN_2T)
+debug_count("REMAIN_UNMATCHED_GROUPS",              REMAIN_UNMATCHED_GROUPS)
+
+# ── Row conservation check ──────────────────────────────────────────────────
+print("\n=== CONSERVATION CHECK ===")
+
+def safe_count(df):
+    return df.count() if df is not None else 0
+
+total_input       = duplicate_pk_groups_all.count()
+exact_pairs       = safe_count(DATASET_3_1_NEXT_MONTH_MATCHES) + safe_count(DATASET_3_2T_SAME_MONTH_MATCHES)
+iterative_pairs   = safe_count(DATASET_2_1_REMAIN_1) + safe_count(DATASET_2_2_REMAIN_2T)
+unmatched_rows    = safe_count(REMAIN_UNMATCHED_GROUPS)
+accounted_for     = (exact_pairs * 2) + (iterative_pairs * 2) + unmatched_rows
+
+print(f"  Total input rows         : {total_input:>10,}")
+print(f"  Exact matched pairs      : {exact_pairs:>10,}  → {exact_pairs * 2:,} rows")
+print(f"  Iterative matched pairs  : {iterative_pairs:>10,}  → {iterative_pairs * 2:,} rows")
+print(f"  Unmatched rows           : {unmatched_rows:>10,}")
+print(f"  Total accounted for      : {accounted_for:>10,}")
+print(f"  Difference (target = 0)  : {total_input - accounted_for:>10,}")
 
 print("\n[DONE] Pipeline complete.")
