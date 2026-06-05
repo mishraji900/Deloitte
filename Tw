@@ -1,0 +1,494 @@
+# =============================================================================
+# JE Matching Pipeline — Databricks PySpark Serverless
+# Primary Key : Company Description || Vendor Number
+# Strategy    : Single-pass rank-based matching (NO iterative loops)
+#               Safe for 1M+ rows — no OOM, no lineage explosion
+#
+# COLUMN NAME MAP  ← edit these to match your actual source columns
+#   source column          used as
+#   ─────────────────────────────────────────────────
+#   company_description  → company_desc_clean / PK
+#   vendor_num           → vendor_num_clean   / PK
+#   category             → cat_clean
+#   invoice_ref          → invoice_ref_clean
+#   usd_net              → usd_net_dec
+#   eff_dt               → eff_dt  (date of effect)
+#   month_dt             → month_dt (first day of accounting month)
+# =============================================================================
+
+from pyspark.sql import functions as F, Window
+from pyspark.sql.types import LongType
+
+# ── CONFIG ────────────────────────────────────────────────────────────────────
+SOURCE_TABLE   = "your_database.je_raw"          # ← change
+OUTPUT_DB      = "your_database"                  # ← change
+CHECKPOINT_DIR = "/tmp/je_pipeline_checkpoints"  # ← change to DBFS path in prod
+                                                  #   e.g. "dbfs:/checkpoints/je"
+NUM_PARTITIONS = 400   # tune: ~2-4x number of cores on your cluster
+# ─────────────────────────────────────────────────────────────────────────────
+
+spark.sparkContext.setCheckpointDir(CHECKPOINT_DIR)
+
+
+# =============================================================================
+# HELPER UTILITIES
+# =============================================================================
+
+def write_table(df, name, log=True):
+    """Write a DataFrame as a Delta table; skip gracefully if df is None."""
+    if df is None:
+        print(f"  [SKIP] {name} — no data")
+        return
+    full_name = f"{OUTPUT_DB}.{name.lower()}"
+    df.write.format("delta").mode("overwrite").saveAsTable(full_name)
+    if log:
+        print(f"  [WRITTEN] {full_name}")
+
+
+def log_counts(label_df_pairs):
+    """
+    Print row counts for a list of (label, df) tuples in ONE pass each.
+    Only call this for final audit; comment out during iterative dev.
+    """
+    print("\n=== ROW COUNT AUDIT ===")
+    for label, df in label_df_pairs:
+        n = df.count() if df is not None else 0
+        print(f"  {label:<50} {n:>10,}")
+    print("=" * 62)
+
+
+def checkpoint_df(df, name):
+    """Materialise + checkpoint a DataFrame to break Spark lineage."""
+    print(f"  [CHECKPOINT] {name}")
+    return df.checkpoint(eager=True)
+
+
+# =============================================================================
+# CORE MATCHING FUNCTION  — replaces ALL iterative loops
+# =============================================================================
+# Logic (single pass, no while-loop):
+#
+#   1. Join sales × credit on primary_key  (within-PK cross product)
+#   2. Apply the caller-supplied filter condition
+#   3. For each SALES row  → rank candidate credits (best first)
+#   4. Keep rank-1 credit per sales row
+#   5. For each CREDIT row → rank remaining candidates (best first)
+#      (step 5 prevents one credit being claimed by two sales rows)
+#   6. Keep rank-2 == 1 → these are the confirmed 1-to-1 matched pairs
+#   7. Anti-join to produce remaining unmatched sales / credit rows
+#
+# Why this is equivalent to iterating:
+#   The greedy "pick lowest diff → remove → repeat" converges to the
+#   same assignment as a single-pass double-rank when the best-pair
+#   ordering is consistent (which it is here: amount_diff ASC, date ASC,
+#   row_id ASC).  If your business logic ever requires TRUE optimal
+#   assignment (minimise total diff globally), you'd need the Hungarian
+#   algorithm — but greedy is standard for accounting reconciliation.
+# =============================================================================
+
+def rank_based_match(sales_df, credit_df, condition_fn, match_label):
+    """
+    Parameters
+    ----------
+    sales_df     : DataFrame with columns [primary_key, sales_row_id,
+                   sales_amt, sales_eff_dt, sales_month, sales_ref]
+    credit_df    : DataFrame with columns [primary_key, credit_row_id,
+                   credit_amt, credit_eff_dt, credit_month, credit_ref]
+    condition_fn : callable(candidates_df) → filtered DataFrame
+                   candidates_df has all columns from both sides plus
+                   amount_diff and month_lag
+    match_label  : string stored in match_type column
+
+    Returns
+    -------
+    matched_df        : confirmed 1-to-1 pairs
+    remaining_sales   : sales rows not matched
+    remaining_credit  : credit rows not matched
+    """
+
+    # ── Step 1: build all candidate pairs within same PK ──────────────────
+    candidates = (
+        sales_df.alias("s")
+        .join(credit_df.alias("c"), on="primary_key", how="inner")
+        .withColumn(
+            "amount_diff",
+            F.abs(F.col("s.sales_amt") + F.col("c.credit_amt"))
+        )
+        .withColumn(
+            "month_lag",
+            F.months_between(
+                F.col("c.credit_month").cast("date"),
+                F.col("s.sales_month").cast("date")
+            ).cast("int")
+        )
+    )
+
+    # ── Step 2: apply caller-supplied business-rule filter ─────────────────
+    candidates = condition_fn(candidates)
+
+    # Early-exit if nothing qualifies
+    if candidates.rdd.isEmpty():
+        print(f"  [{match_label}] No qualifying pairs — skipping.")
+        return None, sales_df, credit_df
+
+    # ── Step 3: rank credits for each sales row ────────────────────────────
+    #    Tiebreak: lowest diff → earliest credit date → lowest credit id
+    w_sales = Window.partitionBy("primary_key", "s.sales_row_id").orderBy(
+        F.col("amount_diff").asc(),
+        F.col("c.credit_eff_dt").asc(),
+        F.col("c.credit_row_id").asc()
+    )
+
+    best_credit_per_sales = (
+        candidates
+        .withColumn("rn_sales", F.row_number().over(w_sales))
+        .filter(F.col("rn_sales") == 1)
+    )
+
+    # ── Step 4: rank sales rows for each credit row ────────────────────────
+    #    Prevents one credit being claimed by two sales rows
+    w_credit = Window.partitionBy("primary_key", "c.credit_row_id").orderBy(
+        F.col("amount_diff").asc(),
+        F.col("s.sales_eff_dt").asc(),
+        F.col("s.sales_row_id").asc()
+    )
+
+    confirmed_pairs = (
+        best_credit_per_sales
+        .withColumn("rn_credit", F.row_number().over(w_credit))
+        .filter(F.col("rn_credit") == 1)
+        .select(
+            F.col("primary_key"),
+            F.col("s.sales_row_id"),
+            F.col("c.credit_row_id"),
+            F.col("s.sales_amt"),
+            F.col("c.credit_amt"),
+            F.col("amount_diff"),
+            F.col("s.sales_eff_dt"),
+            F.col("c.credit_eff_dt"),
+            F.col("s.sales_month"),
+            F.col("c.credit_month"),
+            F.col("month_lag"),
+            F.lit(match_label).alias("match_type")
+        )
+    )
+
+    # ── Step 5: materialise pairs ONCE so anti-joins below don't recompute ─
+    confirmed_pairs = checkpoint_df(confirmed_pairs, match_label)
+
+    # ── Step 6: remove matched rows from each side ─────────────────────────
+    matched_s_ids = confirmed_pairs.select("sales_row_id")
+    matched_c_ids = confirmed_pairs.select("credit_row_id")
+
+    remaining_sales  = sales_df.join(matched_s_ids,  on="sales_row_id",  how="left_anti")
+    remaining_credit = credit_df.join(matched_c_ids, on="credit_row_id", how="left_anti")
+
+    return confirmed_pairs, remaining_sales, remaining_credit
+
+
+# =============================================================================
+# STEP 0 — LOAD
+# =============================================================================
+print("\n[STEP 0] Loading source data...")
+je_raw = spark.table(SOURCE_TABLE)
+
+
+# =============================================================================
+# STEP 1 — BASE PREP
+# =============================================================================
+print("[STEP 1] Base prep...")
+
+je_prep = (
+    je_raw
+    # ── clean strings ──────────────────────────────────────────────────────
+    .withColumn("invoice_ref_clean",  F.trim(F.col("invoice_ref")))
+    .withColumn("cat_clean",          F.trim(F.upper(F.col("category"))))
+    .withColumn("company_desc_clean", F.trim(F.upper(F.col("company_description"))))
+    .withColumn("vendor_num_clean",   F.trim(F.col("vendor_num")))
+
+    # ── numeric amounts ────────────────────────────────────────────────────
+    .withColumn("usd_net_dec",        F.col("usd_net").cast("double"))
+    .withColumn("abs_usd_net",        F.abs(F.col("usd_net_dec")))
+
+    # ── NEW primary key: Company Description || Vendor Number ──────────────
+    .withColumn("primary_key",
+        F.concat_ws("||",
+            F.col("company_desc_clean"),
+            F.col("vendor_num_clean")
+        )
+    )
+
+    # ── assign a STABLE integer row id based on a natural sort ────────────
+    #    Using row_number over a deterministic order so IDs survive
+    #    multiple DataFrame re-evaluations (unlike monotonically_increasing_id)
+    .withColumn("stable_row_id",
+        F.row_number().over(
+            Window.orderBy(
+                "primary_key", "cat_clean", "eff_dt", "usd_net_dec", "invoice_ref_clean"
+            )
+        ).cast(LongType())
+    )
+
+    # ── mandatory field filters ────────────────────────────────────────────
+    .filter(F.col("usd_net_dec").isNotNull())
+    .filter(F.col("eff_dt").isNotNull())
+    .filter(F.col("month_dt").isNotNull())
+    .filter(F.col("primary_key").isNotNull() & (F.col("primary_key") != "||"))
+)
+
+# Repartition on PK so all future joins are co-located
+je_prep = (
+    je_prep
+    .repartition(NUM_PARTITIONS, "primary_key")
+)
+
+# Materialise once — everything downstream reads from this checkpoint
+je_prep = checkpoint_df(je_prep, "je_prep")
+
+
+# =============================================================================
+# STEP 2 — EXCLUDE BLANK / NULL INVOICE REFERENCE
+# =============================================================================
+print("\n[STEP 2] Splitting on invoice reference...")
+
+DATASET_EXC_1 = je_prep.filter(
+    F.col("invoice_ref_clean").isNull() | (F.trim(F.col("invoice_ref_clean")) == "")
+).cache()
+
+je_work = je_prep.filter(
+    F.col("invoice_ref_clean").isNotNull() & (F.trim(F.col("invoice_ref_clean")) != "")
+).cache()
+
+
+# =============================================================================
+# STEP 3 — UNIQUE vs DUPLICATE PK SPLIT
+# =============================================================================
+print("\n[STEP 3] Counting rows per PK...")
+
+pk_count_window = Window.partitionBy("primary_key")
+
+je_work = je_work.withColumn("pk_row_count", F.count("*").over(pk_count_window))
+
+# ── Unique PK (only one JE under this company+vendor) ─────────────────────
+unique_pk = je_work.filter(F.col("pk_row_count") == 1).cache()
+
+DATASET_1_OTHER_UNIQUE_PK = unique_pk.filter(
+    ~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")
+)
+DATASET_2A_UNIQUE_PK_SALES_INVOICES = unique_pk.filter(F.col("cat_clean") == "SALES INVOICES")
+DATASET_2B_UNIQUE_PK_CREDIT_MEMOS   = unique_pk.filter(F.col("cat_clean") == "CREDIT MEMOS")
+
+# ── Duplicate PK groups (2+ JEs under same company+vendor) ────────────────
+duplicate_pk_groups = (
+    je_work
+    .filter(F.col("pk_row_count") > 1)
+    .filter(F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
+    .filter(F.col("usd_net_dec").isNotNull() & (F.col("usd_net_dec") != 0))
+)
+
+
+# =============================================================================
+# STEP 4 — BUILD SALES & CREDIT SIDE TABLES
+# =============================================================================
+print("\n[STEP 4] Building sales / credit side tables...")
+
+sales_df = (
+    duplicate_pk_groups
+    .filter(F.col("cat_clean") == "SALES INVOICES")
+    .select(
+        F.col("primary_key"),
+        F.col("stable_row_id").alias("sales_row_id"),
+        F.col("usd_net_dec").alias("sales_amt"),
+        F.col("eff_dt").alias("sales_eff_dt"),
+        F.col("month_dt").alias("sales_month"),
+        F.col("invoice_ref_clean").alias("sales_ref"),
+    )
+    .repartition(NUM_PARTITIONS, "primary_key")
+    .cache()
+)
+
+credit_df = (
+    duplicate_pk_groups
+    .filter(F.col("cat_clean") == "CREDIT MEMOS")
+    .select(
+        F.col("primary_key"),
+        F.col("stable_row_id").alias("credit_row_id"),
+        F.col("usd_net_dec").alias("credit_amt"),
+        F.col("eff_dt").alias("credit_eff_dt"),
+        F.col("month_dt").alias("credit_month"),
+        F.col("invoice_ref_clean").alias("credit_ref"),
+    )
+    .repartition(NUM_PARTITIONS, "primary_key")
+    .cache()
+)
+
+# Force materialisation of both caches before any joins
+sales_df.count()
+credit_df.count()
+print("  Sales and credit side tables cached.")
+
+
+# =============================================================================
+# STEP 5 — NEXT-MONTH EXACT MATCH  (flowchart 2, first diamond)
+#
+# Conditions:
+#   • month_lag = 1  (credit is one month after sales)
+#   • sales_ref = credit_ref  (same invoice reference)
+#   • sales_eff_dt <= credit_eff_dt
+#   • abs(sales_amt + credit_amt) <= 1
+# =============================================================================
+print("\n[STEP 5] Next-month exact match...")
+
+DATASET_3_1_NEXT_MONTH_MATCHES, rem_sales_1, rem_credit_1 = rank_based_match(
+    sales_df,
+    credit_df,
+    condition_fn=lambda df: df.filter(
+        (F.col("month_lag") == 1) &
+        (F.col("s.sales_ref") == F.col("c.credit_ref")) &
+        (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt")) &
+        (F.col("amount_diff") <= 1)
+    ),
+    match_label="NEXT_MONTH_EXACT"
+)
+
+# Checkpoint remainders to break lineage before next pass
+rem_sales_1  = checkpoint_df(rem_sales_1.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_sales_after_next_month")
+rem_credit_1 = checkpoint_df(rem_credit_1.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_credit_after_next_month")
+
+
+# =============================================================================
+# STEP 6 — SAME-MONTH EXACT MATCH  (flowchart 2, second diamond)
+#
+# Conditions:
+#   • month_lag = 0  (credit in same month as sales)
+#   • sales_ref = credit_ref
+#   • sales_eff_dt <= credit_eff_dt
+#   • abs(sales_amt + credit_amt) <= 1
+# =============================================================================
+print("\n[STEP 6] Same-month exact match...")
+
+DATASET_3_2T_SAME_MONTH_MATCHES, rem_sales_2, rem_credit_2 = rank_based_match(
+    rem_sales_1,
+    rem_credit_1,
+    condition_fn=lambda df: df.filter(
+        (F.col("month_lag") == 0) &
+        (F.col("s.sales_ref") == F.col("c.credit_ref")) &
+        (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt")) &
+        (F.col("amount_diff") <= 1)
+    ),
+    match_label="SAME_MONTH_EXACT"
+)
+
+# Remaining after both exact passes = DATASET_3_2_REMAIN_UNMATCHED_GROUPS
+DATASET_3_2_REMAIN_UNMATCHED_GROUPS = (
+    rem_sales_2.withColumn("cat_clean", F.lit("SALES INVOICES"))
+    .union(rem_credit_2.withColumn("cat_clean", F.lit("CREDIT MEMOS")))
+)
+
+# Checkpoint remainders
+rem_sales_2  = checkpoint_df(rem_sales_2.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_sales_after_exact")
+rem_credit_2 = checkpoint_df(rem_credit_2.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_credit_after_exact")
+
+
+# =============================================================================
+# STEP 7 — LAG 1-TO-2 MONTH ITERATIVE MATCH  (flowchart 3, first diamond)
+#
+# Conditions:
+#   • month_lag BETWEEN 1 AND 2
+#   • sales_eff_dt <= credit_eff_dt
+#   • abs(sales_amt + credit_amt) >= 0  (any non-negative diff accepted)
+#   Tiebreak: lowest amount_diff → earliest credit_eff_dt → lowest credit_row_id
+# =============================================================================
+print("\n[STEP 7] Lag 1-to-2 month iterative match...")
+
+DATASET_2_1_REMAIN_1, rem_sales_3, rem_credit_3 = rank_based_match(
+    rem_sales_2,
+    rem_credit_2,
+    condition_fn=lambda df: df.filter(
+        (F.col("month_lag").between(1, 2)) &
+        (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt")) &
+        (F.col("amount_diff") >= 0)
+    ),
+    match_label="LAG_1_2_MONTH"
+)
+
+rem_sales_3  = checkpoint_df(rem_sales_3.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_sales_after_lag_1_2")
+rem_credit_3 = checkpoint_df(rem_credit_3.repartition(NUM_PARTITIONS, "primary_key"),
+                              "rem_credit_after_lag_1_2")
+
+
+# =============================================================================
+# STEP 8 — SAME-MONTH ITERATIVE MATCH  (flowchart 3, second diamond)
+#
+# Conditions:
+#   • month_lag = 0
+#   • sales_eff_dt <= credit_eff_dt
+#   • abs(sales_amt + credit_amt) >= 0
+#   Tiebreak: lowest amount_diff → earliest credit_eff_dt → lowest credit_row_id
+# =============================================================================
+print("\n[STEP 8] Same-month iterative match...")
+
+DATASET_2_2_REMAIN_2T, rem_sales_final, rem_credit_final = rank_based_match(
+    rem_sales_3,
+    rem_credit_3,
+    condition_fn=lambda df: df.filter(
+        (F.col("month_lag") == 0) &
+        (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt")) &
+        (F.col("amount_diff") >= 0)
+    ),
+    match_label="SAME_MONTH_ITERATIVE"
+)
+
+
+# =============================================================================
+# STEP 9 — FINAL UNMATCHED GROUPS
+# =============================================================================
+print("\n[STEP 9] Assembling final unmatched groups...")
+
+REMAIN_UNMATCHED_GROUPS = (
+    rem_sales_final.withColumn("cat_clean", F.lit("SALES INVOICES"))
+    .union(rem_credit_final.withColumn("cat_clean", F.lit("CREDIT MEMOS")))
+)
+
+
+# =============================================================================
+# STEP 10 — WRITE ALL OUTPUTS
+# =============================================================================
+print("\n[STEP 10] Writing output tables...")
+
+write_table(DATASET_EXC_1,                       "DATASET_EXC_1")
+write_table(DATASET_1_OTHER_UNIQUE_PK,            "DATASET_1_OTHER_UNIQUE_PK")
+write_table(DATASET_2A_UNIQUE_PK_SALES_INVOICES,  "DATASET_2A_UNIQUE_PK_SALES_INVOICES")
+write_table(DATASET_2B_UNIQUE_PK_CREDIT_MEMOS,    "DATASET_2B_UNIQUE_PK_CREDIT_MEMOS")
+write_table(DATASET_3_1_NEXT_MONTH_MATCHES,       "DATASET_3_1_NEXT_MONTH_MATCHES")
+write_table(DATASET_3_2T_SAME_MONTH_MATCHES,      "DATASET_3_2T_SAME_MONTH_MATCHES")
+write_table(DATASET_3_2_REMAIN_UNMATCHED_GROUPS,  "DATASET_3_2_REMAIN_UNMATCHED_GROUPS")
+write_table(DATASET_2_1_REMAIN_1,                 "DATASET_2_1_REMAIN_1")
+write_table(DATASET_2_2_REMAIN_2T,                "DATASET_2_2_REMAIN_2T")
+write_table(REMAIN_UNMATCHED_GROUPS,              "REMAIN_UNMATCHED_GROUPS")
+
+
+# =============================================================================
+# STEP 11 — AUDIT ROW COUNTS  (single .count() per df, all at end)
+# =============================================================================
+print("\n[STEP 11] Audit counts...")
+
+log_counts([
+    ("DATASET_EXC_1 (blank invoice ref)",          DATASET_EXC_1),
+    ("DATASET_1_OTHER_UNIQUE_PK",                  DATASET_1_OTHER_UNIQUE_PK),
+    ("DATASET_2A_UNIQUE_PK_SALES_INVOICES",        DATASET_2A_UNIQUE_PK_SALES_INVOICES),
+    ("DATASET_2B_UNIQUE_PK_CREDIT_MEMOS",          DATASET_2B_UNIQUE_PK_CREDIT_MEMOS),
+    ("DATASET_3_1_NEXT_MONTH_MATCHES",             DATASET_3_1_NEXT_MONTH_MATCHES),
+    ("DATASET_3_2T_SAME_MONTH_MATCHES",            DATASET_3_2T_SAME_MONTH_MATCHES),
+    ("DATASET_3_2_REMAIN_UNMATCHED_GROUPS",        DATASET_3_2_REMAIN_UNMATCHED_GROUPS),
+    ("DATASET_2_1_REMAIN_1 (lag 1-2 matched)",     DATASET_2_1_REMAIN_1),
+    ("DATASET_2_2_REMAIN_2T (same-month matched)", DATASET_2_2_REMAIN_2T),
+    ("REMAIN_UNMATCHED_GROUPS (final leftover)",   REMAIN_UNMATCHED_GROUPS),
+])
+
+print("\n[DONE] Pipeline complete.")
