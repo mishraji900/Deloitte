@@ -2,21 +2,15 @@
 # JE Matching Pipeline — Databricks PySpark Serverless
 # Primary Key : Company Description || Vendor Number
 #
-# KEY CHANGE vs previous version
-# ───────────────────────────────
-# Each match step (5, 6, 7, 8) now runs EXHAUSTIVELY inside a loop:
-#
-#   Iteration 1 → find pairs → extract → remove from working set
-#   Iteration 2 → find pairs on remainder → extract → remove
-#   ...
-#   Iteration N → zero new pairs found → exit loop, move to next step
-#
-# All pairs collected across iterations of one step are unioned into
-# that step's output dataset before moving on.
-#
-# This ensures e.g. A(sale) A(sale) B(sale) A(credit) correctly yields
-# one matched pair per iteration until credits are exhausted, rather than
-# stopping after the first pass.
+# KEY CHANGES vs previous version
+# ────────────────────────────────
+# 1. Exhaustive per-step looping (unchanged from previous version)
+# 2. All matched output datasets are now in ORIGINAL ROW FORMAT
+#    Each matched pair → 2 rows (sales row + credit row), both in full
+#    original column format, with two extra columns added:
+#      • pair_id    : unique string ID per pair (same value on both rows)
+#      • match_type : which step matched them (e.g. NEXT_MONTH_EXACT)
+#    Conservation check updated: matched datasets now count rows / 2
 # =============================================================================
 
 from pyspark.sql import functions as F, Window
@@ -102,7 +96,7 @@ def ensure_row_id(df):
 def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df, name):
     """
     Reconstruct full original rows for whatever sales/credit row_ids remain.
-    Returns the original columns (not just the slim sales/credit projection).
+    Returns original columns — no pair_id / match_type added (unmatched).
     """
     sales_ids  = rem_sales_df.select(F.col("sales_row_id").alias("row_id"))
     credit_ids = rem_credit_df.select(F.col("credit_row_id").alias("row_id"))
@@ -115,23 +109,96 @@ def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df, name):
 
 
 # =============================================================================
+# RESOLVE PAIRS TO ORIGINAL ROWS
+#
+# Takes a pairs summary DataFrame (slim: sales_row_id, credit_row_id,
+# match_type, ...) and joins back to the full source population to recover
+# every original column for both rows in each pair.
+#
+# Output per pair:
+#   Row 1 — original sales row   + pair_id + match_type
+#   Row 2 — original credit row  + pair_id + match_type
+#
+# pair_id format: "<match_label>_<sequential_number>"
+# Both rows in the same pair carry the SAME pair_id so downstream consumers
+# can always reconstruct which sales row belongs with which credit row.
+# =============================================================================
+
+def resolve_to_original(pairs_df, base_df, match_label, stage_name):
+    """
+    Convert a pairs summary into full original-format rows.
+
+    Parameters
+    ----------
+    pairs_df   : slim pairs DataFrame with sales_row_id, credit_row_id, match_type
+    base_df    : duplicate_pk_groups_all — the full original rows
+    match_label: string label used for pair_id prefix
+    stage_name : name used for materialize_df staging path
+
+    Returns
+    -------
+    DataFrame with all original columns + pair_id + match_type, two rows per pair.
+    """
+    if pairs_df is None:
+        return None
+
+    # Assign a stable sequential pair_id within this match step
+    w_pair = Window.orderBy(
+        F.col("primary_key").asc(),
+        F.col("sales_row_id").asc(),
+        F.col("credit_row_id").asc(),
+    )
+    pairs_with_id = (
+        pairs_df
+        .withColumn(
+            "pair_id",
+            F.concat(
+                F.lit(f"{match_label}_"),
+                F.row_number().over(w_pair).cast("string"),
+            )
+        )
+        .select("pair_id", "sales_row_id", "credit_row_id", "match_type")
+    )
+
+    # ── Sales side ─────────────────────────────────────────────────────────
+    sales_side = (
+        pairs_with_id
+        .join(
+            base_df.alias("orig"),
+            pairs_with_id["sales_row_id"] == F.col("orig.row_id"),
+            how="inner",
+        )
+        .drop("sales_row_id", "credit_row_id")
+        # keep all original columns + pair_id + match_type
+    )
+
+    # ── Credit side ────────────────────────────────────────────────────────
+    credit_side = (
+        pairs_with_id
+        .join(
+            base_df.alias("orig"),
+            pairs_with_id["credit_row_id"] == F.col("orig.row_id"),
+            how="inner",
+        )
+        .drop("sales_row_id", "credit_row_id")
+    )
+
+    # ── Union into 2-rows-per-pair output ──────────────────────────────────
+    resolved = sales_side.unionByName(credit_side)
+
+    return materialize_df(resolved, stage_name, "primary_key")
+
+
+# =============================================================================
 # CORE SINGLE-PASS MATCHING FUNCTION
-#
-# HOW PAIRWISE MATCHING WORKS
-# ────────────────────────────
-# The join produces one row per (sales_row, credit_row) combination inside
-# each primary_key group — already pairwise.
-#
-# Step 1 (w_sales)  : for each sales row, pick the credit that minimises diff
-# Step 2 (w_credit) : for each credit row, among sales rows that picked it,
-#                     keep only the best sales → enforces 1-to-1
 # =============================================================================
 
 def rank_based_match(sales_df, credit_df, condition_fn, match_label):
     """
     Single pass: find the best 1-to-1 pairs given condition_fn.
     Returns (pairs_df | None, remaining_sales_df, remaining_credit_df).
-    Does NOT loop — looping is handled by exhaustive_match below.
+    pairs_df is the SLIM summary — resolve_to_original is called by
+    exhaustive_match after all iterations complete.
     """
     candidates_joined = (
         sales_df.alias("s")
@@ -147,7 +214,6 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
 
     candidates = condition_fn(candidates_joined)
 
-    # Cheap existence check — limit(1) avoids full scan
     if candidates.limit(1).count() == 0:
         return None, sales_df, credit_df
 
@@ -198,7 +264,6 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
     if confirmed_pairs.limit(1).count() == 0:
         return None, sales_df, credit_df
 
-    # Materialise to break lineage before anti-joins
     confirmed_pairs = materialize_df(
         confirmed_pairs, f"matched_{match_label}_iter", "primary_key"
     )
@@ -216,26 +281,30 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label):
 
 
 # =============================================================================
-# EXHAUSTIVE MATCH — loops rank_based_match until no new pairs are found
+# EXHAUSTIVE MATCH
 #
-# BEHAVIOUR
-# ─────────
-# Iteration 1: finds pairs P1, removes them → remainder R1
-# Iteration 2: finds pairs P2 from R1, removes them → remainder R2
-# ...
-# Iteration N: finds zero pairs → exit
-#
-# Final output dataset = union(P1, P2, ... P_{N-1})
-# Final remainders     = R_{N-1}  (passed to next step)
-#
-# Each iteration materialises pairs + remainders to disk so Spark's
-# lineage graph never grows beyond a single hop — safe at 1M+ rows.
+# Loops rank_based_match until no new pairs are found, then calls
+# resolve_to_original on the unioned slim pairs to produce the final
+# output dataset in full original-row format (2 rows per pair).
 # =============================================================================
 
-def exhaustive_match(sales_df, credit_df, condition_fn, match_label):
+def exhaustive_match(sales_df, credit_df, condition_fn, match_label, base_df):
+    """
+    Parameters
+    ----------
+    sales_df, credit_df : slim side tables (make_sales / make_credit output)
+    condition_fn        : lambda applied inside rank_based_match
+    match_label         : string label for this step
+    base_df             : duplicate_pk_groups_all — needed for resolve_to_original
+
+    Returns
+    -------
+    (resolved_df | None, remaining_sales_df, remaining_credit_df)
+    resolved_df : full original-format rows, 2 per pair, with pair_id + match_type
+    """
     print(f"\n[EXHAUSTIVE MATCH] {match_label}")
 
-    accumulated_pairs = []   # list of DataFrames, one per successful iteration
+    accumulated_pairs = []
     current_sales  = sales_df
     current_credit = credit_df
     iteration      = 0
@@ -253,18 +322,16 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label):
         )
 
         if pairs is None:
-            # Zero new pairs — this step is exhausted
-            print(f"  [{match_label}] No pairs found at iteration {iteration}. Exiting loop.")
+            print(f"  [{match_label}] No pairs at iteration {iteration}. Exiting loop.")
             break
 
         pair_count = pairs.count()
         print(f"  [{match_label}] Iteration {iteration}: {pair_count:,} pairs found.")
 
         if pair_count == 0:
-            # Defensive: pairs df exists but is empty
             break
 
-        # Relabel match_type to the step label (strip the _iN suffix for output)
+        # Normalise match_type to step label (strip _iN suffix)
         pairs = pairs.withColumn("match_type", F.lit(match_label))
         pairs = materialize_df(pairs, f"pairs_{iter_label}", "primary_key")
 
@@ -272,24 +339,34 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label):
         current_sales  = rem_sales
         current_credit = rem_credit
 
-    # ── Union all iterations into one output dataset ────────────────────────
+    # ── Nothing matched ─────────────────────────────────────────────────────
     if not accumulated_pairs:
         print(f"  [{match_label}] Total pairs: 0")
         return None, sales_df, credit_df
 
-    all_pairs = accumulated_pairs[0]
+    # ── Union slim pairs across all iterations ──────────────────────────────
+    slim_all = accumulated_pairs[0]
     for p in accumulated_pairs[1:]:
-        all_pairs = all_pairs.unionByName(p)
+        slim_all = slim_all.unionByName(p)
+    slim_all = materialize_df(slim_all, f"SLIM_PAIRS_{match_label}", "primary_key")
 
-    # Final materialise of the unioned pairs
-    all_pairs = materialize_df(all_pairs, f"ALL_PAIRS_{match_label}", "primary_key")
+    total_pairs = slim_all.count()
+    print(f"  [{match_label}] Total pairs across {iteration - 1} iteration(s): {total_pairs:,}")
 
-    total = all_pairs.count()
-    print(f"  [{match_label}] Total pairs across {iteration - 1} iteration(s): {total:,}")
+    # ── Resolve to full original rows (2 rows per pair) ─────────────────────
+    resolved = resolve_to_original(
+        slim_all,
+        base_df,
+        match_label,
+        f"RESOLVED_{match_label}",
+    )
+
+    total_rows = resolved.count()
+    print(f"  [{match_label}] Resolved original rows (pairs × 2): {total_rows:,}")
     print(f"  [{match_label}] Remaining sales : {current_sales.count():,}")
     print(f"  [{match_label}] Remaining credit: {current_credit.count():,}")
 
-    return all_pairs, current_sales, current_credit
+    return resolved, current_sales, current_credit
 
 
 # =============================================================================
@@ -371,11 +448,11 @@ exact_ref_pool_counted = exact_ref_pool.withColumn("pk_row_count", F.count("*").
 # ── Unique PK rows ──────────────────────────────────────────────────────────
 unique_pk = je_prep_counted.filter(F.col("pk_row_count") == 1)
 
-DATASET_1_OTHER_UNIQUE_PK            = unique_pk.filter(
+DATASET_1_OTHER_UNIQUE_PK           = unique_pk.filter(
     ~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")
 )
-DATASET_2A_UNIQUE_PK_SALES_INVOICES  = unique_pk.filter(F.col("cat_clean") == "SALES INVOICES")
-DATASET_2B_UNIQUE_PK_CREDIT_MEMOS    = unique_pk.filter(F.col("cat_clean") == "CREDIT MEMOS")
+DATASET_2A_UNIQUE_PK_SALES_INVOICES = unique_pk.filter(F.col("cat_clean") == "SALES INVOICES")
+DATASET_2B_UNIQUE_PK_CREDIT_MEMOS   = unique_pk.filter(F.col("cat_clean") == "CREDIT MEMOS")
 
 # ── Duplicate PK — full population (for iterative passes) ──────────────────
 duplicate_pk_groups_all = (
@@ -461,7 +538,7 @@ debug_count("credit_exact", credit_exact)
 # STEP 5 — NEXT-MONTH EXACT MATCH  (exhaustive loop)
 #
 # Conditions : month_lag = 1, eff_dt order respected, amount_diff <= 1
-# Loops until no new pairs are found within these conditions.
+# Output     : full original rows, 2 per pair, + pair_id + match_type
 # =============================================================================
 print("\n[STEP 5] Next-month exact match (exhaustive)...")
 
@@ -474,6 +551,7 @@ DATASET_3_1_NEXT_MONTH_MATCHES, rem_sales_exact_1, rem_credit_exact_1 = exhausti
         (F.col("amount_diff") <= 1)
     ),
     match_label="NEXT_MONTH_EXACT",
+    base_df=duplicate_pk_groups_all,
 )
 
 rem_sales_exact_1  = materialize_df(rem_sales_exact_1,  "rem_sales_exact_1",  "primary_key")
@@ -484,6 +562,7 @@ rem_credit_exact_1 = materialize_df(rem_credit_exact_1, "rem_credit_exact_1", "p
 # STEP 6 — SAME-MONTH EXACT MATCH  (exhaustive loop)
 #
 # Conditions : month_lag = 0, eff_dt order respected, amount_diff <= 1
+# Output     : full original rows, 2 per pair, + pair_id + match_type
 # =============================================================================
 print("\n[STEP 6] Same-month exact match (exhaustive)...")
 
@@ -496,6 +575,7 @@ DATASET_3_2T_SAME_MONTH_MATCHES, rem_sales_exact_2, rem_credit_exact_2 = exhaust
         (F.col("amount_diff") <= 1)
     ),
     match_label="SAME_MONTH_EXACT",
+    base_df=duplicate_pk_groups_all,
 )
 
 rem_sales_exact_2  = materialize_df(rem_sales_exact_2,  "rem_sales_exact_2",  "primary_key")
@@ -505,25 +585,36 @@ rem_credit_exact_2 = materialize_df(rem_credit_exact_2, "rem_credit_exact_2", "p
 # =============================================================================
 # STEP 6B — CARRY EXACT-MATCH RESULTS BACK TO FULL POPULATION
 #
-# Exact passes ran on the exact_ref sub-population.
-# Remove those matched IDs from sales_all / credit_all before iterative passes
-# so the same rows are never matched twice.
+# The resolved datasets are in original-row format, so extract row_ids
+# from them directly to exclude from the iterative passes.
 # =============================================================================
 print("\n[STEP 6B] Removing exact-match IDs from full population...")
 
-matched_dfs = [
+matched_resolved_dfs = [
     df for df in [DATASET_3_1_NEXT_MONTH_MATCHES, DATASET_3_2T_SAME_MONTH_MATCHES]
     if df is not None
 ]
 
-if matched_dfs:
-    exact_s_ids = matched_dfs[0].select("sales_row_id")
-    exact_c_ids = matched_dfs[0].select("credit_row_id")
-    for df in matched_dfs[1:]:
-        exact_s_ids = exact_s_ids.unionByName(df.select("sales_row_id"))
-        exact_c_ids = exact_c_ids.unionByName(df.select("credit_row_id"))
-    exact_s_ids = exact_s_ids.distinct()
-    exact_c_ids = exact_c_ids.distinct()
+if matched_resolved_dfs:
+    exact_matched_ids = matched_resolved_dfs[0].select("row_id")
+    for df in matched_resolved_dfs[1:]:
+        exact_matched_ids = exact_matched_ids.unionByName(df.select("row_id"))
+    exact_matched_ids = exact_matched_ids.distinct()
+
+    # Split the matched IDs back into sales / credit so anti-join works on
+    # the slim side tables (which carry sales_row_id / credit_row_id)
+    exact_s_ids = (
+        exact_matched_ids
+        .join(sales_all, exact_matched_ids["row_id"] == sales_all["sales_row_id"], "inner")
+        .select("sales_row_id")
+        .distinct()
+    )
+    exact_c_ids = (
+        exact_matched_ids
+        .join(credit_all, exact_matched_ids["row_id"] == credit_all["credit_row_id"], "inner")
+        .select("credit_row_id")
+        .distinct()
+    )
 
     sales_for_iter  = sales_all.join(exact_s_ids, on="sales_row_id",  how="left_anti")
     credit_for_iter = credit_all.join(exact_c_ids, on="credit_row_id", how="left_anti")
@@ -550,7 +641,7 @@ DATASET_3_2_REMAIN_UNMATCHED_GROUPS = build_unmatched_rows(
 # STEP 7 — LAG 1-TO-2 MONTH ITERATIVE MATCH  (exhaustive loop)
 #
 # No amount_diff cap — ranker picks the best pair naturally.
-# Conditions : month_lag between 1-2, eff_dt order respected.
+# Output : full original rows, 2 per pair, + pair_id + match_type
 # =============================================================================
 print("\n[STEP 7] Lag 1-to-2 month iterative match (exhaustive)...")
 
@@ -560,9 +651,9 @@ DATASET_2_1_REMAIN_1, rem_sales_3, rem_credit_3 = exhaustive_match(
     condition_fn=lambda df: df.filter(
         (F.col("month_lag").between(1, 2)) &
         (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt"))
-        # No amount_diff cap — let the ranker pick the best pair naturally
     ),
     match_label="LAG_1_2_MONTH",
+    base_df=duplicate_pk_groups_all,
 )
 
 rem_sales_3  = materialize_df(rem_sales_3,  "rem_sales_3",  "primary_key")
@@ -573,7 +664,7 @@ rem_credit_3 = materialize_df(rem_credit_3, "rem_credit_3", "primary_key")
 # STEP 8 — SAME-MONTH ITERATIVE MATCH  (exhaustive loop)
 #
 # No amount_diff cap.
-# Conditions : month_lag = 0, eff_dt order respected.
+# Output : full original rows, 2 per pair, + pair_id + match_type
 # =============================================================================
 print("\n[STEP 8] Same-month iterative match (exhaustive)...")
 
@@ -583,9 +674,9 @@ DATASET_2_2_REMAIN_2T, rem_sales_final, rem_credit_final = exhaustive_match(
     condition_fn=lambda df: df.filter(
         (F.col("month_lag") == 0) &
         (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt"))
-        # No amount_diff cap
     ),
     match_label="SAME_MONTH_ITERATIVE",
+    base_df=duplicate_pk_groups_all,
 )
 
 rem_sales_final  = materialize_df(rem_sales_final,  "rem_sales_final",  "primary_key")
@@ -638,22 +729,24 @@ debug_count("DATASET_2_2_REMAIN_2T",                DATASET_2_2_REMAIN_2T)
 debug_count("REMAIN_UNMATCHED_GROUPS",              REMAIN_UNMATCHED_GROUPS)
 
 # ── Row conservation check ──────────────────────────────────────────────────
+# Matched datasets are now in original-row format: 1 pair = 2 rows.
+# So pair count = row count / 2  (no × 2 needed unlike before).
 print("\n=== CONSERVATION CHECK ===")
 
 def safe_count(df):
     return df.count() if df is not None else 0
 
-total_input       = duplicate_pk_groups_all.count()
-exact_pairs       = safe_count(DATASET_3_1_NEXT_MONTH_MATCHES) + safe_count(DATASET_3_2T_SAME_MONTH_MATCHES)
-iterative_pairs   = safe_count(DATASET_2_1_REMAIN_1) + safe_count(DATASET_2_2_REMAIN_2T)
-unmatched_rows    = safe_count(REMAIN_UNMATCHED_GROUPS)
-accounted_for     = (exact_pairs * 2) + (iterative_pairs * 2) + unmatched_rows
+total_input          = duplicate_pk_groups_all.count()
+exact_matched_rows   = safe_count(DATASET_3_1_NEXT_MONTH_MATCHES) + safe_count(DATASET_3_2T_SAME_MONTH_MATCHES)
+iterative_matched_rows = safe_count(DATASET_2_1_REMAIN_1) + safe_count(DATASET_2_2_REMAIN_2T)
+unmatched_rows       = safe_count(REMAIN_UNMATCHED_GROUPS)
+accounted_for        = exact_matched_rows + iterative_matched_rows + unmatched_rows
 
-print(f"  Total input rows         : {total_input:>10,}")
-print(f"  Exact matched pairs      : {exact_pairs:>10,}  → {exact_pairs * 2:,} rows")
-print(f"  Iterative matched pairs  : {iterative_pairs:>10,}  → {iterative_pairs * 2:,} rows")
-print(f"  Unmatched rows           : {unmatched_rows:>10,}")
-print(f"  Total accounted for      : {accounted_for:>10,}")
-print(f"  Difference (target = 0)  : {total_input - accounted_for:>10,}")
+print(f"  Total input rows              : {total_input:>10,}")
+print(f"  Exact matched rows            : {exact_matched_rows:>10,}  ({exact_matched_rows // 2:,} pairs)")
+print(f"  Iterative matched rows        : {iterative_matched_rows:>10,}  ({iterative_matched_rows // 2:,} pairs)")
+print(f"  Unmatched rows                : {unmatched_rows:>10,}")
+print(f"  Total accounted for           : {accounted_for:>10,}")
+print(f"  Difference (target = 0)       : {total_input - accounted_for:>10,}")
 
 print("\n[DONE] Pipeline complete.")
