@@ -1,0 +1,347 @@
+# ============================================================
+# PIPELINE 3 — REMAIN_UNMATCHED_GROUPS RE-MATCHING
+# New PK: COMPANY_DESC + VENDOR_NUM (no amount)
+# Match condition: |sale_amt + credit_amt| <= 100
+# ============================================================
+
+# ------------------------------------------------------------
+# STEP P3-1: Rebuild PK on REMAIN_UNMATCHED_GROUPS
+# ------------------------------------------------------------
+print("\n[STEP P3-1] Rebuilding PK on REMAIN_UNMATCHED_GROUPS...")
+
+p3_base = (
+    REMAIN_UNMATCHED_GROUPS
+    .withColumn(
+        "p3_primary_key",
+        F.when(
+            F.col("company_desc_clean").isNotNull()
+            & (F.col("company_desc_clean") != "")
+            & F.col("vendor_num_clean").isNotNull()
+            & (F.col("vendor_num_clean") != ""),
+            F.concat_ws("_", F.col("company_desc_clean"), F.col("vendor_num_clean"))
+        )
+    )
+)
+
+# Rows where new PK cannot be built → straight to NO_MATCH_FOUND
+p3_invalid_pk = materialize_df(
+    p3_base.filter(F.col("p3_primary_key").isNull()),
+    "p3_invalid_pk",
+    "row_id"
+)
+
+p3_base = materialize_df(
+    p3_base.filter(F.col("p3_primary_key").isNotNull()),
+    "p3_base",
+    "p3_primary_key"
+)
+
+debug_count("p3_base (valid new PK)", p3_base)
+debug_count("p3_invalid_pk (no new PK → NO_MATCH_FOUND)", p3_invalid_pk)
+
+# ------------------------------------------------------------
+# STEP P3-2: Build Sales and Credit side tables (new PK)
+# ------------------------------------------------------------
+print("\n[STEP P3-2] Building sales / credit side tables with new PK...")
+
+p3_sales = materialize_df(
+    p3_base
+    .filter(F.col("cat_clean") == "SALES INVOICES")
+    .select(
+        F.col("p3_primary_key"),
+        F.col("row_id").alias("sales_row_id"),
+        F.col("entered_net_dec").alias("sales_amt"),
+        F.col("eff_dt").alias("sales_eff_dt"),
+        F.col("month_dt").alias("sales_month"),
+        F.col("invoice_ref_clean").alias("sales_ref"),
+    )
+    .repartition(NUM_PARTITIONS, "p3_primary_key"),
+    "p3_sales",
+    "p3_primary_key"
+)
+
+p3_credit = materialize_df(
+    p3_base
+    .filter(F.col("cat_clean") == "CREDIT MEMOS")
+    .select(
+        F.col("p3_primary_key"),
+        F.col("row_id").alias("credit_row_id"),
+        F.col("entered_net_dec").alias("credit_amt"),
+        F.col("eff_dt").alias("credit_eff_dt"),
+        F.col("month_dt").alias("credit_month"),
+        F.col("invoice_ref_clean").alias("credit_ref"),
+    )
+    .repartition(NUM_PARTITIONS, "p3_primary_key"),
+    "p3_credit",
+    "p3_primary_key"
+)
+
+debug_count("p3_sales", p3_sales)
+debug_count("p3_credit", p3_credit)
+
+# ------------------------------------------------------------
+# STEP P3-3: Cross-join candidates within PK + apply tolerance
+# ------------------------------------------------------------
+print("\n[STEP P3-3] Cross-joining and applying |sale + credit| <= 100 tolerance...")
+
+TOLERANCE = F.lit(100).cast(DECIMAL_TYPE)
+
+p3_candidates = (
+    p3_sales.alias("s")
+    .join(p3_credit.alias("c"), on="p3_primary_key", how="inner")
+    .withColumn(
+        "amount_net",
+        F.abs(F.col("s.sales_amt") + F.col("c.credit_amt"))
+    )
+    .filter(F.col("amount_net") <= TOLERANCE)
+    .select(
+        F.col("p3_primary_key"),
+        F.col("s.sales_row_id"),
+        F.col("c.credit_row_id"),
+        F.col("s.sales_amt"),
+        F.col("c.credit_amt"),
+        F.col("amount_net"),
+        F.col("s.sales_eff_dt"),
+        F.col("c.credit_eff_dt"),
+        F.col("s.sales_month"),
+        F.col("c.credit_month"),
+        F.col("s.sales_ref"),
+        F.col("c.credit_ref"),
+    )
+)
+
+p3_candidates = materialize_df(p3_candidates, "p3_candidates", "p3_primary_key")
+debug_count("p3_candidates (within tolerance)", p3_candidates)
+
+# ------------------------------------------------------------
+# STEP P3-4: Detect one-to-many vs one-to-one
+# Logic:
+#   - Count distinct credit matches per sales_row_id
+#   - Count distinct sales matches per credit_row_id
+#   - If either count > 1 for any row in a pair → ONE_TO_MANY
+#   - If both counts == 1 → ONE_TO_ONE → check dates
+# ------------------------------------------------------------
+print("\n[STEP P3-4] Classifying one-to-many vs one-to-one...")
+
+# How many credits match each sale?
+sales_match_counts = (
+    p3_candidates
+    .groupBy("sales_row_id")
+    .agg(F.countDistinct("credit_row_id").alias("credit_count_per_sale"))
+)
+
+# How many sales match each credit?
+credit_match_counts = (
+    p3_candidates
+    .groupBy("credit_row_id")
+    .agg(F.countDistinct("sales_row_id").alias("sales_count_per_credit"))
+)
+
+# Join counts back onto candidates
+p3_candidates_classified = (
+    p3_candidates
+    .join(sales_match_counts, on="sales_row_id", how="left")
+    .join(credit_match_counts, on="credit_row_id", how="left")
+    .withColumn(
+        "is_one_to_many",
+        (F.col("credit_count_per_sale") > 1) | (F.col("sales_count_per_credit") > 1)
+    )
+)
+
+p3_candidates_classified = materialize_df(
+    p3_candidates_classified,
+    "p3_candidates_classified",
+    "p3_primary_key"
+)
+
+# ------------------------------------------------------------
+# STEP P3-5: ONE-TO-MANY — collect all original rows
+# ------------------------------------------------------------
+print("\n[STEP P3-5] Building DATASET_ONE_TO_MANY...")
+
+otm_pairs = (
+    p3_candidates_classified
+    .filter(F.col("is_one_to_many"))
+    .select(
+        F.col("sales_row_id"),
+        F.col("credit_row_id"),
+        F.col("p3_primary_key"),
+        F.col("amount_net"),
+        F.col("sales_amt"),
+        F.col("credit_amt"),
+        F.col("credit_count_per_sale"),
+        F.col("sales_count_per_credit"),
+    )
+)
+
+# Collect all distinct row_ids involved in one-to-many
+otm_sales_ids = otm_pairs.select(
+    F.col("sales_row_id").alias("row_id")
+)
+otm_credit_ids = otm_pairs.select(
+    F.col("credit_row_id").alias("row_id")
+)
+otm_all_ids = otm_sales_ids.unionByName(otm_credit_ids).distinct()
+
+DATASET_ONE_TO_MANY = materialize_df(
+    p3_base.join(otm_all_ids, on="row_id", how="inner")
+    .withColumn("match_type", F.lit("ONE_TO_MANY")),
+    "DATASET_ONE_TO_MANY",
+    "p3_primary_key"
+)
+
+debug_count("DATASET_ONE_TO_MANY", DATASET_ONE_TO_MANY)
+
+# ------------------------------------------------------------
+# STEP P3-6: ONE-TO-ONE — split by date sync
+# A row that appears in one-to-many is excluded here
+# ------------------------------------------------------------
+print("\n[STEP P3-6] Building date-sync / date-unsync datasets...")
+
+oto_pairs = (
+    p3_candidates_classified
+    .filter(~F.col("is_one_to_many"))
+    .withColumn(
+        "date_sync",
+        F.col("sales_eff_dt") < F.col("credit_eff_dt")
+    )
+    .select(
+        F.col("p3_primary_key"),
+        F.col("sales_row_id"),
+        F.col("credit_row_id"),
+        F.col("sales_amt"),
+        F.col("credit_amt"),
+        F.col("amount_net"),
+        F.col("sales_eff_dt"),
+        F.col("credit_eff_dt"),
+        F.col("date_sync"),
+    )
+)
+
+oto_pairs = materialize_df(oto_pairs, "oto_pairs", "p3_primary_key")
+
+# --- DATE SYNC (sale_date < credit_date) ---
+oto_sync_ids = (
+    oto_pairs
+    .filter(F.col("date_sync"))
+    .select(F.col("sales_row_id").alias("row_id"))
+    .unionByName(
+        oto_pairs.filter(F.col("date_sync"))
+        .select(F.col("credit_row_id").alias("row_id"))
+    )
+    .distinct()
+)
+
+DATASET_1_1_DATE_SYNC = materialize_df(
+    p3_base.join(oto_sync_ids, on="row_id", how="inner")
+    .withColumn("match_type", F.lit("ONE_TO_ONE_DATE_SYNC")),
+    "DATASET_1_1_DATE_SYNC",
+    "p3_primary_key"
+)
+
+# --- DATE UNSYNC (sale_date >= credit_date) ---
+oto_unsync_ids = (
+    oto_pairs
+    .filter(~F.col("date_sync"))
+    .select(F.col("sales_row_id").alias("row_id"))
+    .unionByName(
+        oto_pairs.filter(~F.col("date_sync"))
+        .select(F.col("credit_row_id").alias("row_id"))
+    )
+    .distinct()
+)
+
+DATASET_1_1_DATE_UNSYNC = materialize_df(
+    p3_base.join(oto_unsync_ids, on="row_id", how="inner")
+    .withColumn("match_type", F.lit("ONE_TO_ONE_DATE_UNSYNC")),
+    "DATASET_1_1_DATE_UNSYNC",
+    "p3_primary_key"
+)
+
+debug_count("DATASET_1_1_DATE_SYNC", DATASET_1_1_DATE_SYNC)
+debug_count("DATASET_1_1_DATE_UNSYNC", DATASET_1_1_DATE_UNSYNC)
+
+# ------------------------------------------------------------
+# STEP P3-7: NO_MATCH_FOUND
+# Any row in p3_base not in OTM, DATE_SYNC, DATE_UNSYNC
+# + rows that had no valid new PK (p3_invalid_pk)
+# ------------------------------------------------------------
+print("\n[STEP P3-7] Building DATASET_NO_MATCH_FOUND...")
+
+matched_ids = (
+    otm_all_ids
+    .unionByName(oto_sync_ids)
+    .unionByName(oto_unsync_ids)
+    .distinct()
+)
+
+p3_no_match = materialize_df(
+    p3_base.join(matched_ids, on="row_id", how="left_anti")
+    .withColumn("match_type", F.lit("NO_MATCH_FOUND")),
+    "p3_no_match",
+    "p3_primary_key"
+)
+
+DATASET_NO_MATCH_FOUND = materialize_df(
+    union_non_null(p3_no_match, p3_invalid_pk.withColumn("match_type", F.lit("NO_MATCH_FOUND"))),
+    "DATASET_NO_MATCH_FOUND",
+    "row_id"
+)
+
+debug_count("DATASET_NO_MATCH_FOUND", DATASET_NO_MATCH_FOUND)
+
+# ------------------------------------------------------------
+# STEP P3-8: AUDIT — row count conservation check
+# ------------------------------------------------------------
+print("\n=== PIPELINE 3 AUDIT ===")
+
+total_in  = REMAIN_UNMATCHED_GROUPS.count()
+total_out = sum([
+    DATASET_ONE_TO_MANY.count(),
+    DATASET_1_1_DATE_SYNC.count(),
+    DATASET_1_1_DATE_UNSYNC.count(),
+    DATASET_NO_MATCH_FOUND.count(),
+])
+
+debug_count("INPUT  — REMAIN_UNMATCHED_GROUPS", REMAIN_UNMATCHED_GROUPS)
+debug_count("OUTPUT — DATASET_ONE_TO_MANY",     DATASET_ONE_TO_MANY)
+debug_count("OUTPUT — DATASET_1_1_DATE_SYNC",   DATASET_1_1_DATE_SYNC)
+debug_count("OUTPUT — DATASET_1_1_DATE_UNSYNC", DATASET_1_1_DATE_UNSYNC)
+debug_count("OUTPUT — DATASET_NO_MATCH_FOUND",  DATASET_NO_MATCH_FOUND)
+
+print(f"\n  [AUDIT] Total IN  : {total_in:>10,}")
+print(f"  [AUDIT] Total OUT : {total_out:>10,}")
+print(f"  [AUDIT] Diff      : {total_in - total_out:>10,}  ← should be 0")
+
+# ------------------------------------------------------------
+# STEP P3-9: WRITE OUTPUTS
+# ------------------------------------------------------------
+print("\n[STEP P3-9] Writing Pipeline 3 outputs...")
+
+write_table(DATASET_ONE_TO_MANY,     "P3_DATASET_ONE_TO_MANY")
+write_table(DATASET_1_1_DATE_SYNC,   "P3_DATASET_1_1_DATE_SYNC")
+write_table(DATASET_1_1_DATE_UNSYNC, "P3_DATASET_1_1_DATE_UNSYNC")
+write_table(DATASET_NO_MATCH_FOUND,  "P3_DATASET_NO_MATCH_FOUND")
+
+# ------------------------------------------------------------
+# STEP P3-10: EXPORT TO EXCEL
+# ------------------------------------------------------------
+print("\n[STEP P3-10] Exporting Pipeline 3 to Excel...")
+
+cp.pandas.to_excel(
+    dataframes=[
+        safe_for_excel(DATASET_ONE_TO_MANY),
+        safe_for_excel(DATASET_1_1_DATE_SYNC),
+        safe_for_excel(DATASET_1_1_DATE_UNSYNC),
+        safe_for_excel(DATASET_NO_MATCH_FOUND),
+    ],
+    sheet_names=[
+        "ONE_TO_MANY",
+        "DATE_SYNC_1_1",
+        "DATE_UNSYNC_1_1",
+        "NO_MATCH_FOUND",
+    ],
+    path=f"{output_path}/Pipeline_3_Rematching.xlsx",
+)
+
+print("\n[DONE] Pipeline 3 complete.")
