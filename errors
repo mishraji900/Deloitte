@@ -1,25 +1,31 @@
-[FINAL] === END-TO-END ROW CONSERVATION CHECK ===
-/databricks/python/lib/python3.10/site-packages/pyspark/sql/connect/expressions.py:968: UserWarning: WARN WindowExpression: No Partition Defined for Window operation! Moving all data to a single partition, this can cause serious performance degradation.
-  warnings.warn(
-AssertionError: 
-File <command-6964436880502316>, line 317
-    313 print("\n[FINAL] === END-TO-END ROW CONSERVATION CHECK ===")
-    315 total_raw = JE_raw.count()
---> 317 total_out = sum(
-    318     df.count() for df in [
-    319         all_invalid,
-    320         all_exc_1,
-    321         all_dup_other,
-    322         all_unique_other,
-    323         P1_ALL_MATCHED,
-    324         P2_ALL_MATCHED,
-    325         P3_ALL_UNMATCHED_COMMENTED,
-    326     ]
-    327     if df is not None
-    328 )
-    330 print(f"\n  {'Total raw input rows':<50} {total_raw:>10,}")
-    331 print(f"  {'Total output rows (all sheets)':<50} {total_out:>10,}")
-File /databricks/python/lib/python3.10/site-packages/pyspark/sql/connect/functions/builtin.py:80, in _to_col(col)
-     79 def _to_col(col: "ColumnOrName") -> Column:
----> 80     assert isinstance(col, (Column, str))
-     81     return col if isinstance(col, Column) else column(col)
+print("\n[FINAL] === END-TO-END ROW CONSERVATION CHECK ===")
+
+total_raw = JE_raw.count()
+print(f"Raw rows: {total_raw:,}")
+
+dfs = {
+    "all_invalid": all_invalid,
+    "all_exc_1": all_exc_1,
+    "all_dup_other": all_dup_other,
+    "all_unique_other": all_unique_other,
+    "P1_ALL_MATCHED": P1_ALL_MATCHED,
+    "P2_ALL_MATCHED": P2_ALL_MATCHED,
+    "P3_ALL_UNMATCHED_COMMENTED": P3_ALL_UNMATCHED_COMMENTED,
+}
+
+total_out = 0
+for name, df in dfs.items():
+    if df is None:
+        print(f"  {name}: None")
+        continue
+    try:
+        cnt = df.count()
+        print(f"  {name}: {cnt:,}")
+        total_out += cnt
+    except Exception as e:
+        print(f"  [ERROR] {name} caused: {e}")
+        # Optional: print schema to see columns
+        # df.printSchema()
+        raise
+
+print(f"Total out: {total_out:,}")
