@@ -1,5 +1,3 @@
-# COMMAND ----------
-
 # DBTITLE 1,Set PYPI_TOKEN & CortexPy for Serverless Compute
 import os
 os.environ['PYPI_TOKEN'] = dbutils.secrets.get('all-users-scope', 'PYPI_TOKEN')
@@ -47,7 +45,9 @@ logger = get_logger(__name__, logging.INFO)
 # Please update the output file path according to the testing period as this will ensure better organization of the folder structure within Staging. 
 # For example, if the testing period is Q1 through Q4 2022, then use FY22. If the testing period is Q1 through Q2 2022, then use Q1Q2_FY22. If there are multiple entities, please use ENT1_Q1Q2_FY22.
 
-dbutils.widgets.text(name="output_path", defaultValue="", label="Enter a path to save the outputs")
+dbutils.widgets.text(name="output_path", defaultValue="", label="Enter a path to save Intermediary outputs")
+output_path = dbutils.widgets.get('output_path')
+dbutils.widgets.text(name="output_path_et", defaultValue="", label="Enter a path to save the final outputs")
 output_path = dbutils.widgets.get('output_path')
 
 # Widget to disable dataframe previews - The default input is 'No', please update to 'Yes' and re-run when ready to run for final documentation.
@@ -1761,6 +1761,10 @@ for name, df in dfs.items():
 
 print(f"Total out: {total_out:,}")
 print("\n[DONE] All pipelines complete.")
+
+# COMMAND ----------
+
+cp.fs.ls(f"{output_path}",True)
 
 # COMMAND ----------
 
