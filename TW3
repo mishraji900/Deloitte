@@ -1610,17 +1610,14 @@ display(all_matched_pairs_2_pipe2.limit(100))
 display(all_unmatched_1_pipe2.limit(100))
 
 
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 3
 # ============================================================
-# PIPELINE 2 â€” FULL SELF-CONTAINED VERSION
+# PIPELINE 2 — FULL SELF-CONTAINED VERSION
 # All derived columns explicitly created from raw source columns
 # using the same helpers as Pipeline 1
 # ============================================================
 
 # ------------------------------------------------------------
-# STEP P3-0: PREP â€” Derive all required columns on input data
+# STEP P3-0: PREP — Derive all required columns on input data
 # REMAIN_UNMATCHED_GROUPS already carries these from Pipeline 1.
 # This block is a safety re-derivation in case Pipeline 2 is
 # ever run independently from raw source data.
@@ -1630,14 +1627,14 @@ print("\n[STEP P3-0] Preparing derived columns on input data...")
 def prepare_pipe2_input(df):
     """
     Derives all columns Pipeline 2 depends on from raw source fields.
-    Idempotent â€” safe to call even if columns already exist.
+    Idempotent — safe to call even if columns already exist.
     Uses the same helper functions as Pipeline 1.
     """
 
-    # â”€â”€ Row identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Row identity ──────────────────────────────────────────────────
     df = ensure_row_id(df)              # row_id: SHA-256 of all RAW_COLUMNS
 
-    # â”€â”€ Cleaned text fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Cleaned text fields ───────────────────────────────────────────
     df = df.withColumn(
         "company_desc_clean",           # Source: "Company Description"
         F.upper(F.trim(F.col("Company Description")))
@@ -1651,22 +1648,22 @@ def prepare_pipe2_input(df):
         F.trim(F.col("Invoice Reference"))
     )
 
-    # â”€â”€ Standardised category â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Standardised category ─────────────────────────────────────────
     # Pipeline 2 hard-filters on "SALES INVOICES" and "CREDIT MEMOS".
-    # Values must match exactly â€” Pipeline 1 passes them through as-is
+    # Values must match exactly — Pipeline 1 passes them through as-is
     # from trim+upper, so "SALES INVOICES" / "CREDIT MEMOS" are expected.
     df = df.withColumn(
         "cat_clean",                    # Source: "JE Category"
         F.trim(F.upper(F.col("JE Category")))
     )
 
-    # â”€â”€ Numeric amount â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Numeric amount ────────────────────────────────────────────────
     df = df.withColumn(
         "entered_net_dec",              # Source: "Net Entered"
         to_decimal_clean("Net Entered") # handles commas, parentheses, blanks
     )
 
-    # â”€â”€ Date fields â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ── Date fields ───────────────────────────────────────────────────
     df = df.withColumn(
         "eff_dt",                       # Source: "Default Effective Date"
         to_date_clean("Default Effective Date")  # tries 5 format patterns
@@ -1688,17 +1685,17 @@ debug_count("JE_raw_pipe_3 (prepared input)", JE_raw_pipe_3)
 
 
 # ------------------------------------------------------------
-# STEP P3-1: Rebuild PK â€” COMPANY_DESC + VENDOR_NUM (no amount)
+# STEP P3-1: Rebuild PK — COMPANY_DESC + VENDOR_NUM (no amount)
 # This is the ONLY column Pipeline 2 adds that Pipeline 1 never had.
 # Pipeline 1 PK = company_desc + vendor_num + abs_amount
-# Pipeline 2 PK = company_desc + vendor_num  (looser â€” intentional)
+# Pipeline 2 PK = company_desc + vendor_num  (looser — intentional)
 # ------------------------------------------------------------
 print("\n[STEP P3-1] Rebuilding PK on REMAIN_UNMATCHED_GROUPS...")
 
 p3_base = (
     JE_raw_pipe_3
     .withColumn(
-        "p3_primary_key",               # NEW â€” only column P3 adds
+        "p3_primary_key",               # NEW — only column P3 adds
         F.when(
             F.col("company_desc_clean").isNotNull()
             & (F.col("company_desc_clean") != "")
@@ -1709,12 +1706,12 @@ p3_base = (
                 F.col("vendor_num_clean")
             )
         )
-        # No .otherwise() â†’ NULL if either field is missing
+        # No .otherwise() → NULL if either field is missing
         # NULL rows are caught below and sent to NO_MATCH_FOUND
     )
 )
 
-# Rows where PK cannot be built â†’ straight to NO_MATCH_FOUND
+# Rows where PK cannot be built → straight to NO_MATCH_FOUND
 p3_invalid_pk = materialize_df(
     p3_base.filter(F.col("p3_primary_key").isNull()),
     "p3_invalid_pk",
@@ -1728,9 +1725,9 @@ p3_base = materialize_df(
 )
 
 debug_count("p3_base (valid new PK)", p3_base)
-debug_count("p3_invalid_pk (no new PK â†’ NO_MATCH_FOUND)", p3_invalid_pk)
+debug_count("p3_invalid_pk (no new PK → NO_MATCH_FOUND)", p3_invalid_pk)
 
-# â”€â”€ Quick null profile on the 22K invalid PK rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ── Quick null profile on the 22K invalid PK rows ──────────────────
 # Tells you exactly which field is causing the PK failure.
 print("\n  [PROFILE] PK failure breakdown on p3_invalid_pk")
 p3_invalid_pk.select(
@@ -1824,8 +1821,8 @@ debug_count("p3_candidates (within tolerance)", p3_candidates)
 # Logic:
 #   - Count distinct credit matches per sales_row_id
 #   - Count distinct sales matches per credit_row_id
-#   - If either count > 1 for any row in a pair â†’ ONE_TO_MANY
-#   - If both counts == 1 â†’ ONE_TO_ONE â†’ check dates
+#   - If either count > 1 for any row in a pair → ONE_TO_MANY
+#   - If both counts == 1 → ONE_TO_ONE → check dates
 # ------------------------------------------------------------
 print("\n[STEP P3-4] Classifying one-to-many vs one-to-one...")
 
@@ -1861,7 +1858,7 @@ p3_candidates_classified = materialize_df(
 )
 
 # ------------------------------------------------------------
-# STEP P3-5: ONE-TO-MANY â€” collect all original rows
+# STEP P3-5: ONE-TO-MANY — collect all original rows
 # ------------------------------------------------------------
 print("\n[STEP P3-5] Building DATASET_ONE_TO_MANY...")
 
@@ -1899,7 +1896,7 @@ DATASET_ONE_TO_MANY = materialize_df(
 debug_count("DATASET_ONE_TO_MANY", DATASET_ONE_TO_MANY)
 
 # ------------------------------------------------------------
-# STEP P3-6: ONE-TO-ONE â€” split by date sync
+# STEP P3-6: ONE-TO-ONE — split by date sync
 # A row that appears in one-to-many is excluded here
 # ------------------------------------------------------------
 print("\n[STEP P3-6] Building date-sync / date-unsync datasets...")
@@ -1997,11 +1994,11 @@ DATASET_NO_MATCH_FOUND = materialize_df(
 debug_count("DATASET_NO_MATCH_FOUND", DATASET_NO_MATCH_FOUND)
 
 # ------------------------------------------------------------
-# STEP P3-8: AUDIT â€” row count conservation check
+# STEP P3-8: AUDIT — row count conservation check
 # ------------------------------------------------------------
 print("\n=== Pipeline 2 AUDIT ===")
 
-# Capture counts once â€” avoids re-triggering plan serialization
+# Capture counts once — avoids re-triggering plan serialization
 cnt_in        = JE_raw_pipe_3.count()
 cnt_otm       = DATASET_ONE_TO_MANY.count()
 cnt_sync      = DATASET_1_1_DATE_SYNC.count()
@@ -2013,15 +2010,15 @@ total_out = cnt_otm + cnt_sync + cnt_unsync + cnt_no_match
 
 print(f"\n  {'Dataset':<45} {'Count':>10}")
 print(f"  {'-'*55}")
-print(f"  {'INPUT  â€” JE_raw_pipe_3':<45} {total_in:>10,}")
-print(f"  {'OUTPUT â€” DATASET_ONE_TO_MANY':<45} {cnt_otm:>10,}")
-print(f"  {'OUTPUT â€” DATASET_1_1_DATE_SYNC':<45} {cnt_sync:>10,}")
-print(f"  {'OUTPUT â€” DATASET_1_1_DATE_UNSYNC':<45} {cnt_unsync:>10,}")
-print(f"  {'OUTPUT â€” DATASET_NO_MATCH_FOUND':<45} {cnt_no_match:>10,}")
+print(f"  {'INPUT  — JE_raw_pipe_3':<45} {total_in:>10,}")
+print(f"  {'OUTPUT — DATASET_ONE_TO_MANY':<45} {cnt_otm:>10,}")
+print(f"  {'OUTPUT — DATASET_1_1_DATE_SYNC':<45} {cnt_sync:>10,}")
+print(f"  {'OUTPUT — DATASET_1_1_DATE_UNSYNC':<45} {cnt_unsync:>10,}")
+print(f"  {'OUTPUT — DATASET_NO_MATCH_FOUND':<45} {cnt_no_match:>10,}")
 print(f"  {'-'*55}")
 print(f"\n  [AUDIT] Total IN  : {total_in:>10,}")
 print(f"  [AUDIT] Total OUT : {total_out:>10,}")
-print(f"  [AUDIT] Diff      : {total_in - total_out:>10,}  â† should be 0")
+print(f"  [AUDIT] Diff      : {total_in - total_out:>10,}  ← should be 0")
 
 assert total_in == total_out, (
     f"Row count mismatch! IN={total_in:,}  OUT={total_out:,}  "
@@ -2069,6 +2066,12 @@ def safe_for_excel(df):
     remaining_cols = [c for c in df.columns if c not in front_cols]
     return df.select(*(front_cols + remaining_cols)).pandas_api()
 
+Unmatched_final_items = union_non_null(
+    DATASET_ONE_TO_MANY,
+    DATASET_1_1_DATE_SYNC,
+    DATASET_1_1_DATE_UNSYNC,
+    DATASET_NO_MATCH_FOUND
+)
     
 cp.pandas.to_excel(
     dataframes=[
@@ -2077,13 +2080,14 @@ cp.pandas.to_excel(
         safe_for_excel(all_DATASET_DUPLICATE_PK_OTHER_OR_ZERO),
         safe_for_excel(all_DATASET_1_OTHER_UNIQUE_PK),
         safe_for_excel(all_matched_pairs),
-        safe_for_excel(all_unmatched),
+        # safe_for_excel(all_unmatched),
         safe_for_excel(all_matched_pairs_2_pipe2),
-        safe_for_excel(all_unmatched_1_pipe2),
-        safe_for_excel(DATASET_ONE_TO_MANY),
-        safe_for_excel(DATASET_1_1_DATE_SYNC),
-        safe_for_excel(DATASET_1_1_DATE_UNSYNC),
-        safe_for_excel(DATASET_NO_MATCH_FOUND),
+        # safe_for_excel(all_unmatched_1_pipe2),
+        # safe_for_excel(DATASET_ONE_TO_MANY),
+        # safe_for_excel(DATASET_1_1_DATE_SYNC),
+        # safe_for_excel(DATASET_1_1_DATE_UNSYNC),
+        # safe_for_excel(DATASET_NO_MATCH_FOUND),
+        safe_for_excel(Unmatched_final_items)
     ],
     sheet_names=[
         "INVALID_PREP_ROWS",
@@ -2091,17 +2095,16 @@ cp.pandas.to_excel(
         "OTHER_Duplicate_PKs",
         "Other_Unique_PKs",
         "ALL_MATCHED_PAIRS",
-        "REMAIN_UNMATCHED_GROUPS",
+        # "REMAIN_UNMATCHED_GROUPS",
         "ALL_MATCHED_PAIRS_2",
-        "REMAIN_UNMATCHED_GROUPS_2",
-        "ONE_TO_MANY",
-        "DATE_SYNC_1_1",
-        "DATE_UNSYNC_1_1",
-        "NO_MATCH_FOUND",
+        # "REMAIN_UNMATCHED_GROUPS_2",
+        # "ONE_TO_MANY",
+        # "DATE_SYNC_1_1",
+        # "DATE_UNSYNC_1_1",
+        # "NO_MATCH_FOUND",
+        "Unmatched Items"
     ],
     path=f"{output_path}/Tradeweb Securities Data Final.xlsx",
 )
 
-print("\n[DONE] Pipeline 2 complete.")
-
-# COMMAND ----------
+print("\n[DONE] Pipeline 3 complete.")
