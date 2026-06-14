@@ -1,31 +1,24 @@
-print("\n[FINAL] === END-TO-END ROW CONSERVATION CHECK ===")
+[PATH_NOT_FOUND] Path does not exist: dbfs:/Volumes/cortex_prd_catalog/tradeweb_fy25_a_07c9b945_68d6_492a_99ae_dee6e88d6304_raw/spec-dataprep/Securities/V4_2/between/_stage/p1/pairs_NEXT_MONTH_EXACT_i1.parquet. SQLSTATE: 42K03
+File <command-6964436880502300>, line 96
+     93 # ── Steps 5-8: Match pipeline ─────────────────────────────────────────────────
+     94 print("\n[P1-S5-8] Running all match steps...")
+---> 96 p1_resolved_list, p1_rem_sales, p1_rem_credit = run_match_pipeline(
+     97     p1_sales, p1_credit, P1_DUP_SI_CM, MATCH_STEPS, STAGE_PATH_P1, has_year_flag=False
+     98 )
+    100 # ── Step 9: Unmatched ─────────────────────────────────────────────────────────
+    101 print("\n[P1-S9] Assembling unmatched groups...")
+File /databricks/python/lib/python3.10/site-packages/pyspark/sql/connect/client/core.py:1995, in SparkConnectClient._handle_rpc_error(self, rpc_error)
+   1991             d.Unpack(info)
+   1993             self._handle_rpc_error_with_error_info(info, status.message, status_code)  # EDGE
+-> 1995             raise convert_exception(
+   1996                 info,
+   1997                 status.message,
+   1998                 self._fetch_enriched_error(info),
+   1999                 self._display_server_stack_trace(),
+   2000             ) from None
+   2002     raise SparkConnectGrpcException(
+   2003         message=status.message,
+   2004         sql_state=ErrorCode.CLIENT_UNEXPECTED_MISSING_SQL_STATE,  # EDGE
+   2005     ) from None
+   2006 else:
 
-total_raw = JE_raw.count()
-print(f"Raw rows: {total_raw:,}")
-
-dfs = {
-    "all_invalid": all_invalid,
-    "all_exc_1": all_exc_1,
-    "all_dup_other": all_dup_other,
-    "all_unique_other": all_unique_other,
-    "P1_ALL_MATCHED": P1_ALL_MATCHED,
-    "P2_ALL_MATCHED": P2_ALL_MATCHED,
-    "P3_ALL_UNMATCHED_COMMENTED": P3_ALL_UNMATCHED_COMMENTED,
-}
-
-total_out = 0
-for name, df in dfs.items():
-    if df is None:
-        print(f"  {name}: None")
-        continue
-    try:
-        cnt = df.count()
-        print(f"  {name}: {cnt:,}")
-        total_out += cnt
-    except Exception as e:
-        print(f"  [ERROR] {name} caused: {e}")
-        # Optional: print schema to see columns
-        # df.printSchema()
-        raise
-
-print(f"Total out: {total_out:,}")
