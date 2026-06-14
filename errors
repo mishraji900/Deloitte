@@ -1,18 +1,5 @@
-All rules, priority order (first match wins):
+'SPEC-DATAPREP/Securities/V4_2/Final2/P1_credit.parquet/_committed_2808205554411123585',
 
-| Priority | Rule Tag | Match Type | Condition | AA Comment |
-|---|---|---|---|---|
-| 1 | `Rule1_OTM_RequiresReview` | `ONE_TO_MANY` | Sales or credit row had multiple candidates in P3 cross-join | `"Requires Audit Team Review"` |
-| 2a | `Rule2a_DateSync_ExactMatch` | `ONE_TO_ONE_DATE_SYNC` | Sales `eff_dt` < Credit `eff_dt` AND `amount_net == 0` | `"Exact Match"` |
-| 2b | `Rule2a_DateSync_ApproxMatch` | `ONE_TO_ONE_DATE_SYNC` | Sales `eff_dt` < Credit `eff_dt` AND `amount_net > 0` (within P3_TOLERANCE=100) | `"Approx Match"` |
-| 3a | `Rule2b_DateUnsync_ExactMatch` | `ONE_TO_ONE_DATE_UNSYNC` | Credit `eff_dt` <= Sales `eff_dt` AND `amount_net == 0` | `"Exact Match"` |
-| 3b | `Rule2b_DateUnsync_ApproxMatch` | `ONE_TO_ONE_DATE_UNSYNC` | Credit `eff_dt` <= Sales `eff_dt` AND `amount_net > 0` (within tolerance) | `"Approx Match"` |
-| 4 | `Rule3P1_OnlyCredits` | `NO_MATCH_FOUND` + CM only | Vendor has 0 sales invoices, >0 credit memos in full raw | `"Only Credit Memos Present"` |
-| 5 | `Rule3P2_SingleCreditCombo` | `NO_MATCH_FOUND` + CM only | Vendor has exactly 1 unique credit combination | `"Single Credit Memo with One Combination"` |
-| 6 | `Rule3P3_SmallAmt_le5` | `NO_MATCH_FOUND` + CM only | `abs(Net Entered) <= 5` | `"Small Amount"` |
-| 7 | `Rule3P4_FirstMonthOfQtr_Qn` | `NO_MATCH_FOUND` + CM only | `eff_dt` month == first month of row's own Source Quarter | `"<MonthName> Credit Memo"` |
-| 8 | `Rule3P5_ClientConfirm` | `NO_MATCH_FOUND` + CM only | Catch-all | `"Client to Confirm"` |
+'SPEC-DATAPREP/Securities/V4_2/Final2/P1_credit.parquet/_started_2808205554411123585',
 
-`NO_MATCH_FOUND` Sales Invoice rows → `AA Comment` = NULL (no rule fires).
-
-
+'SPEC-DATAPREP/Securities/V4_2/Final2/P1_credit.parquet/part-00000-tid-2808205554411123585-b5020db4-de69-4b2a-ba90-79b770188767-118829-1.c000.snappy.parquet can you check where are files like these being created in coed
