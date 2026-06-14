@@ -488,23 +488,40 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
     total_pairs      = 0
 
     # ── Attempt checkpoint resume ─────────────────────────────────────────────
+    # Only resumes if checkpoint exists, last_iter > 0 (not -1 done-sentinel),
+    # AND every expected pair file is physically present on disk.
+    # A stale/partial checkpoint from a prior crash is silently discarded.
     try:
         ckpt_row  = cp.read(ckpt_meta_path).collect()[0]
         last_iter = ckpt_row["last_completed_iteration"]
         if last_iter == -1:
-            print(f"  [CKPT] Prior run finished — starting fresh.")
+            # Completed cleanly in a prior run — start fresh this run
+            print(f"  [CKPT] Prior run completed cleanly — starting fresh.")
+        elif last_iter > 0:
+            # Verify every expected pair file actually exists before trusting ckpt
+            _candidate_paths = [
+                (f"{match_label}_i{i}", f"{base}/pairs_{match_label}_i{i}.parquet")
+                for i in range(1, last_iter + 1)
+            ]
+            try:
+                _all_exist = all(len(dbutils.fs.ls(p)) > 0 for _, p in _candidate_paths)
+            except Exception:
+                _all_exist = False
+
+            if _all_exist:
+                total_pairs     = ckpt_row["total_pairs"]
+                cur_sales       = cp.read(ckpt_sales_path)
+                cur_credit      = cp.read(ckpt_credit_path)
+                accumulated     = list(_candidate_paths)
+                start_iteration = last_iter + 1
+                print(f"  [CKPT] Resuming from iteration {start_iteration} "
+                      f"(pairs so far: {total_pairs:,})")
+            else:
+                print(f"  [CKPT] Stale checkpoint (pair files missing) — starting fresh.")
         else:
-            total_pairs = ckpt_row["total_pairs"]
-            cur_sales   = cp.read(ckpt_sales_path)
-            cur_credit  = cp.read(ckpt_credit_path)
-            for i in range(1, last_iter + 1):
-                iter_lbl = f"{match_label}_i{i}"
-                accumulated.append((iter_lbl, f"{base}/pairs_{iter_lbl}.parquet"))
-            start_iteration = last_iter + 1
-            print(f"  [CKPT] Resuming from iteration {start_iteration} "
-                  f"(pairs so far: {total_pairs:,})")
+            print(f"  [CKPT] Checkpoint unreadable (last_iter={last_iter}) — starting fresh.")
     except Exception:
-        print(f"  [CKPT] No checkpoint — starting fresh.")
+        print(f"  [CKPT] No checkpoint found — starting fresh.")
 
     # ── Main loop ─────────────────────────────────────────────────────────────
     for iteration in range(start_iteration, max_iterations + 1):
@@ -530,8 +547,14 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
             break
 
         total_pairs += n
-        pairs = pairs.withColumn("match_type", F.lit(match_label))
-        # pairs already materialized inside rank_based_match as pairs_{iter_lbl}
+        # pairs_{iter_lbl}.parquet already written by rank_based_match
+        # match_type column is set to iter_lbl inside rank_based_match —
+        # overwrite it here with the step-level label (e.g. NEXT_MONTH_EXACT)
+        # by re-materializing. This is the only extra write per iteration.
+        pairs = materialize_df(
+            pairs.withColumn("match_type", F.lit(match_label)),
+            f"pairs_{iter_lbl}", stage_path=base
+        )
         accumulated.append((iter_lbl, f"{base}/pairs_{iter_lbl}.parquet"))
 
         # Materialize rem sets so next iteration doesn't carry growing lineage
