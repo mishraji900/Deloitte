@@ -1,0 +1,8 @@
+// filename: preload.js
+const { contextBridge, ipcRenderer } = require("electron");
+
+contextBridge.exposeInMainWorld("validatorApi", {
+  pickExcelFile: () => ipcRenderer.invoke("pick-excel-file"),
+  runValidation: (payload) => ipcRenderer.invoke("run-validation", payload),
+  openReport: (reportPath) => ipcRenderer.invoke("open-report", reportPath)
+});
