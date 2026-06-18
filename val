@@ -1,0 +1,392 @@
+# filename: excel-validator.py
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill
+
+
+@dataclass
+class ColumnRule:
+    column: str
+    expected_header: str
+    numeric: bool = False
+
+
+@dataclass
+class FileRule:
+    file_path: str
+    sheet_name: str
+    header_row: int
+    data_start_row: int
+    data_end_row: int
+    start_col: str
+    end_col: str
+    number_of_columns: int = 0
+    columns: list[ColumnRule] = field(default_factory=list)
+
+
+def col_letter_to_index(col: str) -> int:
+    text = str(col or "").strip().upper()
+    if not text:
+        raise ValueError("Column letter cannot be blank.")
+    value = 0
+    for char in text:
+        if not ("A" <= char <= "Z"):
+            raise ValueError(f"Invalid column letter: {col}")
+        value = value * 26 + (ord(char) - 64)
+    return value
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def make_result(rule: FileRule) -> dict[str, Any]:
+    return {
+        "file_path": rule.file_path,
+        "sheet_name": rule.sheet_name,
+        "file_exists": False,
+        "sheet_exists": False,
+        "range_read": False,
+        "status": "FAIL",
+        "errors": [],
+        "columns": [],
+    }
+
+
+def validate_rule(rule: FileRule) -> dict[str, Any]:
+    result = make_result(rule)
+    path = Path(rule.file_path)
+
+    if not path.exists():
+        result["errors"].append("File not found.")
+        return result
+    result["file_exists"] = True
+
+    try:
+        excel_file = pd.ExcelFile(path)
+    except Exception as exc:
+        result["errors"].append(f"Unable to open workbook: {exc}")
+        return result
+
+    if rule.sheet_name not in excel_file.sheet_names:
+        result["errors"].append("Sheet not found.")
+        return result
+    result["sheet_exists"] = True
+
+    if min(rule.header_row, rule.data_start_row, rule.data_end_row) < 1:
+        result["errors"].append("Row numbers must be greater than zero.")
+        return result
+
+    if rule.header_row > rule.data_start_row:
+        result["errors"].append("header_row cannot be greater than data_start_row.")
+        return result
+
+    if rule.data_start_row > rule.data_end_row:
+        result["errors"].append("data_start_row cannot be greater than data_end_row.")
+        return result
+
+    if rule.number_of_columns < 1:
+        result["errors"].append("number_of_columns must be at least 1.")
+        return result
+
+    if len(rule.columns) != rule.number_of_columns:
+        result["errors"].append(
+            f"Expected {rule.number_of_columns} column mapping rows, found {len(rule.columns)}."
+        )
+        return result
+
+    try:
+        start_idx = col_letter_to_index(rule.start_col)
+        end_idx = col_letter_to_index(rule.end_col)
+    except Exception as exc:
+        result["errors"].append(str(exc))
+        return result
+
+    if start_idx > end_idx:
+        result["errors"].append(
+            f"Start column cannot be after End column. You entered {rule.start_col}:{rule.end_col}."
+        )
+        return result
+
+    available_column_count = end_idx - start_idx + 1
+    if rule.number_of_columns > available_column_count:
+        result["errors"].append(
+            f"Number of headers out of bound. Selected range {rule.start_col}:{rule.end_col} "
+            f"contains only {available_column_count} columns, but number_of_columns is "
+            f"{rule.number_of_columns}."
+        )
+        return result
+
+    try:
+        raw = pd.read_excel(
+            path,
+            sheet_name=rule.sheet_name,
+            header=None,
+            skiprows=rule.header_row - 1,
+            nrows=rule.data_end_row - rule.header_row + 1,
+            usecols=f"{rule.start_col}:{rule.end_col}",
+            dtype=object,
+        )
+    except Exception as exc:
+        result["errors"].append(f"Unable to read configured range: {exc}")
+        return result
+
+    if raw.empty:
+        result["errors"].append("Configured range returned no data.")
+        return result
+
+    result["range_read"] = True
+    header_values = raw.iloc[0].tolist()
+    body_start = rule.data_start_row - rule.header_row
+    body_end = rule.data_end_row - rule.header_row
+    body = raw.iloc[body_start : body_end + 1].reset_index(drop=True)
+
+    seen_columns = set()
+
+    for column_rule in rule.columns:
+      col_name = normalize_text(column_rule.column).upper()
+      expected_header = normalize_text(column_rule.expected_header)
+      col_result = {
+          "column": col_name,
+          "expected_header": expected_header,
+          "actual_header": None,
+          "header_match": False,
+          "non_blank_count": 0,
+          "numeric": column_rule.numeric,
+          "numeric_sum": None,
+      }
+
+      if not col_name:
+          result["errors"].append("Mapped column cannot be blank.")
+          result["columns"].append(col_result)
+          continue
+
+      if not expected_header:
+          result["errors"].append(f"Expected header cannot be blank for column {col_name}.")
+          result["columns"].append(col_result)
+          continue
+
+      if col_name in seen_columns:
+          result["errors"].append(f"Duplicate mapped column: {col_name}.")
+          result["columns"].append(col_result)
+          continue
+      seen_columns.add(col_name)
+
+      try:
+          abs_idx = col_letter_to_index(col_name)
+      except Exception:
+          result["errors"].append(f"Invalid mapped column: {col_name}")
+          result["columns"].append(col_result)
+          continue
+
+      rel_idx = abs_idx - start_idx
+      if rel_idx < 0 or rel_idx >= len(header_values):
+          result["errors"].append(
+              f"Column {col_name} is outside range {rule.start_col}:{rule.end_col}."
+          )
+          result["columns"].append(col_result)
+          continue
+
+      actual_header = normalize_text(header_values[rel_idx])
+      header_match = actual_header == expected_header
+      col_result["actual_header"] = actual_header
+      col_result["header_match"] = header_match
+
+      if not header_match:
+          result["errors"].append(
+              f"Header mismatch at {col_name}{rule.header_row}: expected "
+              f"'{expected_header}', found '{actual_header}'."
+          )
+
+      series = body.iloc[:, rel_idx]
+      mask = series.notna() & series.astype(str).str.strip().ne("")
+      col_result["non_blank_count"] = int(mask.sum())
+
+      if column_rule.numeric:
+          numeric_series = pd.to_numeric(series, errors="coerce")
+          if numeric_series.notna().any():
+              col_result["numeric_sum"] = float(numeric_series.sum())
+
+      result["columns"].append(col_result)
+
+    result["status"] = "PASS" if not result["errors"] else "FAIL"
+    return result
+
+
+def validate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    rules = []
+    for item in payload.get("files", []):
+        columns = [ColumnRule(**col) for col in item.get("columns", [])]
+        rules.append(
+            FileRule(
+                file_path=item.get("file_path", ""),
+                sheet_name=item.get("sheet_name", ""),
+                header_row=int(item.get("header_row", 0) or 0),
+                data_start_row=int(item.get("data_start_row", 0) or 0),
+                data_end_row=int(item.get("data_end_row", 0) or 0),
+                start_col=item.get("start_col", ""),
+                end_col=item.get("end_col", ""),
+                number_of_columns=int(item.get("number_of_columns", 0) or 0),
+                columns=columns,
+            )
+        )
+
+    results = [validate_rule(rule) for rule in rules]
+    overall_status = "PASS" if results and all(item["status"] == "PASS" for item in results) else "FAIL"
+
+    return {
+        "overall_status": overall_status,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_count": len(results),
+        "results": results,
+    }
+
+
+def style_sheet(ws) -> None:
+    fill = PatternFill(fill_type="solid", fgColor="D9EAD3")
+    font = Font(bold=True)
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+    for col in ws.columns:
+        width = max(len(str(cell.value or "")) for cell in col) + 2
+        ws.column_dimensions[col[0].column_letter].width = min(width, 50)
+
+
+def write_excel_report(validation_output: dict[str, Any], report_path: str) -> str:
+    wb = Workbook()
+
+    ws = wb.active
+    ws.title = "Summary"
+    ws.append(["Metric", "Value"])
+    ws.append(["Overall Status", validation_output["overall_status"]])
+    ws.append(["Generated At", validation_output["generated_at"]])
+    ws.append(["File Count", validation_output["file_count"]])
+    style_sheet(ws)
+
+    ws = wb.create_sheet("File Checks")
+    ws.append(["File Path", "Sheet", "File Exists", "Sheet Exists", "Range Read", "Status", "Errors"])
+    for item in validation_output["results"]:
+        ws.append([
+            item["file_path"],
+            item["sheet_name"],
+            item["file_exists"],
+            item["sheet_exists"],
+            item["range_read"],
+            item["status"],
+            " | ".join(item["errors"]),
+        ])
+    style_sheet(ws)
+
+    ws = wb.create_sheet("Column Checks")
+    ws.append([
+        "File Path",
+        "Sheet",
+        "Column",
+        "Expected Header",
+        "Actual Header",
+        "Header Match",
+        "Non Blank Count",
+        "Numeric",
+        "Numeric Sum",
+    ])
+    for item in validation_output["results"]:
+        for col in item["columns"]:
+            ws.append([
+                item["file_path"],
+                item["sheet_name"],
+                col["column"],
+                col["expected_header"],
+                col["actual_header"],
+                col["header_match"],
+                col["non_blank_count"],
+                col["numeric"],
+                col["numeric_sum"],
+            ])
+    style_sheet(ws)
+
+    output = Path(report_path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output)
+    return str(output.resolve())
+
+
+def build_ui_response(validation_output: dict[str, Any], report_path: str | None) -> dict[str, Any]:
+    files = []
+    for item in validation_output["results"]:
+        files.append({
+            "filePath": item["file_path"],
+            "fileName": Path(item["file_path"]).name,
+            "sheetName": item["sheet_name"],
+            "status": item["status"],
+            "fileExists": item["file_exists"],
+            "sheetExists": item["sheet_exists"],
+            "rangeRead": item["range_read"],
+            "errors": item["errors"],
+            "columns": [
+                {
+                    "column": col["column"],
+                    "expectedHeader": col["expected_header"],
+                    "actualHeader": col["actual_header"],
+                    "headerMatch": col["header_match"],
+                    "nonBlankCount": col["non_blank_count"],
+                    "numericSum": col["numeric_sum"],
+                }
+                for col in item["columns"]
+            ],
+        })
+
+    return {
+        "success": validation_output["overall_status"] == "PASS",
+        "overallStatus": validation_output["overall_status"],
+        "generatedAt": validation_output["generated_at"],
+        "fileCount": validation_output["file_count"],
+        "passedFiles": sum(1 for item in files if item["status"] == "PASS"),
+        "failedFiles": sum(1 for item in files if item["status"] == "FAIL"),
+        "reportPath": report_path,
+        "files": files,
+    }
+
+
+def build_default_report_path(payload: dict[str, Any]) -> str:
+    output_dir = payload.get("report_output_dir", ".")
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return str(Path(output_dir) / f"data_validation_report_{stamp}.xlsx")
+
+
+def main() -> None:
+    try:
+        payload = json.load(sys.stdin)
+        validation_output = validate_payload(payload)
+
+        report_path = None
+        if payload.get("generate_excel_report"):
+            report_path = write_excel_report(validation_output, build_default_report_path(payload))
+
+        print(json.dumps(build_ui_response(validation_output, report_path)))
+        sys.exit(0)
+    except Exception as exc:
+        print(json.dumps({
+            "success": False,
+            "overallStatus": "FAIL",
+            "message": str(exc),
+            "files": [],
+        }))
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
