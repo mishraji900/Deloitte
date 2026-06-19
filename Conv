@@ -1,0 +1,39 @@
+import os
+import pandas as pd
+
+
+def convert_to_xlsx(file_path, output_dir):
+    """
+    Converts .xls, .xlsm, .xlsx input to a clean .xlsx in output_dir.
+
+    Important behavior:
+    - Does NOT treat row 1 as headers
+    - Preserves row 1 as data
+    - Writes output without invented header names such as "Unnamed: 1"
+    """
+    base_name = os.path.splitext(os.path.basename(file_path))[0]
+    output_path = os.path.join(output_dir, f"{base_name}.xlsx")
+    ext = os.path.splitext(file_path)[1].lower()
+
+    if ext == ".xls":
+        all_sheets = pd.read_excel(
+            file_path,
+            sheet_name=None,
+            engine="xlrd",
+            header=None
+        )
+    elif ext in (".xlsm", ".xlsx"):
+        all_sheets = pd.read_excel(
+            file_path,
+            sheet_name=None,
+            engine="openpyxl",
+            header=None
+        )
+    else:
+        raise ValueError(f"Unsupported file extension: {ext}")
+
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        for sheet_name, df in all_sheets.items():
+            df.to_excel(writer, sheet_name=sheet_name, index=False, header=False)
+
+    return output_path
