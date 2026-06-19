@@ -1,0 +1,54 @@
+// filename: src/App.jsx
+import React, { useState } from 'react';
+import UploadScreen from './components/UploadScreen.jsx';
+import MappingScreen from './components/MappingScreen.jsx';
+import ValidationScreen from './components/ValidationScreen.jsx';
+
+export default function App() {
+  const [screen, setScreen] = useState('upload');
+  const [ingestPayload, setIngestPayload] = useState(null);
+  const [mappedRows, setMappedRows] = useState([]);
+
+  function goToMapping(payload) {
+    setIngestPayload(payload);
+    setMappedRows([]);
+    setScreen('mapping');
+  }
+
+  function goToValidation(rows) {
+    setMappedRows(rows);
+    setScreen('validation');
+  }
+
+  function goBackToUpload() {
+    setScreen('upload');
+    setIngestPayload(null);
+    setMappedRows([]);
+  }
+
+  function goBackToMapping() {
+    setScreen('mapping');
+  }
+
+  return (
+    <>
+      <div className="topbar">
+        <span className="topbar-logo">Deloitte.</span>
+        <div className="topbar-divider" />
+        <span className="topbar-app">Sheet Ingestor</span>
+      </div>
+
+      {screen === 'validation' && mappedRows.length > 0 ? (
+        <ValidationScreen rows={mappedRows} onBack={goBackToMapping} />
+      ) : screen === 'mapping' && ingestPayload ? (
+        <MappingScreen
+          payload={ingestPayload}
+          onBack={goBackToUpload}
+          onContinue={goToValidation}
+        />
+      ) : (
+        <UploadScreen onContinue={goToMapping} />
+      )}
+    </>
+  );
+}
