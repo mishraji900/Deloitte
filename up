@@ -1,0 +1,317 @@
+// filename : UploadScreen.jsx
+import React, { useState } from 'react';
+
+export default function UploadScreen({ onContinue }) {
+  const [selectedFiles, setSelectedFiles] = useState([]);
+  const [status, setStatus] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [dragging, setDragging] = useState(false);
+
+  async function handleSelectFiles() {
+    const files = await window.api.selectFiles();
+
+    if (files && files.length) {
+      addFiles(files);
+    }
+  }
+
+  function addFiles(newFiles) {
+    setSelectedFiles(prev => {
+      const merged = [...prev, ...newFiles];
+
+      // remove duplicates
+      return [...new Set(merged)];
+    });
+
+    setStatus('');
+  }
+
+  function handleDragOver(e) {
+    e.preventDefault();
+    setDragging(true);
+  }
+
+  function handleDragLeave(e) {
+    e.preventDefault();
+    setDragging(false);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setDragging(false);
+
+    const files = [...e.dataTransfer.files];
+
+    if (!files.length) return;
+
+    const allowed = ['.xls', '.xlsx', '.xlsm'];
+
+    const invalidFiles = files.filter(
+      file =>
+        !allowed.some(ext =>
+          file.name.toLowerCase().endsWith(ext)
+        )
+    );
+
+    const filePaths = files
+      .filter(file =>
+        allowed.some(ext =>
+          file.name.toLowerCase().endsWith(ext)
+        )
+      )
+      .map(file => file.path);
+
+    if (!filePaths.length) {
+      setStatus(
+        'Please drop only Excel files (.xls, .xlsx, .xlsm)'
+      );
+      return;
+    }
+
+    if (invalidFiles.length > 0) {
+      setStatus(
+        `${invalidFiles.length} non-Excel file(s) were ignored.`
+      );
+    }
+
+    addFiles(filePaths);
+  }
+
+  function getFileBadge(filepath) {
+    const name = filepath.toLowerCase();
+
+    if (name.includes('plan operations')) {
+      return {
+        label: 'Plan Ops',
+        cls: 'badge-plan'
+      };
+    }
+
+    if (name.includes('net trust assets')) {
+      return {
+        label: 'Net Trust',
+        cls: 'badge-trust'
+      };
+    }
+
+    return {
+      label: 'File',
+      cls: 'badge-neutral'
+    };
+  }
+
+  function getFileName(filepath) {
+    return filepath.split(/[\\/]/).pop();
+  }
+
+  function removeFile(filepath) {
+    setSelectedFiles(prev =>
+      prev.filter(f => f !== filepath)
+    );
+  }
+
+  const planCount = selectedFiles.filter(f =>
+    f.toLowerCase().includes('plan operations')
+  ).length;
+
+  const trustCount = selectedFiles.filter(f =>
+    f.toLowerCase().includes('net trust assets')
+  ).length;
+
+  async function handleContinue() {
+    setBusy(true);
+    setStatus('Converting files...');
+
+    try {
+      const result = await window.api.convertFiles(
+        selectedFiles
+      );
+
+      setStatus('Identifying files...');
+
+      const planFile = result.files.find(f =>
+        f.original
+          .toLowerCase()
+          .includes('plan operations')
+      );
+
+      const trustFile = result.files.find(f =>
+        f.original
+          .toLowerCase()
+          .includes('net trust assets')
+      );
+
+      if (!planFile || !trustFile) {
+        setStatus(
+          'Error: could not identify both required files.'
+        );
+        setBusy(false);
+        return;
+      }
+
+      if (
+        planFile.status === 'error' ||
+        trustFile.status === 'error'
+      ) {
+        setStatus(
+          'Conversion error: ' +
+            (planFile.error ||
+              trustFile.error ||
+              'unknown')
+        );
+
+        setBusy(false);
+        return;
+      }
+
+      onContinue({
+        planFile: planFile.converted,
+        trustFile: trustFile.converted
+      });
+    } catch (err) {
+      setStatus('Error: ' + err.message);
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="page">
+      <div className="steps">
+        <div className="step active">
+          <div className="step-num">1</div>
+          <span>Select Files</span>
+        </div>
+
+        <div className="step-line" />
+
+        <div className="step">
+          <div className="step-num">2</div>
+          <span>Map Sheets</span>
+        </div>
+
+        <div className="step-line" />
+
+        <div className="step">
+          <div className="step-num">3</div>
+          <span>Validate</span>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-icon">📂</div>
+
+        <h1>Select your files</h1>
+
+        <p className="hint">
+          Choose 2 Excel files — one containing
+          "plan operations" and one containing
+          "net trust assets" in the filename.
+        </p>
+
+        <div className="format-tags">
+          <span className="tag">.xlsx</span>
+          <span className="tag">.xls</span>
+          <span className="tag">.xlsm</span>
+        </div>
+
+        {selectedFiles.length > 0 && (
+          <ul className="file-list">
+            {selectedFiles.map((f, i) => {
+              const badge = getFileBadge(f);
+
+              return (
+                <li
+                  key={i}
+                  className="file-item"
+                >
+                  <span className="file-item-icon">
+                    📄
+                  </span>
+
+                  <span className="file-item-name">
+                    {getFileName(f)}
+                  </span>
+
+                  <span
+                    className={`file-item-badge ${badge.cls}`}
+                  >
+                    {badge.label}
+                  </span>
+
+                  <button
+                    className="remove-file-btn"
+                    onClick={() =>
+                      removeFile(f)
+                    }
+                  >
+                    ✕
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+
+        <div
+          className={`dropzone ${
+            dragging ? 'dragging' : ''
+          }`}
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+        >
+          <div className="dropzone-icon">
+            ⬆
+          </div>
+
+          <p>
+            Drag & Drop Excel files here
+          </p>
+
+          <span>
+            Accepted: .xls, .xlsx, .xlsm
+          </span>
+        </div>
+
+        {(planCount !== 1 ||
+          trustCount !== 1) && (
+          <div className="status">
+            Please select exactly one
+            Plan Operations file and one
+            Net Trust Assets file.
+          </div>
+        )}
+
+        {status && (
+          <div className="status">
+            {status}
+          </div>
+        )}
+
+        <div className="btn-row">
+          <button
+            className="btn btn-ghost"
+            onClick={handleSelectFiles}
+            disabled={busy}
+          >
+            Add Files
+          </button>
+
+          <button
+            className="btn btn-primary"
+            onClick={handleContinue}
+            disabled={
+              busy ||
+              planCount !== 1 ||
+              trustCount !== 1
+            }
+          >
+            {busy
+              ? 'Processing...'
+              : 'Convert & Continue →'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
