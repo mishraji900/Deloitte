@@ -1,6 +1,34 @@
 from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
+from pyspark.sql import functions as F
+
+# Assume your raw >10M row DataFrame is 'gl_df'
+
+# 1. Define all dimensions needed for filters AND the Y-axis hierarchy
+dimensions = [
+    "Entity", "Grouping", "LOB", "FS Line",           # Global Filters
+    "FS Category", "Account Description",             # Y-Axis Hierarchy
+    "Account Number", "Transaction Type", 
+    "Flag"                                            # CRITICAL for Sankey cross-highlighting
+]
+
+# 2. Aggregate the 10M+ rows down to just the unique combinations
+diverging_bar_df = gl_df.groupBy(*dimensions).agg(
+    F.sum("Balance").alias("Total_Balance")
+)
+
+# 3. (Optional but recommended) Add a Debit/Credit indicator for easy coloring in Tableau
+diverging_bar_df = diverging_bar_df.withColumn(
+    "Balance_Type",
+    F.when(F.col("Total_Balance") > 0, "Debit (+)")
+     .when(F.col("Total_Balance") < 0, "Credit (-)")
+     .otherwise("Zero")
+)
+
+# Write this out as your second data source for Tableau
+# diverging_bar_df.write.format("parquet").save("tableau_diverging_bar")
+
 # Assume your raw dataframe is 'gl_df'
 filters = ["Entity", "Grouping", "LOB", "FS Line"]
 
