@@ -1,220 +1,323 @@
-# GL Diverging Bar + Polygon Sankey — Data Prep & Tableau Build Guide
+// filename: main.js
+const { app, BrowserWindow, ipcMain, dialog, shell } = require("electron");
+const path = require("path");
+const fs = require("fs");
+const { spawn, execFileSync } = require("child_process");
+const axios = require("axios");
 
-## 0. Schema assumed coming out of the GL/COA join
+const FLASK_BASE_URL = "http://127.0.0.1:5123";
+const FLASK_HEALTH_RETRIES = 30;
+const FLASK_HEALTH_DELAY_MS = 300;
 
-| Column            | Notes                                   |
-|-------------------|------------------------------------------|
-| Entity            | filter                                    |
-| LOB               | filter                                    |
-| Grouping          | filter                                    |
-| FS Line           | filter (also a Y-axis option on the bar) |
-| FS Category       | sankey center pillar                      |
-| Account           | bar Y-axis option                         |
-| Acct Desc         | bar Y-axis option                         |
-| Account Grp       | descriptive                               |
-| Transaction Type  | bar Y-axis option                         |
-| Flag              | A,B,C,D,E,Other — sankey left/right pillar|
-| Balance            | + = debit, - = credit                    |
+let mainWindow = null;
+let flaskProcess = null;
+let flaskReady = false;
+let workspaceDir = null;
+let convertedDir = null;
+let reportDir = null;
 
----
+// ---------- window ----------
 
-## 1. Diverging Bar Chart — no row explosion needed
+function createWindow() {
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 900,
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  });
 
-This stays at the **aggregated grain**, so it's safe at any volume (10M → a few thousand rows).
+  if (app.isPackaged) {
+    mainWindow.loadFile(path.join(__dirname, "dist-renderer", "index.html"));
+  } else {
+    mainWindow.loadURL("http://localhost:5173");
+  }
+}
 
-```python
-from pyspark.sql import functions as F
+// ---------- workspace (task 1 + task 2, now triggered from Upload screen button) ----------
 
-def prep_diverging_bar(df_gl):
-    dims = ["Entity", "LOB", "Grouping", "FS Line", "FS Category",
-            "Account", "Acct Desc", "Transaction Type"]
+function hideFolderWindows(folderPath) {
+  if (process.platform !== "win32") return;
+  try {
+    execFileSync("attrib", ["+h", folderPath]);
+  } catch (error) {
+    console.error(`Failed to hide folder: ${error.message}`);
+  }
+}
 
-    df_bar = (
-        df_gl.groupBy(*dims)
-             .agg(
-                 F.sum("Balance").alias("Net_Balance"),
-                 F.sum(F.when(F.col("Balance") > 0, F.col("Balance")).otherwise(0))
-                  .alias("Debit_Balance"),
-                 F.sum(F.when(F.col("Balance") < 0, F.col("Balance")).otherwise(0))
-                  .alias("Credit_Balance"),
-                 F.count("*").alias("Txn_Count")
-             )
-    )
-    return df_bar
-```
+function setupWorkspace(selectedDir) {
+  workspaceDir = selectedDir;
+  convertedDir = path.join(workspaceDir, "converted");
+  reportDir = path.join(workspaceDir, "output", "validation_control_totals");
 
-**In Tableau:**
-- Parameter `Pivot Dimension` (string list): FS Line / FS Category / Acct Desc / Account / Transaction Type
-- Calc `Pivot Value`:
-```
-CASE [Pivot Dimension]
-WHEN "FS Line" THEN [FS Line]
-WHEN "FS Category" THEN [FS Category]
-WHEN "Acct Desc" THEN [Acct Desc]
-WHEN "Account" THEN [Account]
-WHEN "Transaction Type" THEN [Transaction Type]
-END
-```
-- Rows: `Pivot Value` (sorted by SUM(Net_Balance))
-- Columns: `SUM(Net_Balance)`
-- Color: `SUM(Net_Balance)` sign (diverging palette, center at 0)
-- No issue with this sheet at 10M source rows — it's a pre-aggregated extract.
+  fs.mkdirSync(convertedDir, { recursive: true });
+  fs.mkdirSync(reportDir, { recursive: true });
+  hideFolderWindows(convertedDir);
+}
 
----
+// ---------- flask backend (convert / sheets / preview) ----------
 
-## 2. Sankey — Step 1: collapse transactions to LINK grain
+function getFlaskLaunchConfig() {
+  if (app.isPackaged) {
+    return {
+      command: path.join(process.resourcesPath, "backend", "app.exe"),
+      args: [],
+      cwd: path.join(process.resourcesPath, "backend")
+    };
+  }
 
-This is the fix for both the "sankey doesn't form" problem and the scale problem. A ribbon represents one **link total**, not a transaction, so aggregate first.
+  return {
+    command: process.platform === "win32" ? "python" : "python3",
+    args: [path.join(__dirname, "python_backend", "app.py")],
+    cwd: path.join(__dirname, "python_backend")
+  };
+}
 
-```python
-def prep_sankey_links(df_gl):
-    df_flow = (
-        df_gl
-        .withColumn("Flow_Type",
-                    F.when(F.col("Balance") > 0, F.lit("Debit"))
-                     .otherwise(F.lit("Credit")))
-        .withColumn("Link_Value", F.abs(F.col("Balance")))
-    )
+function startFlaskBackend() {
+  if (flaskProcess) return; // already running, don't double-spawn
 
-    # keep every filter dimension you need interactivity on
-    link_dims = ["Entity", "LOB", "Grouping", "FS Line",
-                 "Flag", "FS Category", "Flow_Type"]
+  const cfg = getFlaskLaunchConfig();
 
-    df_links = (
-        df_flow.groupBy(*link_dims)
-               .agg(F.sum("Link_Value").alias("Link_Value"))
-               .withColumn("Source",
-                   F.when(F.col("Flow_Type") == "Debit", F.col("Flag"))
-                    .otherwise(F.col("FS Category")))
-               .withColumn("Target",
-                   F.when(F.col("Flow_Type") == "Debit", F.col("FS Category"))
-                    .otherwise(F.col("Flag")))
-               .withColumn("Source_Level",
-                   F.when(F.col("Flow_Type") == "Debit", F.lit(0))   # left pillar
-                    .otherwise(F.lit(1)))                            # center pillar
-               .withColumn("Target_Level",
-                   F.when(F.col("Flow_Type") == "Debit", F.lit(1))   # center pillar
-                    .otherwise(F.lit(2)))                            # right pillar
-               .withColumn("Path_ID", F.monotonically_increasing_id())
-               # fixed sort keys so left/right pillar order is stable & consistent
-               # regardless of filters — needed for the Tableau running-sum calcs
-               .withColumn("Flag_Sort",
-                   F.when(F.col("Flag") == "A", 1)
-                    .when(F.col("Flag") == "B", 2)
-                    .when(F.col("Flag") == "C", 3)
-                    .when(F.col("Flag") == "D", 4)
-                    .when(F.col("Flag") == "E", 5)
-                    .otherwise(6))
-    )
-    return df_links
-```
+  flaskProcess = spawn(cfg.command, cfg.args, {
+    cwd: cfg.cwd,
+    windowsHide: true,
+    env: { ...process.env, CONVERTED_DIR: convertedDir }
+  });
 
-This typically turns 10M transactions into low thousands of link rows (Entity × LOB × Grouping × FS Line × 6 flags × N FS Categories × 2 flow types).
+  flaskProcess.stdout.on("data", (data) => {
+    console.log(`[flask] ${data.toString().trim()}`);
+  });
 
----
+  flaskProcess.stderr.on("data", (data) => {
+    console.error(`[flask] ${data.toString().trim()}`);
+  });
 
-## 3. Sankey — Step 2: densify the LINK table (not the transactions) into curve points
+  flaskProcess.on("error", (error) => {
+    console.error(`Failed to start Flask backend: ${error.message}`);
+  });
 
-```python
-def densify_for_polygon_sankey(spark, df_links, n_points=30):
-    """
-    n_points = curve smoothness. 20-40 is visually smooth and keeps the
-    output table small: link_rows * n_points * 2 (top+bottom), e.g.
-    5,000 links * 30 * 2 = 300,000 rows -> trivial for Tableau.
-    """
-    t_values = [round(i / (n_points - 1), 5) for i in range(n_points)]
-    df_t = spark.createDataFrame([(t,) for t in t_values], ["T"])
+  flaskProcess.on("close", (code) => {
+    console.log(`Flask backend exited with code ${code}`);
+    flaskProcess = null;
+    flaskReady = false;
+  });
+}
 
-    df_dense = df_links.crossJoin(df_t)
+async function waitForFlaskReady() {
+  for (let attempt = 0; attempt < FLASK_HEALTH_RETRIES; attempt++) {
+    try {
+      await axios.get(`${FLASK_BASE_URL}/health`, { timeout: 1000 });
+      flaskReady = true;
+      return true;
+    } catch {
+      await new Promise((resolve) => setTimeout(resolve, FLASK_HEALTH_DELAY_MS));
+    }
+  }
+  return false;
+}
 
-    # Pre-bake the sigmoid shape here (data-independent, safe to bake) —
-    # this is what makes the ribbon S-curved instead of a straight line.
-    df_dense = df_dense.withColumn(
-        "Sigmoid_T",
-        F.lit(1.0) / (F.lit(1.0) + F.exp(F.lit(-12.0) * (F.col("T") - F.lit(0.5))))
-    )
+function stopFlaskBackend() {
+  if (flaskProcess && !flaskProcess.killed) {
+    flaskProcess.kill();
+    flaskProcess = null;
+    flaskReady = false;
+  }
+}
 
-    # X position interpolates linearly between source/target pillar (0,1,2)
-    df_dense = df_dense.withColumn(
-        "Curve_X",
-        F.col("Source_Level") + (F.col("Target_Level") - F.col("Source_Level")) * F.col("T")
-    )
+// ---------- validation backend (stdin/stdout, one-shot per run) ----------
 
-    # Build Top and Bottom edges, with a Point_Order that traces a closed
-    # loop: top edge left->right, then bottom edge right->left.
-    df_top = (df_dense
-        .withColumn("Side", F.lit("Top"))
-        .withColumn("Point_Order", (F.col("T") * (n_points - 1)).cast("int")))
+function getPythonScriptConfig(devScriptName, packagedExeName) {
+  if (app.isPackaged) {
+    return {
+      command: path.join(process.resourcesPath, "backend", packagedExeName),
+      args: []
+    };
+  }
 
-    df_bottom = (df_dense
-        .withColumn("Side", F.lit("Bottom"))
-        .withColumn("Point_Order",
-            F.lit(2 * (n_points - 1)) - (F.col("T") * (n_points - 1)).cast("int")))
+  return {
+    command: process.platform === "win32" ? "python" : "python3",
+    args: [path.join(__dirname, "python_backend", devScriptName)]
+  };
+}
 
-    df_polygon = df_top.unionByName(df_bottom)
-    return df_polygon
-```
+function runPythonStdinJson(cfg, payload) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(cfg.command, cfg.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true
+    });
 
-**Do NOT bake the Y (vertical) position in Spark.** The vertical stacking position of each ribbon depends on the *current filtered mix* of links sharing a node (Entity/LOB/FS Line filters change which links exist and their relative size). If you hardcode Y in Spark, the picture breaks the moment someone filters. Y is computed live in Tableau with table calcs (next section) — that's exactly what the Flerlage template does, and it's why I'd still recommend building on that template rather than from scratch: the addressing/partitioning of these table calcs has to match your worksheet's pill order exactly, and that's fragile to hand-roll blind.
+    let stdout = "";
+    let stderr = "";
 
-Output of this stage — load this single table as the Sankey data source:
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
 
-| Path_ID | Side | Point_Order | T | Sigmoid_T | Curve_X | Link_Value | Source | Target | Flag | Flag_Sort | FS Category | Flow_Type | Entity | LOB | Grouping | FS Line |
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
 
----
+    child.on("error", (error) => {
+      reject(new Error(`Failed to start ${cfg.args[0] || "script"}: ${error.message}`));
+    });
 
-## 4. Tableau calculated fields (map onto the template / build manually)
+    child.on("close", (code) => {
+      if (!stdout.trim()) {
+        reject(new Error(stderr || `Process exited with code ${code}`));
+        return;
+      }
 
-**Sigmoid (normalized 0→1):**
-```
-([Sigmoid_T] - 1/(1+EXP(6))) / (1/(1+EXP(-6)) - 1/(1+EXP(6)))
-```
+      try {
+        resolve(JSON.parse(stdout));
+      } catch {
+        reject(new Error(`Invalid JSON from process.\n${stdout}\n${stderr}`));
+      }
+    });
 
-**Node running total (bottom of stack) — table calc, partitioned by node, sorted by Flag_Sort / FS Category sort:**
-```
-// "Y Start Bottom" — drag Source (or Target) into the partition,
-// addressing = Path, compute using Flag_Sort then Path_ID as tiebreaker
-WINDOW_SUM(SUM([Link_Value])) - SUM([Link_Value])
-```
+    child.stdin.write(JSON.stringify(payload));
+    child.stdin.end();
+  });
+}
 
-**Y Start Top:**
-```
-[Y Start Bottom] + SUM([Link_Value])
-```
-(Do the same pattern partitioned by Target node for Y End Bottom / Y End Top.)
+// ---------- IPC handlers ----------
 
-**Curve Y (the actual band edge at each point):**
-```
-IF [Side] = "Top"
-THEN [Y Start Top] + ([Y End Top] - [Y Start Top]) * [Sigmoid]
-ELSE [Y Start Bottom] + ([Y End Bottom] - [Y Start Bottom]) * [Sigmoid]
-END
-```
+ipcMain.handle("select-workspace-dir", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Choose a workspace folder",
+    properties: ["openDirectory", "createDirectory"]
+  });
 
-**Mark setup:**
-- Mark type: **Polygon**
-- Path: `Path_ID` (one polygon per link)
-- Order points by: `Side`, then `Point_Order`
-- X: `Curve_X`, Y: `Curve Y`
-- Color: `Flag` or `Flow_Type`
-- Size of ribbon comes naturally from the gap between Top/Bottom Y, driven by `Link_Value`
+  if (result.canceled || !result.filePaths.length) {
+    return { workspaceDir: null, convertedDir: null, ready: false };
+  }
 
----
+  setupWorkspace(result.filePaths[0]);
 
-## 5. Linking the two pillars + bar chart in one dashboard (the "click A → highlight both paths" behavior)
+  startFlaskBackend();
+  const ready = await waitForFlaskReady();
 
-- Add `Flag` as a dashboard **filter action** AND a **highlight action** (use highlight, not filter, so both ribbons touching Flag A stay visible, just dimmed elsewhere).
-- Source: any sheet with `Flag` (left pillar marks, or a small Flag legend sheet)
-- Target: the Sankey polygon sheet — Tableau will highlight every Path_ID where `Flag` = the clicked value, which naturally includes *both* the Debit ribbon (Flag→FS Category) and the Credit ribbon (FS Category→Flag) since both rows carry the same `Flag` value in the link table.
-- Run on: Select. Clearing selection: Show all values.
-- Same `Flag`/`FS Category` field can drive a highlight action into the diverging bar sheet if you want cross-highlighting there too.
+  return { workspaceDir, convertedDir, reportDir, ready };
+});
 
----
+ipcMain.handle("get-workspace-dir", async () => {
+  return { workspaceDir, convertedDir, reportDir, ready: flaskReady };
+});
 
-## 6. Scale checklist for 10M+ rows
+ipcMain.handle("select-files", async () => {
+  const result = await dialog.showOpenDialog({
+    properties: ["openFile", "multiSelections"],
+    filters: [
+      { name: "Excel Files", extensions: ["xls", "xlsx", "xlsm"] },
+      { name: "All Files", extensions: ["*"] }
+    ]
+  });
 
-1. **Never densify at transaction grain.** Aggregate to link grain first (Step 2) — this is the single biggest fix, both for correctness and performance.
-2. Keep `n_points` modest (20–40). Visually a sankey ribbon doesn't need more; doubling it just doubles row count for no visible gain.
-3. Publish as a **Tableau Extract (Hyper)**, not a live connection to Spark/Delta — table calcs (WINDOW_SUM) on a Polygon mark are calc-heavy and live queries will be slow.
-4. Materialize the Step 1 aggregation (`prep_sankey_links`) as Delta/Parquet and incrementally refresh only changed Entities/periods if this is a recurring job — no need to rescan 10M rows every run if older periods are closed.
-5. Keep the bar chart extract (Step 1 of section 1) and the sankey extract (Step 3) as **two separate data sources/extracts** even though they're one dashboard — don't force them into one table, since the Sankey's row count (links × n_points × 2) is a different grain than the bar chart's. Blend or use a dashboard filter action between them rather than a single blended extract.
+  if (result.canceled || !result.filePaths.length) {
+    return [];
+  }
+
+  return result.filePaths;
+});
+
+ipcMain.handle("convert-files", async (_event, filePaths) => {
+  if (!flaskReady) {
+    return { error: "Select a workspace folder first." };
+  }
+  const response = await axios.post(`${FLASK_BASE_URL}/convert`, { files: filePaths });
+  return response.data;
+});
+
+ipcMain.handle("get-sheets", async (_event, filePath) => {
+  if (!flaskReady) {
+    return { error: "Select a workspace folder first." };
+  }
+  try {
+    const response = await axios.post(`${FLASK_BASE_URL}/sheets`, { file: filePath });
+    return response.data;
+  } catch (error) {
+    const message = error.response?.data?.error || error.message;
+    return { error: message };
+  }
+});
+
+ipcMain.handle("preview-sheet", async (_event, filePath, sheetName) => {
+  if (!flaskReady) {
+    return { error: "Select a workspace folder first." };
+  }
+  try {
+    const response = await axios.post(`${FLASK_BASE_URL}/preview`, {
+      file: filePath,
+      sheet: sheetName
+    });
+    return response.data;
+  } catch (error) {
+    const message = error.response?.data?.error || error.message;
+    return { error: message };
+  }
+});
+
+ipcMain.handle("run-validation", async (_event, payload) => {
+  if (!convertedDir || !reportDir) {
+    return { success: false, overallStatus: "FAIL", message: "Select a workspace folder first.", files: [] };
+  }
+  // task 3: hidden converted/ folder for validated-range output (on overall PASS)
+  // report always goes to workspace/output/validation_control_totals — not user-configurable.
+  const fullPayload = { ...payload, converted_dir: convertedDir, report_output_dir: reportDir };
+  return runPythonStdinJson(getPythonScriptConfig("excel_validation.py", "excel_validation.exe"), fullPayload);
+});
+
+ipcMain.handle("select-template-file", async () => {
+  const result = await dialog.showOpenDialog({
+    title: "Choose the trial balance template workbook",
+    properties: ["openFile"],
+    filters: [{ name: "Excel Workbook", extensions: ["xlsx", "xlsm"] }]
+  });
+
+  if (result.canceled || !result.filePaths.length) {
+    return null;
+  }
+
+  return result.filePaths[0];
+});
+
+ipcMain.handle("run-trial-balance", async (_event, payload) => {
+  if (!workspaceDir) {
+    return { success: false, message: "Select a workspace folder first.", log: [] };
+  }
+
+  const outputPath = path.join(workspaceDir, "output", "trial_balance.xlsx");
+  const fullPayload = { ...payload, output_path: outputPath };
+  return runPythonStdinJson(getPythonScriptConfig("trial_balance.py", "trial_balance.exe"), fullPayload);
+});
+
+ipcMain.handle("open-report", async (_event, reportPath) => {
+  if (!reportPath) return false;
+  const result = await shell.openPath(reportPath);
+  return result === "";
+});
+
+// ---------- lifecycle ----------
+
+app.whenReady().then(() => {
+  createWindow();
+
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) {
+      createWindow();
+    }
+  });
+});
+
+app.on("window-all-closed", () => {
+  stopFlaskBackend();
+  if (process.platform !== "darwin") {
+    app.quit();
+  }
+});
+
+app.on("before-quit", () => {
+  stopFlaskBackend();
+});
