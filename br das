@@ -26,7 +26,7 @@ def build_source_data(mayank):
         .withColumn('financial_statement_category', func.col('`FS Category`'))
         .withColumn('user', func.col('WF_APPROVER_NAME'))
         .withColumn('date_posted', func.col('Creation_Date'))
-        .withColumn('LOB', func.col('LOB'))   # tagged here, at raw row grain, before any groupBy
+        .withColumn('LOB', func.coalesce(func.col('LOB'), func.lit('UNSPECIFIED')))  # null-safe: prevents null==null join failures downstream
         .withColumn(
             'Debit_Credit_Indicator',
             func.when(func.col('NET_AMOUNT_AT_REPORTING_CURRENCY') >= 0, 'D').otherwise('C')
