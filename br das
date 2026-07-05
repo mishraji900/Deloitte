@@ -1,17 +1,39 @@
-**Short answer: yes, same fan-out issue — identically. No LOB bug, since original doesn't have LOB at all.**
+What a journal entry actually is
+Every accounting transaction (a journal entry) has to balance — total debits must equal total credits. But a single journal entry can touch multiple accounts on each side. Example:
+Journal Entry #J100 (a company paying rent partly in cash):
+LineTypeAccount (FS Line)Amount1DebitCash7002DebitRent Expense3003CreditRevenue8004CreditTax Payable200
+Total debits = 1000, total credits = 1000. Balances, as required.
+The business question the matrix answers is: "Which FS lines are debited together with which FS lines credited, and how often/how much?" — this is used to spot unusual account combinations (a classic fraud/error indicator — e.g. debiting Cash and crediting Revenue directly, bypassing normal controls).
+How Deloitte's Cortex script builds this (same core idea, more inputs)
+Cortex's version works from two separate files — a General Ledger detail file and a Chart of Accounts file — and joins them together first to attach the FS Line/FS Category to each GL line, plus applies exclusion rules (zero-amount lines, accounts flagged for exclusion, etc.) before anything gets aggregated. Once each line knows its FS Line and Debit/Credit side, the logic is:
 
-**1. Fan-out overstatement — YES, present identically.**
-Look at `agg_matrix_financial_statement_line_table` (page 23-25). Same exact pattern we built: `debits` grouped, `credits` grouped, `summary_key` at journal grain, then `summary_key OUTER debits`, then `OUTER credits`. Same journal-grain join → same N×M row explosion when a journal has multiple debit_fs_lines × multiple credit_fs_lines. Summing `matrix_table_final.debit_amount`/`credit_amount` directly will overstate here too, same as ours.
+Split the journal into its debit lines and its credit lines separately.
+For J100: Debits = {Cash: 700, Rent Expense: 300}, Credits = {Revenue: 800, Tax Payable: 200}.
+Pair every debit FS line with every credit FS line that occurred in the same journal.
+This produces one row per pairing:
 
-**Proof this was already known to Deloitte's own devs:** they built `source_data_summary_compound` (page 24) — a plain `groupBy` per FS line, no cross-join — specifically as the reconciliation-safe counterpart to the fan-out matrix. That's exactly the `compound_summary` pattern I gave you. They hit the same problem and solved it the same way.
+debit_fs_linecredit_fs_linedebit_amountcredit_amountCashRevenue700800CashTax Payable700200Rent ExpenseRevenue300800Rent ExpenseTax Payable300200
+Notice: 2 debit lines × 2 credit lines = 4 matrix rows, and 700 appears twice, 300 appears twice, 800 appears twice, 200 appears twice. This is deliberate — it's what makes the debit×credit heatmap possible (you need every combination to color a cell) — but it means you cannot just add up the debit_amount column and get 1000 back; you'd get 2000.
 
-**2. LOB null-join bug — NOT present, because LOB doesn't exist in this script.**
-Original has no LOB column anywhere. So that specific defect (both debit_fs_line/credit_fs_line null due to `null == null` join failure) can't trigger from LOB here.
+Cortex solves the "can't just sum it" problem by also producing a second, simpler table (compound_summary) that sums each FS line's amount once, correctly:
 
-**3. But the same *class* of bug can still trigger — via any null join key.**
-Join keys are `journal_number`, `entity_id`, `is_standard`, `fiscal_year_identifier`.
-- `is_standard` is null-safe — `apply_defaults()` coalesces it to `'N'`.
-- `fiscal_year_identifier` is null-safe — hardcoded literal per branch.
-- `journal_number` and `entity_id` are **not** defaulted anywhere in this script. If either is null in source GL rows, the same both-null matrix row symptom you saw in your screenshot will reproduce here, for the same reason — `null == null` fails in the outer joins.
+financial_statement_linedebit_amountcredit_amountCash7000Rent Expense3000Revenue0800Tax Payable0200
+This second table is the "ground truth" — it's what any total or percentage on the dashboard should be calculated from. The matrix table is for the heatmap grid visual only.
+How we built ours
+Same two-output pattern, adapted to a single flat source file instead of two separate ones, with our specific columns:
 
-**Recommendation if this runs against your data:** add a null-check / coalesce on `journal_number` and `entity_id` before `je_merged()`, same fix pattern as the LOB coalesce — cheap insurance against the identical defect class.
+Same fan-out mechanic: our matrix_table does the identical debit-FS-line × credit-FS-line pairing per journal, for the identical reason (need every combination to populate the heatmap).
+Same safety-valve table: our compound_summary sums each FS line once — this is our version of Cortex's ground truth.
+One addition Cortex's version doesn't need: we added an LOB (Line of Business) dimension for filtering. This required two extra safeguards Cortex's script doesn't have to deal with:
+
+LOB had to be tagged onto every line before any aggregation happens (not joined on afterward), so the fan-out pairing and the summary totals both slice by LOB consistently.
+LOB had to be null-safe — a blank LOB value was silently breaking the joins (because in Spark, blank does not equal blank), producing rows that showed up with no FS line on either side. We fixed this by labeling blanks as 'UNSPECIFIED' instead of leaving them null.
+
+
+Simplification: Cortex's script also excludes certain lines (zero-amount entries, flagged accounts) before building the matrix. Our source data has no such exclusion flags, so we skip that step — confirmed there's nothing to exclude, rather than assuming.
+
+The one thing to say clearly to your seniors
+
+"The heatmap grid intentionally repeats amounts across paired rows — that's required to build a debit×credit crosstab. We never total off the grid directly; every total and every percentage on the dashboard is calculated from the separate, non-duplicated summary table. We validated this reconciles to the original data, and we specifically tested and fixed a case where blank LOB values would have broken that reconciliation."
+
+Want me to turn this exact example (the J100 walkthrough + the two tables) into a one-page slide or a short section added to the technical summary doc, so you have something to actually screen-share?
