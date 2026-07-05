@@ -1,39 +1,270 @@
-What a journal entry actually is
-Every accounting transaction (a journal entry) has to balance — total debits must equal total credits. But a single journal entry can touch multiple accounts on each side. Example:
-Journal Entry #J100 (a company paying rent partly in cash):
-LineTypeAccount (FS Line)Amount1DebitCash7002DebitRent Expense3003CreditRevenue8004CreditTax Payable200
-Total debits = 1000, total credits = 1000. Balances, as required.
-The business question the matrix answers is: "Which FS lines are debited together with which FS lines credited, and how often/how much?" — this is used to spot unusual account combinations (a classic fraud/error indicator — e.g. debiting Cash and crediting Revenue directly, bypassing normal controls).
-How Deloitte's Cortex script builds this (same core idea, more inputs)
-Cortex's version works from two separate files — a General Ledger detail file and a Chart of Accounts file — and joins them together first to attach the FS Line/FS Category to each GL line, plus applies exclusion rules (zero-amount lines, accounts flagged for exclusion, etc.) before anything gets aggregated. Once each line knows its FS Line and Debit/Credit side, the logic is:
+"""
+Complete Matrix FS Line pipeline (final, with LOB support)
+Raw dataset: `mayank` (assumed already loaded in the Spark session, not read from path)
 
-Split the journal into its debit lines and its credit lines separately.
-For J100: Debits = {Cash: 700, Rent Expense: 300}, Credits = {Revenue: 800, Tax Payable: 200}.
-Pair every debit FS line with every credit FS line that occurred in the same journal.
-This produces one row per pairing:
+Expected raw columns in `mayank`:
+    Jrn_Nmbr, LEGALENTITY, MAN_SYS_NEW, Acc, FS Line, FS Category,
+    NET_AMOUNT_AT_REPORTING_CURRENCY, WF_APPROVER_NAME, Creation_Date, LOB
+"""
 
-debit_fs_linecredit_fs_linedebit_amountcredit_amountCashRevenue700800CashTax Payable700200Rent ExpenseRevenue300800Rent ExpenseTax Payable300200
-Notice: 2 debit lines × 2 credit lines = 4 matrix rows, and 700 appears twice, 300 appears twice, 800 appears twice, 200 appears twice. This is deliberate — it's what makes the debit×credit heatmap possible (you need every combination to color a cell) — but it means you cannot just add up the debit_amount column and get 1000 back; you'd get 2000.
-
-Cortex solves the "can't just sum it" problem by also producing a second, simpler table (compound_summary) that sums each FS line's amount once, correctly:
-
-financial_statement_linedebit_amountcredit_amountCash7000Rent Expense3000Revenue0800Tax Payable0200
-This second table is the "ground truth" — it's what any total or percentage on the dashboard should be calculated from. The matrix table is for the heatmap grid visual only.
-How we built ours
-Same two-output pattern, adapted to a single flat source file instead of two separate ones, with our specific columns:
-
-Same fan-out mechanic: our matrix_table does the identical debit-FS-line × credit-FS-line pairing per journal, for the identical reason (need every combination to populate the heatmap).
-Same safety-valve table: our compound_summary sums each FS line once — this is our version of Cortex's ground truth.
-One addition Cortex's version doesn't need: we added an LOB (Line of Business) dimension for filtering. This required two extra safeguards Cortex's script doesn't have to deal with:
-
-LOB had to be tagged onto every line before any aggregation happens (not joined on afterward), so the fan-out pairing and the summary totals both slice by LOB consistently.
-LOB had to be null-safe — a blank LOB value was silently breaking the joins (because in Spark, blank does not equal blank), producing rows that showed up with no FS line on either side. We fixed this by labeling blanks as 'UNSPECIFIED' instead of leaving them null.
+from pyspark.sql import functions as func
+from pyspark.sql.window import Window
 
 
-Simplification: Cortex's script also excludes certain lines (zero-amount entries, flagged accounts) before building the matrix. Our source data has no such exclusion flags, so we skip that step — confirmed there's nothing to exclude, rather than assuming.
+# ---------------------------------------------------------------
+# STEP 1: BUILD SOURCE DATA (map + derive fields, LOB tagged at row grain)
+# ---------------------------------------------------------------
+def build_source_data(mayank):
+    def blank_safe(colname, default):
+        c = func.col(colname)
+        return func.when(c.isNull() | (func.trim(c) == ''), func.lit(default)).otherwise(c)
 
-The one thing to say clearly to your seniors
+    # Row-stable unique id must be added BEFORE any other transform, on the raw frame,
+    # so it stays tied to the physical row and isn't recomputed after later shuffles.
+    mayank = mayank.withColumn('_row_id', func.monotonically_increasing_id())
 
-"The heatmap grid intentionally repeats amounts across paired rows — that's required to build a debit×credit crosstab. We never total off the grid directly; every total and every percentage on the dashboard is calculated from the separate, non-duplicated summary table. We validated this reconciles to the original data, and we specifically tested and fixed a case where blank LOB values would have broken that reconciliation."
+    source_data = (
+        mayank
+        .withColumn('fiscal_year_identifier', func.lit('2026'))
+        .withColumn(
+            'journal_number',
+            # CATEGORY fields (entity_id, is_standard, LOB) can safely share one default value.
+            # journal_number is an IDENTITY key -- sharing one default here would merge
+            # unrelated transactions into a single fake "journal". Each blank gets its own
+            # unique placeholder instead, so blank-journal rows never collide with each other.
+            func.when(
+                func.col('Jrn_Nmbr').isNull() | (func.trim(func.col('Jrn_Nmbr')) == ''),
+                func.concat(func.lit('UNSPECIFIED_JRN_'), func.col('_row_id').cast('string'))
+            ).otherwise(func.col('Jrn_Nmbr'))
+        )
+        .withColumn(
+            'entity_id',
+            # entity_id is part of the compound identity key (journal_number + entity_id) --
+            # journal numbers repeat/reset across entities, same as the original Cortex script's
+            # journal_number_entity_id logic assumes. A shared default here would cause the same
+            # collision bug journal_number had -- unrelated transactions in different entities
+            # merging together. Each blank gets its own unique placeholder instead.
+            func.when(
+                func.col('LEGALENTITY').isNull() | (func.trim(func.col('LEGALENTITY')) == ''),
+                func.concat(func.lit('UNSPECIFIED_ENTITY_'), func.col('_row_id').cast('string'))
+            ).otherwise(func.col('LEGALENTITY'))
+        )
+        .withColumn('is_standard', blank_safe('MAN_SYS_NEW', 'N'))                 # matches Cortex's own default ('N') for this field
+        .withColumn('account_number', func.col('Acc'))
+        .withColumn('financial_statement_line', func.col('`FS Line`'))
+        .withColumn('financial_statement_category', func.col('`FS Category`'))
+        .withColumn('user', func.col('WF_APPROVER_NAME'))
+        .withColumn('date_posted', func.col('Creation_Date'))
+        .withColumn('LOB', blank_safe('LOB', 'UNSPECIFIED'))  # now also catches empty string, not just true null
+        .withColumn(
+            'journal_number_entity_id',
+            # matches original Cortex's composite key: journal numbers repeat across entities,
+            # so (journal_number, entity_id) together -- not journal_number alone -- is the
+            # true atomic transaction identity.
+            func.concat(func.col('journal_number'), func.lit(':'), func.col('entity_id'))
+        )
+        .withColumn(
+            'Debit_Credit_Indicator',
+            func.when(func.col('NET_AMOUNT_AT_REPORTING_CURRENCY') >= 0, 'D').otherwise('C')
+        )
+        .withColumn(
+            'debit_amount',
+            func.when(func.col('Debit_Credit_Indicator') == 'D',
+                      func.col('NET_AMOUNT_AT_REPORTING_CURRENCY')).otherwise(func.lit(0.0))
+        )
+        .withColumn(
+            'credit_amount',
+            func.when(func.col('Debit_Credit_Indicator') == 'C',
+                      func.abs(func.col('NET_AMOUNT_AT_REPORTING_CURRENCY'))).otherwise(func.lit(0.0))
+        )
+        .withColumn('number_of_lines', func.lit(1))
+    )
+    # no exclusion flags exist in source -> no filtering applied
+    return source_data
 
-Want me to turn this exact example (the J100 walkthrough + the two tables) into a one-page slide or a short section added to the technical summary doc, so you have something to actually screen-share?
+
+def data_quality_flag_report(mayank):
+    """Run BEFORE build_source_data. Counts blank/null key fields at raw grain
+    so the gap is documented, not silently absorbed by defaults."""
+    def blank_count(colname):
+        c = func.col(colname)
+        return mayank.filter(c.isNull() | (func.trim(c) == '')).count()
+
+    print("=== RAW DATA QUALITY CHECK (run before defaults are applied) ===")
+    print(f"Blank/null Jrn_Nmbr    : {blank_count('Jrn_Nmbr')}  (each gets a UNIQUE placeholder, never shared)")
+    print(f"Blank/null LEGALENTITY : {blank_count('LEGALENTITY')}")
+    print(f"Blank/null MAN_SYS_NEW : {blank_count('MAN_SYS_NEW')}")
+    print(f"Blank/null LOB         : {blank_count('LOB')}")
+    print("Non-zero counts here = raw source data quality gap, report to data owner.")
+    print("Defaults applied downstream prevent join corruption but do NOT fix the source gap.")
+
+
+# ---------------------------------------------------------------
+# STEP 2: COMPOUND SUMMARY (reconciliation-safe, per FS line, LOB-aware)
+# No cross-join here -> safe to add LOB directly to groupBy.
+# ---------------------------------------------------------------
+def build_compound_summary(source_data):
+    window_spec = Window.partitionBy(
+        'journal_number', 'entity_id', 'is_standard', 'fiscal_year_identifier', 'LOB'
+    )
+    source_data_summary = source_data.withColumn(
+        'compound_entries', func.sum('number_of_lines').over(window_spec)
+    )
+    compound_summary = source_data_summary.groupBy(
+        'fiscal_year_identifier', 'journal_number', 'entity_id', 'is_standard', 'LOB',
+        'financial_statement_line', 'compound_entries'
+    ).agg(
+        func.sum('debit_amount').alias('debit_amount'),
+        func.sum('credit_amount').alias('credit_amount')
+    )
+    return compound_summary
+
+
+# ---------------------------------------------------------------
+# STEP 3: MATRIX TABLE (debit_fs_line x credit_fs_line crosstab, LOB-aware)
+# LOB is included in EVERY join key (not just groupBy) to prevent
+# cross-LOB pairing inside a journal that spans multiple LOBs.
+# ---------------------------------------------------------------
+def build_matrix_table(source_data):
+    debits = source_data.filter(func.col('Debit_Credit_Indicator') == 'D').groupBy(
+        'fiscal_year_identifier', 'journal_number', 'entity_id', 'is_standard', 'LOB',
+        'financial_statement_line'
+    ).agg(
+        func.sum('number_of_lines').alias('number_of_lines_debit'),
+        func.sum('debit_amount').alias('debit_amount')
+    ).withColumnRenamed('financial_statement_line', 'debit_fs_line')
+
+    credits = source_data.filter(func.col('Debit_Credit_Indicator') == 'C').groupBy(
+        'fiscal_year_identifier', 'journal_number', 'entity_id', 'is_standard', 'LOB',
+        'financial_statement_line'
+    ).agg(
+        func.sum('number_of_lines').alias('number_of_lines_credit'),
+        func.sum('credit_amount').alias('credit_amount')
+    ).withColumnRenamed('financial_statement_line', 'credit_fs_line')
+
+    summary_key = source_data.groupBy(
+        'journal_number', 'entity_id', 'is_standard', 'fiscal_year_identifier', 'LOB'
+    ).agg(func.sum('number_of_lines').alias('total_lines_per_entry'))
+
+    jd = [summary_key.journal_number == debits.journal_number,
+          summary_key.entity_id == debits.entity_id,
+          summary_key.is_standard == debits.is_standard,
+          summary_key.fiscal_year_identifier == debits.fiscal_year_identifier,
+          summary_key.LOB == debits.LOB]
+    t1 = summary_key.join(debits, jd, 'outer').select(
+        func.coalesce(summary_key.journal_number, debits.journal_number).alias('journal_number'),
+        func.coalesce(summary_key.entity_id, debits.entity_id).alias('entity_id'),
+        func.coalesce(summary_key.is_standard, debits.is_standard).alias('is_standard'),
+        func.coalesce(summary_key.fiscal_year_identifier, debits.fiscal_year_identifier).alias('fiscal_year_identifier'),
+        func.coalesce(summary_key.LOB, debits.LOB).alias('LOB'),
+        summary_key.total_lines_per_entry,
+        debits.debit_fs_line, debits.number_of_lines_debit, debits.debit_amount
+    )
+
+    jc = [credits.journal_number == t1.journal_number,
+          credits.entity_id == t1.entity_id,
+          credits.is_standard == t1.is_standard,
+          credits.fiscal_year_identifier == t1.fiscal_year_identifier,
+          credits.LOB == t1.LOB]
+    matrix_table = t1.join(credits, jc, 'outer').select(
+        func.coalesce(t1.journal_number, credits.journal_number).alias('journal_number'),
+        func.coalesce(t1.entity_id, credits.entity_id).alias('entity_id'),
+        func.coalesce(t1.is_standard, credits.is_standard).alias('is_standard'),
+        func.coalesce(t1.fiscal_year_identifier, credits.fiscal_year_identifier).alias('fiscal_year_identifier'),
+        func.coalesce(t1.LOB, credits.LOB).alias('LOB'),
+        t1.debit_fs_line, t1.total_lines_per_entry,
+        credits.credit_fs_line, t1.number_of_lines_debit, credits.number_of_lines_credit,
+        t1.debit_amount, credits.credit_amount
+    )
+
+    user_concat = source_data.groupBy(
+        'journal_number', 'entity_id', 'is_standard', 'fiscal_year_identifier', 'LOB'
+    ).agg(func.concat_ws(', ', func.array_sort(func.collect_set('user'))).alias('concat_user_IDs'))
+
+    jr = [matrix_table.journal_number == user_concat.journal_number,
+          matrix_table.entity_id == user_concat.entity_id,
+          matrix_table.is_standard == user_concat.is_standard,
+          matrix_table.fiscal_year_identifier == user_concat.fiscal_year_identifier,
+          matrix_table.LOB == user_concat.LOB]
+    matrix_table_final = matrix_table.join(user_concat, jr, 'left').select(
+        matrix_table['*'], user_concat['concat_user_IDs']
+    )
+    return matrix_table_final
+
+
+# ---------------------------------------------------------------
+# STEP 4: RECONCILIATION CHECK
+# Confirms compound_summary ties to raw source (denominator-safe),
+# and shows where matrix_table_final would overstate if summed directly.
+# ---------------------------------------------------------------
+def reconciliation_check(source_data, compound_summary, matrix_table_final):
+    raw_debit_total = source_data.agg(func.sum('debit_amount')).collect()[0][0]
+    raw_credit_total = source_data.agg(func.sum('credit_amount')).collect()[0][0]
+
+    compound_debit_total = compound_summary.agg(func.sum('debit_amount')).collect()[0][0]
+    compound_credit_total = compound_summary.agg(func.sum('credit_amount')).collect()[0][0]
+
+    matrix_debit_total = matrix_table_final.agg(func.sum('debit_amount')).collect()[0][0]
+    matrix_credit_total = matrix_table_final.agg(func.sum('credit_amount')).collect()[0][0]
+
+    print(f"RAW        debit={raw_debit_total} credit={raw_credit_total}")
+    print(f"COMPOUND   debit={compound_debit_total} credit={compound_credit_total}  (should MATCH raw)")
+    print(f"MATRIX     debit={matrix_debit_total} credit={matrix_credit_total}  (WILL OVERSTATE if summed directly, dedupe in Tableau via FIXED LOD)")
+
+    null_jn_count = matrix_table_final.filter(func.col('journal_number').isNull()).count()
+    print(f"\nMatrix rows with null journal_number after coalesce fix: {null_jn_count} (should be 0)")
+
+    print("\n=== LOB grain check: does LOB vary WITHIN a true (journal_number, entity_id) transaction? ===")
+    lob_variance_by_true_key = source_data.groupBy('journal_number_entity_id').agg(
+        func.countDistinct('LOB').alias('distinct_lob_count')
+    ).filter(func.col('distinct_lob_count') > 1)
+    mixed_lob_txn_count = lob_variance_by_true_key.count()
+    print(f"Transactions (by journal_number+entity_id) with more than one LOB: {mixed_lob_txn_count}")
+    if mixed_lob_txn_count > 0:
+        print("LOB genuinely varies within a single transaction -- treat LOB as a display/filter")
+        print("dimension only, NOT as an audit-test rollup key. See prior discussion on why.")
+    else:
+        print("LOB is uniform per true transaction -- safe to add as a rollup key everywhere,")
+        print("using journal_number_entity_id (not journal_number alone) as the grain.")
+    if null_jn_count > 0:
+        print("Remaining nulls mean a row exists on NEITHER side's key match at all -- check for")
+        print("blank/null values in entity_id, is_standard, or fiscal_year_identifier in source_data:")
+        source_data.select('entity_id', 'is_standard', 'fiscal_year_identifier', 'LOB').filter(
+            func.col('entity_id').isNull() | func.col('is_standard').isNull() |
+            func.col('fiscal_year_identifier').isNull() | func.col('LOB').isNull()
+        ).groupBy('entity_id', 'is_standard', 'fiscal_year_identifier', 'LOB').count().show(truncate=False)
+
+    # per-LOB breakdown, useful to confirm LOB slicing didn't distort composition
+    print("\nPer-LOB raw vs compound (should match row for row):")
+    raw_by_lob = source_data.groupBy('LOB').agg(
+        func.sum('debit_amount').alias('raw_debit'),
+        func.sum('credit_amount').alias('raw_credit')
+    )
+    compound_by_lob = compound_summary.groupBy('LOB').agg(
+        func.sum('debit_amount').alias('compound_debit'),
+        func.sum('credit_amount').alias('compound_credit')
+    )
+    raw_by_lob.join(compound_by_lob, 'LOB', 'outer').orderBy('LOB').show(truncate=False)
+
+
+# ---------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------
+def main(mayank):
+    data_quality_flag_report(mayank)   # documents blank-key gaps in raw data BEFORE defaults mask them
+    source_data = build_source_data(mayank)
+
+    compound_summary = build_compound_summary(source_data)     # reconciliation-safe, LOB-aware
+    matrix_table_final = build_matrix_table(source_data)        # display grid, LOB-aware, join-safe
+
+    reconciliation_check(source_data, compound_summary, matrix_table_final)
+
+    return compound_summary, matrix_table_final
+
+
+# Usage (mayank already loaded as a Spark DataFrame in this session):
+# compound_summary, matrix_table_final = main(mayank)
+#
+# Write outputs:
+# compound_summary.write.format("delta").mode("overwrite").save("<compound_summary_output_path>")
+# matrix_table_final.write.format("delta").mode("overwrite").save("<matrix_fs_line_output_path>")
