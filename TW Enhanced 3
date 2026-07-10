@@ -10,7 +10,6 @@ JE_raw_2_aligned=cp.read(f'{output_path_et}/JE_raw_2_aligned.parquet')
 
 # COMMAND ----------
 
-# DBTITLE 1,Custom Widget Setup
 # DBTITLE 1,Config and Quarter Setup
 # =============================================================================
 # CELL 1 â€” CONFIGURATION & QUARTER SETUP
@@ -21,18 +20,7 @@ from pyspark.sql import functions as F, Window, types as T
 
 # ---------------- Immutable schema ----------------
 BASE_RAW_COLUMNS = [
-    "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name",
-    "Month", "Default Effective Date", "Posted Date", "JE Category",
-    "Journal Description", "JE Line Number", "Line Description", "Currency Code",
-    "Je Source", "Ledger", "Account Description", "Invoice Reference",
-    "Journal Line Vendor/Customer", "Vendor/Customer Name", "Vendor PO#",
-    "Vendor/Customer Number", "COA", "Company", "Business",
-    "Client Sector Idenitifier", "Client Sector", "Location",
-    "Location Description", "Department/Cost Center", "Natural Account",
-    "Product", "Product Description", "Revenue Type", "Revenue Description",
-    "Intercompany", "Future1", "Future2", "Accounted Dr", "Accounted Cr",
-    "Net Accounted", "Entered Dr", "Entered CR", "Net Entered", "FX",
-    "USD DR", "USD CR", "USD NET", "Company Description",
+    "Company Description", "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name", "Month", "Default Effective Date", "Posted Date", "JE Category", "Journal Description", "JE Line Number", "Line Description", "Currency Code", "Je Source", "Ledger", "Account Description", "Invoice Reference", "Journal Line Vendor/Customer", "Vendor/Customer Name", "Vendor PO#", "Vendor/Customer Number", "COA", "Company", "Business", "Location", "Department/Cost Center", "Natural Account", "Product", "Revenue Type", "Intercompany", "Future1", "Future2", "Accounted Dr", "Accounted Cr", "Entered Dr", "Entered CR", "Net Entered", "Net Accounted"
 ]
 
 # Pipeline 2 adds Year Flag and Source Quarter (quarter attribution)
@@ -149,14 +137,10 @@ else:
 
 
 # â€” Fiscal year labels â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”â€”
-_fy_match = re.search(r'FY(\d{2})', output_path, re.IGNORECASE)
-if _fy_match:
-    _fy_num    = int(_fy_match.group(1))
-    CURRENT_FY = f"FY{_fy_num}"
-    PRIOR_FY   = f"FY{_fy_num - 1}"
-else:
-    CURRENT_FY = "FY26"   ## Remember to change based on year
-    PRIOR_FY   = "FY25"   ## Remember to change based on year
+dbutils.widgets.text(name="CURRENT_FY", defaultValue="", label="Enter Current year final outputs")
+CURRENT_FY = dbutils.widgets.get('CURRENT_FY')
+dbutils.widgets.text(name="PRIOR_FY", defaultValue="", label="Enter Prior year final outputs")
+PRIOR_FY = dbutils.widgets.get('PRIOR_FY')
 
 print(f"[CONFIG] Current FY: {CURRENT_FY}  |  Prior FY: {PRIOR_FY}")
 print(f"[CONFIG] Quarter first month: {QUARTER_FIRST_MONTH[CURRENT_QUARTER]} "
@@ -165,8 +149,6 @@ print(f"[CONFIG] Quarter first month: {QUARTER_FIRST_MONTH[CURRENT_QUARTER]} "
 STAGE_PATH_P1 = f"{output_path}/_stage/p1"
 STAGE_PATH_P2 = f"{output_path}/_stage/p2"
 STAGE_PATH_P3 = f"{output_path}/_stage/p3"
-
-# COMMAND ----------
 
 # COMMAND ----------
 
@@ -189,11 +171,20 @@ STAGE_PATH_P3 = f"{output_path}/_stage/p3"
 
 # â”€â”€ I/O helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 def _path_exists(path: str) -> bool:
-    """Check if a DBFS/Unity Catalog path exists without triggering read errors."""
+    """
+    Quiet existence check for DBFS / UC Volumes / ABFS paths.
+    Avoids dbutils.fs.ls(), which logs noisy errors on missing files.
+    """
     try:
-        dbutils.fs.ls(path)
-        return True
-    except Exception:
+        jvm = spark._jvm
+        hconf = spark._jsc.hadoopConfiguration()
+        jpath = jvm.org.apache.hadoop.fs.Path(path)
+        fs = jpath.getFileSystem(hconf)
+        return fs.exists(jpath)
+    except Exception as e:
+        # Optional: keep this as False for fail-closed behavior,
+        # or log at WARN if you want observability without hard failure.
+        print(f"[WARN] _path_exists unexpected error for {path}: {e}")
         return False
     
 def write_table(df, name: str, log: bool = True, base_path: str = None):
@@ -1104,6 +1095,32 @@ MATCH_STEPS = [
     ),
 ]
 
+# â”€â”€ Multi-step match orchestrator â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+def run_match_pipeline(sales_df, credit_df, base_df,
+                       steps: list, stage_path: str,
+                       has_year_flag: bool = False):
+    """
+    Drive a sequence of (label, condition_fn) match steps.
+    Each step consumes the *remaining* sales/credit from the previous step.
+
+    Returns
+    -------
+    resolved_datasets : list[(match_label, resolved_df_or_None)]
+    cur_s             : DataFrame  â€” sales rows still unmatched after all steps
+    cur_c             : DataFrame  â€” credit rows still unmatched after all steps
+    """
+    resolved_datasets = []
+    cur_s, cur_c = sales_df, credit_df
+
+    for match_label, condition_fn in steps:
+        resolved, cur_s, cur_c = exhaustive_match(
+            cur_s, cur_c, condition_fn, match_label,
+            base_df, stage_path=stage_path, has_year_flag=has_year_flag,
+        )
+        resolved_datasets.append((match_label, resolved))
+
+    return resolved_datasets, cur_s, cur_c
+
 STAGE_PATH_P1 = f"{output_path}/_stage/p1"
 STAGE_PATH_P2 = f"{output_path}/_stage/p2"
 STAGE_PATH_P3 = f"{output_path}/_stage/p3"
@@ -1249,8 +1266,6 @@ P1_ALL_MATCHED   = union_non_null(*[df for _, df in p1_resolved_list])
 P1_ALL_UNMATCHED = union_non_null(P1_UNIQUE_SALES, P1_UNIQUE_CREDITS, P1_UNMATCHED)
 
 print("\n[P1] Done.")
-
-# COMMAND ----------
 
 # COMMAND ----------
 
@@ -1413,8 +1428,6 @@ P2_ALL_MATCHED   = union_non_null(*[df for _, df in p2_resolved_list])
 P2_ALL_UNMATCHED = union_non_null(P2_UNIQUE_SALES, P2_UNIQUE_CREDITS, P2_UNMATCHED)
 
 print("\n[P2] Done.")
-
-# COMMAND ----------
 
 # COMMAND ----------
 
@@ -1706,6 +1719,7 @@ debug_group_count(P3_ALL_UNMATCHED_COMMENTED, "AA Rule",    "AA Rule distributio
 write_table(P3_ALL_UNMATCHED_COMMENTED, "P3_ALL_UNMATCHED_WITH_AA_COMMENT", base_path=output_path_et)
 
 print("\n[AA] Done.")
+
 # COMMAND ----------
 
 # =============================================================================
@@ -1767,3 +1781,6 @@ for name, df in dfs.items():
 
 print(f"Total out: {total_out:,}")
 print("\n[DONE] All pipelines complete.")
+
+# COMMAND ----------
+
