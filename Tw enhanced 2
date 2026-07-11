@@ -112,8 +112,8 @@ _year_rows = [r["yr"] for r in _years_df.where(F.col("yr").isNotNull()).distinct
 assert _year_rows, "Could not derive any year from Default Effective Date in the input data."
 
 _max_year = max(_year_rows)
-CURRENT_FY = str(_max_year)
-PRIOR_FY   = str(_max_year - 1)
+CURRENT_FY = f"FY{str(_max_year)[-2:]}"
+PRIOR_FY   = f"FY{str(_max_year - 1)[-2:]}"
 
 # CURRENT_QUARTER is now just a display label (max quarter seen within
 # CURRENT_FY) — used only for the final output filename, not for tagging.
@@ -349,8 +349,12 @@ def base_tag(df, required_cols: list):
         # Overwrites whatever (if anything) was padded in by
         # ensure_required_columns(), so every row's quarter/year always
         # matches its own Default Effective Date, in every pipeline (P1/P2/P3).
+        # Source Quarter = calendar quarter of eff_dt (Q1=Jan-Mar, Q2=Apr-Jun,
+        # Q3=Jul-Sep, Q4=Oct-Dec). Year Flag = "FY" + last 2 digits of the
+        # calendar year, e.g. 09/12/2025 -> Q3 / FY25, 02/24/2026 -> Q1 / FY26,
+        # 04/09/2026 -> Q2 / FY26 — both derived fresh per row from eff_dt.
         .withColumn("Source Quarter",     F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
-        .withColumn("Year Flag",          F.year(F.col("eff_dt")).cast("string"))
+        .withColumn("Year Flag",          F.concat(F.lit("FY"), F.date_format(F.col("eff_dt"), "yy")))
         .withColumn("month_dt",           month_from_business_column(F.col("Month")))
         .withColumn("entered_net_dec",    to_decimal_clean("Net Entered"))
         .withColumn("abs_entered_dec",    F.abs(F.col("entered_net_dec")))
@@ -453,11 +457,25 @@ def resolve_to_original(pairs_df, base_df, match_label: str,
         yf_sales  = base_df.select(
             F.col("row_id").alias("sales_row_id"),
             F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("sales_year_flag"),
+            F.upper(F.trim(F.col("Source Quarter").cast("string"))).alias("sales_quarter_flag"),
         )
         yf_credit = base_df.select(
             F.col("row_id").alias("credit_row_id"),
             F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("credit_year_flag"),
+            F.upper(F.trim(F.col("Source Quarter").cast("string"))).alias("credit_quarter_flag"),
         )
+        # CHANGED: carry-forward is no longer guaranteed to be exactly one
+        # prior year/quarter — it can span any number of PY quarters/years.
+        # So "CY" vs "PY" is now decided generically (CY = matches
+        # CURRENT_FY exactly, PY = anything else, however many years back)
+        # instead of requiring an exact match to a single PRIOR_FY constant.
+        # The row's actual "Year Flag" / "Source Quarter" columns (already
+        # carried all the way to the final export) are what you filter on
+        # if you need to know exactly WHICH prior year/quarter a row is
+        # from — "Year Pair Flag" is only a quick CY/PY-at-a-glance label.
+        _sales_cy_py  = F.when(F.col("sales_year_flag")  == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
+        _credit_cy_py = F.when(F.col("credit_year_flag") == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
+
         pairs_with_id = (
             pairs_with_id
             .join(yf_sales,  on="sales_row_id",  how="left")
@@ -465,22 +483,11 @@ def resolve_to_original(pairs_df, base_df, match_label: str,
             .withColumn(
                 "Year Pair Flag",
                 F.when(
-                    (F.col("sales_year_flag") == PRIOR_FY)
-                    & (F.col("credit_year_flag") == CURRENT_FY),
-                    F.lit("PY Sales Inv with CY Credit Memo"),
-                ).when(
-                    (F.col("sales_year_flag") == CURRENT_FY)
-                    & (F.col("credit_year_flag") == CURRENT_FY),
-                    F.lit("CY Sales Inv with CY Credit Memo"),
-                ).when(
-                    (F.col("sales_year_flag") == PRIOR_FY)
-                    & (F.col("credit_year_flag") == PRIOR_FY),
-                    F.lit("PY Sales Inv with PY Credit Memo"),
-                ).when(
-                    (F.col("sales_year_flag") == CURRENT_FY)
-                    & (F.col("credit_year_flag") == PRIOR_FY),
-                    F.lit("CY Sales Inv with PY Credit Memo"),
-                ).otherwise(F.lit("Unknown"))
+                    F.col("sales_year_flag").isNull() | F.col("credit_year_flag").isNull(),
+                    F.lit("Unknown"),
+                ).otherwise(
+                    F.concat(_sales_cy_py, F.lit(" Sales Inv with "), _credit_cy_py, F.lit(" Credit Memo"))
+                )
             )
             .select("pair_id", "sales_row_id", "credit_row_id", "match_type", "Year Pair Flag")
         )
