@@ -2,9 +2,14 @@
 # JE SALES-INVOICE / CREDIT-MEMO MATCHING PIPELINE  —  MODIFIED VERSION
 # =============================================================================
 # CHANGES FROM ORIGINAL (per request):
-#   1. Year + Quarter no longer come from widgets / output_path detection.
-#      They are derived PER ROW from "Default Effective Date". CURRENT_FY /
-#      PRIOR_FY are derived from the max year found in the data.
+#   1. Year + Quarter no longer come from widgets / output_path detection,
+#      and are NOT stamped as a constant per batch anywhere. base_tag()
+#      derives "Source Quarter" and "Year Flag" directly, per row, from
+#      that row's own "Default Effective Date" (Q1-Q4 calendar quarter,
+#      calendar year) — this runs identically for every pipeline (P1/P2/P3).
+#      CURRENT_FY / PRIOR_FY (used only for the "Year Pair Flag" CY/PY
+#      label on confirmed pairs) are derived from the max year found in
+#      the data, once, in Cell 2.
 #   2. Carry-forward is now ALWAYS assumed present (no Yes/No widget) — Cell 2
 #      no longer prompts, HAS_CARRY_FORWARD is hardcoded True.
 #   3. AA Comment text updated:
@@ -87,8 +92,8 @@ STAGE_PATH_P1 = STAGE_PATH_P2 = STAGE_PATH_P3 = None
 # year seen in "Default Effective Date" across JE_raw (+ JE_raw_2_aligned,
 # since carry-forward is always present) is CURRENT_FY; the year before it
 # is PRIOR_FY. Every row's own "Source Quarter"/"Year Flag" is computed
-# later, per row, in add_year_quarter_from_date() (Cell 3) — not stamped
-# with a single global constant.
+# later, per row, directly inside base_tag() (Cell 3) from that row's
+# eff_dt — not stamped with a single global constant.
 # =============================================================================
 
 def _parse_eff_date(df, col_name: str = "Default Effective Date"):
@@ -262,27 +267,6 @@ def ensure_required_columns(df, required_cols: list):
     return df.select(*required_cols)
 
 
-def add_year_quarter_from_date(df, date_col: str = "Default Effective Date"):
-    """
-    REPLACES add_source_quarter_col(). Derives "Source Quarter" (Q1-Q4,
-    calendar quarter) and "Year Flag" (calendar year, as string) PER ROW
-    from the row's own Default Effective Date — instead of stamping every
-    row in a batch with one constant quarter/year value.
-    INPUT  : df, date_col — column to parse (defaults to "Default Effective Date")
-    OUTPUT : df + "Source Quarter" + "Year Flag"
-    USED BY: Cell 5 (Pipeline 2) — tags cy_unmatched AND the carry-forward
-             data with per-row quarter/year, before they're unioned.
-    NOTE: if date_col has already been overwritten with a parsed date
-          (post base_tag, column "eff_dt" exists), that is preferred over
-          re-parsing the raw string.
-    """
-    _d = F.col("eff_dt") if "eff_dt" in df.columns else to_date_clean(date_col)
-    return (
-        df.withColumn("Source Quarter", F.concat(F.lit("Q"), F.quarter(_d).cast("string")))
-          .withColumn("Year Flag", F.year(_d).cast("string"))
-    )
-
-
 def ensure_row_id(df):
     if "row_id" in df.columns:
         return df.withColumn("row_id", F.col("row_id").cast("string"))
@@ -368,6 +352,13 @@ def base_tag(df, required_cols: list):
         .withColumn("vendor_num_clean",   F.trim(F.col("Vendor/Customer Number").cast("string")))
         .withColumn("eff_dt",             to_date_clean("Default Effective Date"))
         .withColumn("Default Effective Date", F.col("eff_dt"))
+        # Source Quarter / Year Flag are NOT hardcoded/stamped anymore —
+        # derived directly, per row, from this row's own effective date.
+        # Overwrites whatever (if anything) was padded in by
+        # ensure_required_columns(), so every row's quarter/year always
+        # matches its own Default Effective Date, in every pipeline (P1/P2/P3).
+        .withColumn("Source Quarter",     F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
+        .withColumn("Year Flag",          F.year(F.col("eff_dt")).cast("string"))
         .withColumn("month_dt",           month_from_business_column(F.col("Month")))
         .withColumn("entered_net_dec",    to_decimal_clean("Net Entered"))
         .withColumn("abs_entered_dec",    F.abs(F.col("entered_net_dec")))
@@ -1136,10 +1127,10 @@ print("\n[P1] Done.")
 
 # DBTITLE 1,Pipeline 2 : Exact match Using PY quarter
 # =============================================================================
-# CELL 5 — PIPELINE 2  (Year Flag / Source Quarter now derived PER ROW from
-# Default Effective Date, via add_year_quarter_from_date(). Carry-forward is
-# ALWAYS unioned in — no HAS_CARRY_FORWARD branch needed anymore, but the
-# guard is kept in case JE_raw_2_aligned is ever empty/absent.)
+# CELL 5 — PIPELINE 2  (Year Flag / Source Quarter are derived PER ROW from
+# Default Effective Date inside base_tag() below — nothing stamped here.
+# Carry-forward is ALWAYS unioned in — no HAS_CARRY_FORWARD branch needed
+# anymore, but the guard is kept in case JE_raw_2_aligned is ever empty/absent.)
 # =============================================================================
 print("\n" + "="*70)
 print("PIPELINE 2 — Cross-year matching (CY unmatched + PY carry-forward)")
@@ -1161,18 +1152,18 @@ def align_to_raw(df, drop_cols, rename_map, target_cols):
     return df.select(*[c for c in target_cols if c in df.columns])
 
 
-# cy_unmatched: Pipeline-1 leftovers, reshaped to raw schema, then tagged
-# with Source Quarter / Year Flag derived PER ROW from its own Default
-# Effective Date (CHANGED — no longer a constant CURRENT_QUARTER/CURRENT_FY
-# stamp).
+# cy_unmatched: Pipeline-1 leftovers, reshaped back to raw schema. No
+# Source Quarter / Year Flag stamping happens here anymore — base_tag()
+# (called just below) now derives both columns directly, per row, from
+# each row's own "Default Effective Date". Nothing hardcoded here.
 cy_unmatched = align_to_raw(P1_ALL_UNMATCHED, _P1_DROP, _RENAME, BASE_RAW_COLUMNS)
-cy_unmatched = add_year_quarter_from_date(cy_unmatched)
 
 # Carry-forward data — always unioned in now (HAS_CARRY_FORWARD is True by
-# design; guard kept defensively in case the frame is missing/empty).
+# design; guard kept defensively in case the frame is missing/empty). Its
+# Source Quarter / Year Flag will also be derived from its own Default
+# Effective Date inside base_tag() below — not tagged here.
 if 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None:
-    cf_data      = add_year_quarter_from_date(JE_raw_2_aligned)
-    JE_raw_pipe2 = cy_unmatched.unionByName(cf_data, allowMissingColumns=True)
+    JE_raw_pipe2 = cy_unmatched.unionByName(JE_raw_2_aligned, allowMissingColumns=True)
     print(f"[P2-S0] Combined input count = {JE_raw_pipe2.count():,} (current + carry-forward)")
 else:
     JE_raw_pipe2 = cy_unmatched
