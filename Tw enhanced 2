@@ -11,7 +11,8 @@
 #      label on confirmed pairs) are derived from the max year found in
 #      the data, once, in Cell 2.
 #   2. Carry-forward is now ALWAYS assumed present (no Yes/No widget) — Cell 2
-#      no longer prompts, HAS_CARRY_FORWARD is hardcoded True.
+#      no longer prompts — carry-forward is now always assumed present
+#      (no HAS_CARRY_FORWARD flag/global needed).
 #   3. AA Comment text updated:
 #        - ONE_TO_MANY                -> "One to Many"
 #        - DATE_SYNC exact match      -> "Exact Match (There is a lag of more than two month)"
@@ -58,11 +59,6 @@ SMALL_AMT_MAX      = 5
 P3_TOLERANCE       = 100
 NUM_PARTITIONS     = 400
 
-# Kept only as a reference map (Q1=Jan-Mar ... Q4=Oct-Dec, calendar quarters).
-# No longer used to derive AA comments (Rule3 Priority4 removed) — retained
-# in case other reporting needs a quarter->first-month lookup.
-QUARTER_FIRST_MONTH = {"Q1": "January", "Q2": "April", "Q3": "July", "Q4": "October"}
-
 # ---------------- AA Comment rule labels ----------------
 AA_ONE_TO_MANY          = "One to Many"                                              # Rule Group 1
 AA_EXACT_MATCH_SYNC     = "Exact Match (There is a lag of more than two month)"       # Rule 2a exact
@@ -75,8 +71,6 @@ AA_CLIENT_CONFIRM       = "Client to Confirm"                                   
 
 # Globals set in Cell 2 (now derived from data, not widgets)
 CURRENT_QUARTER              = None   # label only, used for output filename
-CARRY_FORWARD_SOURCE_QUARTER = None   # unused now (kept for compatibility, always None)
-HAS_CARRY_FORWARD            = True   # ALWAYS True — carry-forward assumed present
 CURRENT_FY                   = None   # derived: max calendar year found in eff_dt across both inputs
 PRIOR_FY                     = None   # derived: CURRENT_FY - 1
 STAGE_PATH_P1 = STAGE_PATH_P2 = STAGE_PATH_P3 = None
@@ -134,7 +128,7 @@ CURRENT_QUARTER = f"Q{_max_q}"
 
 print(f"[CONFIG] Current FY (derived): {CURRENT_FY}  |  Prior FY (derived): {PRIOR_FY}")
 print(f"[CONFIG] Current Quarter label (derived, for filename only): {CURRENT_QUARTER}")
-print(f"[CONFIG] Carry-forward: always assumed present (HAS_CARRY_FORWARD=True)")
+print(f"[CONFIG] Carry-forward: always assumed present.")
 
 STAGE_PATH_P1 = f"{output_path}/_stage/p1"
 STAGE_PATH_P2 = f"{output_path}/_stage/p2"
@@ -186,7 +180,7 @@ def materialize_df(df, name: str, repartition_key: str = None,
 # tables in the notebook output. exhaustive_match()'s internal per-iteration
 # progress logging is left as plain print() (status/progress, not data).
 
-def debug_count(label: str, df, width: int = 55):
+def debug_count(label: str, df):
     """Show a one-row [Metric, Count] table via display() instead of printing text."""
     n = df.count() if df is not None else None
     row_df = spark.createDataFrame([(label, n)], ["Metric", "Count"])
@@ -337,12 +331,10 @@ def union_non_null(*dfs):
 # ── Pipeline base transformation ─────────────────────────────────────────────
 
 def base_tag(df, required_cols: list):
-    _sq = "Source Quarter"
-    _cols = required_cols if _sq in required_cols else (
-        required_cols + [_sq] if _sq in df.columns else required_cols
-    )
-
-    df = ensure_required_columns(df, _cols)
+    # Source Quarter / Year Flag are derived unconditionally further below
+    # (from eff_dt), regardless of whether they're in required_cols, so no
+    # special-casing is needed here anymore — just pad/select as normal.
+    df = ensure_required_columns(df, required_cols)
     df = ensure_row_id(df)
     df = (
         df
@@ -735,7 +727,6 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
 #   - Rule 3 Priorities 1/2/3/(old 5, now 4) unchanged in text.
 
 def assign_aa_comment(df, raw_df, oto_df=None,
-                      source_quarter_col: str = "Source Quarter",
                       small_amt_threshold: float = SMALL_AMT_MAX):
     """
     Final labeling step. See module header for the updated comment text.
@@ -1129,7 +1120,7 @@ print("\n[P1] Done.")
 # =============================================================================
 # CELL 5 — PIPELINE 2  (Year Flag / Source Quarter are derived PER ROW from
 # Default Effective Date inside base_tag() below — nothing stamped here.
-# Carry-forward is ALWAYS unioned in — no HAS_CARRY_FORWARD branch needed
+# Carry-forward is ALWAYS unioned in — no flag/branch needed anymore
 # anymore, but the guard is kept in case JE_raw_2_aligned is ever empty/absent.)
 # =============================================================================
 print("\n" + "="*70)
@@ -1158,8 +1149,7 @@ def align_to_raw(df, drop_cols, rename_map, target_cols):
 # each row's own "Default Effective Date". Nothing hardcoded here.
 cy_unmatched = align_to_raw(P1_ALL_UNMATCHED, _P1_DROP, _RENAME, BASE_RAW_COLUMNS)
 
-# Carry-forward data — always unioned in now (HAS_CARRY_FORWARD is True by
-# design; guard kept defensively in case the frame is missing/empty). Its
+# Carry-forward data — always unioned in now (assumed present by design; guard kept defensively in case the frame is missing/empty). Its
 # Source Quarter / Year Flag will also be derived from its own Default
 # Effective Date inside base_tag() below — not tagged here.
 if 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None:
@@ -1549,7 +1539,6 @@ P3_ALL_UNMATCHED_COMMENTED = assign_aa_comment(
     df                  =P3_ALL_UNMATCHED,
     raw_df              =raw_for_stats,
     oto_df              =oto,
-    source_quarter_col  ="Source Quarter",
     small_amt_threshold =SMALL_AMT_MAX,
 )
 
