@@ -1,36 +1,47 @@
 # =============================================================================
-# JE SALES-INVOICE / CREDIT-MEMO MATCHING PIPELINE  —  MODIFIED VERSION
+# JE SALES-INVOICE / CREDIT-MEMO MATCHING PIPELINE
 # =============================================================================
-# CHANGES FROM ORIGINAL (per request):
-#   1. Year + Quarter no longer come from widgets / output_path detection,
-#      and are NOT stamped as a constant per batch anywhere. base_tag()
-#      derives "Source Quarter" and "Year Flag" directly, per row, from
-#      that row's own "Default Effective Date" (Q1-Q4 calendar quarter,
-#      calendar year) — this runs identically for every pipeline (P1/P2/P3).
-#      CURRENT_FY / PRIOR_FY (used only for the "Year Pair Flag" CY/PY
-#      label on confirmed pairs) are derived from the max year found in
-#      the data, once, in Cell 2.
-#   2. Carry-forward is now ALWAYS assumed present (no Yes/No widget) — Cell 2
-#      no longer prompts — carry-forward is now always assumed present
-#      (no HAS_CARRY_FORWARD flag/global needed).
-#   3. AA Comment text updated:
-#        - ONE_TO_MANY                -> "One to Many"
-#        - DATE_SYNC exact match      -> "Exact Match (There is a lag of more than two month)"
-#        - DATE_UNSYNC exact match    -> "Exact match (Credit memo occures before sales invoice)"
-#        - DATE_SYNC/UNSYNC approx    -> "Upto $100 Difference"
-#        - Rule3 Priority 4 (start-of-quarter flag) REMOVED entirely — those
-#          rows now fall through to the Priority 5 catch-all comment.
-#        - AA_ONLY_CREDITS / AA_SINGLE_CREDIT_COMBO / AA_SMALL_AMOUNT /
-#          AA_CLIENT_CONFIRM text unchanged.
+# WHAT THIS NOTEBOOK DOES, END TO END
+# -----------------------------------
+# Input : JE_raw (current-quarter journal entries) + JE_raw_2_aligned
+#         (prior-year carry-forward journal entries, same schema).
+# Output: one Excel workbook containing every row from the input, sorted
+#         into either a matched-pair sheet or an unmatched/exception sheet,
+#         plus one parquet table per intermediate dataset for audit trail.
 #
-# Everything else (matching logic, checkpointing, pipeline structure) is
-# unchanged from the original notebook.
+# The core problem: for each (Company, Vendor, |Amount|) combination, pair
+# up "Sales Invoices" rows with "Credit Memos" rows that cancel each other
+# out (net amount == 0), across three passes of increasing looseness:
+#
+#   PIPELINE 1 (Cell 4) — match within the current quarter's own data only.
+#   PIPELINE 2 (Cell 5) — take what P1 couldn't match, add in prior-year
+#                          carry-forward rows, and match again (this is the
+#                          only pipeline that tags CY/PY on the pair).
+#   PIPELINE 3 (Cell 6) — take what P2 couldn't match, drop the exact-amount
+#                          requirement from the join key, and allow up to
+#                          $100 of difference (tolerance match).
+#
+# Every row that survives all three passes unmatched gets a rule-based
+# "AA Comment" (Cell 7) explaining *why* it's unmatched, then everything
+# — matched and unmatched — is written to one final .xlsx (Cell 8).
+#
+# ROW CONSERVATION is the invariant the whole notebook is built around:
+# every row that goes into base_tag() must come back out somewhere in the
+# final export. Cell 8 asserts this explicitly; Pipeline 3 asserts it
+# per-pipeline (cnt_in == cnt_out).
 # =============================================================================
 
 
 # COMMAND ----------
 
 # DBTITLE 1,Export JE as Parquet
+# Round-trips both raw inputs through parquet before any pipeline touches
+# them. Forces Spark to materialize JE_raw_1 / JE_raw_2_aligned to disk and
+# re-read them as JE_raw / JE_raw_2_aligned, so every downstream cell reads
+# from a stable, already-computed source instead of re-evaluating whatever
+# lazy transformation chain produced JE_raw_1/JE_raw_2_aligned upstream of
+# this notebook. JE_raw = current-quarter data. JE_raw_2_aligned =
+# prior-year carry-forward data, same schema, consumed only in Pipeline 2.
 cp.write(JE_raw_1, f'{output_path_et}/JE_raw.parquet', 'overwrite', register=True)
 JE_raw=cp.read(f'{output_path_et}/JE_raw.parquet')
 cp.write(JE_raw_2_aligned, f'{output_path_et}/JE_raw_2_aligned.parquet', 'overwrite', register=True)
@@ -41,57 +52,69 @@ JE_raw_2_aligned=cp.read(f'{output_path_et}/JE_raw_2_aligned.parquet')
 
 # DBTITLE 1,Config and Quarter Setup
 # =============================================================================
-# CELL 1 — CONFIGURATION
+# CELL 1 — CONSTANTS, COLUMN LISTS, GLOBALS, AND THE TWO HELPERS THAT NEED
+# TO EXIST BEFORE CELL 2 CAN RUN
 # =============================================================================
 
 import re
 from pyspark.sql import functions as F, Window, types as T
 
+# BASE_RAW_COLUMNS: the exact column set/order every raw JE row is forced
+# into by ensure_required_columns() (see base_tag() in Cell 3). Any column
+# missing from an input frame gets padded in as NULL; anything extra is
+# dropped. This is the schema contract every pipeline (P1/P2/P3) tags
+# against, so P1's output can be reshaped back into P2's input, and so on.
 BASE_RAW_COLUMNS = [
     "Company Description", "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name", "Month", "Default Effective Date", "Posted Date", "JE Category", "Journal Description", "JE Line Number", "Line Description", "Currency Code", "Je Source", "Ledger", "Account Description", "Invoice Reference", "Journal Line Vendor/Customer", "Vendor/Customer Name", "Vendor PO#", "Vendor/Customer Number", "COA", "Company", "Business", "Location", "Department/Cost Center", "Natural Account", "Product", "Revenue Type", "Intercompany", "Future1", "Future2", "Accounted Dr", "Accounted Cr", "Entered Dr", "Entered CR", "Net Entered", "Net Accounted"
 ]
 
+# PIPE2_RAW_COLUMNS: same as above, plus "Year Flag" / "Source Quarter" —
+# Pipeline 2 and 3 carry these two derived columns through their schema
+# contract because base_tag() re-derives (overwrites) them from each row's
+# own Default Effective Date every time it runs, on every pipeline. Listing
+# them here just means ensure_required_columns() won't null-pad them away
+# before base_tag() gets a chance to (re)compute them.
 PIPE2_RAW_COLUMNS = BASE_RAW_COLUMNS + ["Year Flag", "Source Quarter"]
 
+# DECIMAL_TYPE / EXACT_ZERO: every dollar amount in the pipeline is cast to
+# this DecimalType(38,6) so "sales_amt + credit_amt == 0" comparisons are
+# exact (no float rounding drift). EXACT_ZERO is that literal, pre-cast, so
+# every "==EXACT_ZERO" check downstream compares like-for-like types.
 DECIMAL_TYPE       = T.DecimalType(38, 6)
 EXACT_ZERO         = F.lit(0).cast(DECIMAL_TYPE)
-SMALL_AMT_MAX      = 5
-P3_TOLERANCE       = 100
-NUM_PARTITIONS     = 400
+SMALL_AMT_MAX      = 5      # AA Rule 3 Priority 3 threshold — see assign_aa_comment()
+P3_TOLERANCE       = 100    # Pipeline 3's "up to $100 difference" tolerance-match ceiling
+NUM_PARTITIONS     = 400    # repartition width used everywhere a primary_key-keyed shuffle happens
 
 # ---------------- AA Comment rule labels ----------------
-AA_ONE_TO_MANY          = "One to Many"                                              # Rule Group 1
-AA_EXACT_MATCH_SYNC     = "Exact Match (There is a lag of more than two month)"       # Rule 2a exact
-AA_EXACT_MATCH_UNSYNC   = "Exact match (Credit memo occures before sales invoice)"    # Rule 2b exact
-AA_APPROX_MATCH         = "Upto $100 Difference"                                     # Rule 2a/2b approx
-AA_ONLY_CREDITS         = "Only Credit Memos Present"                                 # Rule 3 Priority 1
-AA_SINGLE_CREDIT_COMBO  = "Single Credit Memo with One Combination"                    # Rule 3 Priority 2
-AA_SMALL_AMOUNT         = "Small Amount"                                              # Rule 3 Priority 3
-AA_CLIENT_CONFIRM       = "Client to Confirm"                                         # Rule 3 Priority 4 (catch-all, was Priority 5)
+# These are the exact strings written into the "AA Comment" column on every
+# row that comes out of Pipeline 3 still unmatched (see assign_aa_comment(),
+# Cell 3). Client-facing text — changing these changes what appears in the
+# final Excel "Unmatched_Items" sheet, not just an internal label.
+AA_ONE_TO_MANY          = "One to Many"                                              # Rule Group 1: row was one of several tolerance-match candidates, so it's flagged for manual review instead of auto-picked
+AA_EXACT_MATCH_SYNC     = "Exact Match (There is a lag of more than two month)"       # Rule 2a exact: within-tolerance pair where sales predates credit, but by more than the 2-step lag Pipeline 1/2 already covers
+AA_EXACT_MATCH_UNSYNC   = "Exact match (Credit memo occures before sales invoice)"    # Rule 2b exact: within-tolerance pair where the credit memo's effective date is actually BEFORE the sales invoice's
+AA_APPROX_MATCH         = "Upto $100 Difference"                                     # Rule 2a/2b approx: same two date-order cases as above, but the pair's net amount isn't exactly zero — it's within P3_TOLERANCE
+AA_ONLY_CREDITS         = "Only Credit Memos Present"                                 # Rule 3 Priority 1: this vendor has zero Sales Invoices anywhere in the raw data — there is nothing for this credit memo to ever match against
+AA_SINGLE_CREDIT_COMBO  = "Single Credit Memo with One Combination"                    # Rule 3 Priority 2: this vendor has exactly one distinct (vendor, amount) credit-memo combination — one memo, so nothing to reconcile against
+AA_SMALL_AMOUNT         = "Small Amount"                                              # Rule 3 Priority 3: |amount| <= SMALL_AMT_MAX — immaterial, flagged rather than chased
+AA_CLIENT_CONFIRM       = "Client to Confirm"                                         # Rule 3 Priority 4 (catch-all): none of the above — genuinely unexplained, needs a human
 
-# Globals set in Cell 2 (now derived from data, not widgets)
-CURRENT_QUARTER              = None   # label only, used for output filename
-CURRENT_FY                   = None   # derived: max calendar year found in eff_dt across both inputs
-PRIOR_FY                     = None   # derived: CURRENT_FY - 1
-STAGE_PATH_P1 = STAGE_PATH_P2 = STAGE_PATH_P3 = None
+# Globals populated by Cell 2 (derived from the data itself — no widgets,
+# no output_path parsing, no manual quarter/year selection anywhere).
+CURRENT_QUARTER              = None   # display label only (e.g. "Q3"), used solely in the final .xlsx filename
+CURRENT_FY                   = None   # e.g. "FY26" — the max calendar year seen in Default Effective Date, across JE_raw + JE_raw_2_aligned
+PRIOR_FY                     = None   # CURRENT_FY - 1, e.g. "FY25" — kept for reference; Year Pair Flag logic (resolve_to_original) no longer requires an exact match to this, see Cell 3
+STAGE_PATH_P1 = STAGE_PATH_P2 = STAGE_PATH_P3 = None   # per-pipeline scratch/checkpoint directories, set for real in Cell 2
 
 
-# COMMAND ----------
-
-# DBTITLE 1,Config and Quarter Setup
-# =============================================================================
-# CELL 2 — YEAR DERIVATION FROM Default Effective Date  (no widgets)
-# Quarter/Year are no longer picked by the user or detected from output_path.
-# CURRENT_FY / PRIOR_FY are derived from the data itself: the max calendar
-# year seen in "Default Effective Date" across JE_raw (+ JE_raw_2_aligned,
-# since carry-forward is always present) is CURRENT_FY; the year before it
-# is PRIOR_FY. Every row's own "Source Quarter"/"Year Flag" is computed
-# later, per row, directly inside base_tag() (Cell 3) from that row's
-# eff_dt — not stamped with a single global constant.
-# =============================================================================
-
-def _parse_eff_date(df, col_name: str = "Default Effective Date"):
-    """Best-effort parse of the raw effective-date string column into DateType."""
+# to_date_clean(): the one and only Default-Effective-Date parser in the
+# notebook. Lives here (not in Cell 3, where the rest of the type-cleaning
+# helpers live) because Cell 2's year/quarter derivation needs it and Cell 2
+# runs before Cell 3. Every date-format variant seen in raw exports is
+# tried via coalesce, first match wins: US slash dates, ISO dates, and two
+# "dd-MMM-yy(yy)" spellings, plus a timestamp fallback.
+def to_date_clean(col_name: str):
     raw = F.trim(F.col(col_name).cast("string"))
     return F.coalesce(
         F.to_date(raw, "MM/dd/yyyy"),
@@ -102,10 +125,38 @@ def _parse_eff_date(df, col_name: str = "Default Effective Date"):
         F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
     )
 
-_years_df = JE_raw.select(F.year(_parse_eff_date(JE_raw)).alias("yr"))
-if 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None:
+
+# HAS_CF: true if the prior-year carry-forward frame exists and isn't None.
+# Computed exactly once here; every later cell that needs to know "is
+# carry-forward data actually available" (Cell 2's year scan, Pipeline 2's
+# input build, Cell 7's vendor-stats source) reads this same flag instead
+# of re-evaluating the globals() check itself.
+HAS_CF = 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Config and Quarter Setup
+# =============================================================================
+# CELL 2 — DERIVE CURRENT_FY / PRIOR_FY / CURRENT_QUARTER FROM THE DATA
+# =============================================================================
+# Nothing here is picked by a user or read from output_path. CURRENT_FY is
+# the calendar year with the highest max(year(Default Effective Date))
+# across JE_raw and (if HAS_CF) JE_raw_2_aligned — i.e. whichever year the
+# freshest row in either input belongs to. PRIOR_FY is just CURRENT_FY - 1.
+# Neither value is stamped onto rows anywhere; every row's own "Source
+# Quarter" / "Year Flag" is computed independently, per row, inside
+# base_tag() (Cell 3) from that row's own eff_dt — CURRENT_FY/PRIOR_FY only
+# feed the CY/PY label in resolve_to_original() and the output filename.
+# =============================================================================
+
+# Collect distinct years out of both inputs (guarded by HAS_CF so this
+# still runs correctly if carry-forward is ever absent) into one column,
+# then take the max — that's CURRENT_FY. -1 from it is PRIOR_FY.
+_years_df = JE_raw.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))
+if HAS_CF:
     _years_df = _years_df.unionByName(
-        JE_raw_2_aligned.select(F.year(_parse_eff_date(JE_raw_2_aligned)).alias("yr"))
+        JE_raw_2_aligned.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))
     )
 
 _year_rows = [r["yr"] for r in _years_df.where(F.col("yr").isNotNull()).distinct().collect()]
@@ -115,11 +166,13 @@ _max_year = max(_year_rows)
 CURRENT_FY = f"FY{str(_max_year)[-2:]}"
 PRIOR_FY   = f"FY{str(_max_year - 1)[-2:]}"
 
-# CURRENT_QUARTER is now just a display label (max quarter seen within
-# CURRENT_FY) — used only for the final output filename, not for tagging.
+# CURRENT_QUARTER: the highest calendar quarter seen within CURRENT_FY,
+# in JE_raw only (current-quarter data, not carry-forward) — used
+# exclusively to name the final .xlsx file, has no effect on any matching
+# or tagging logic.
 _cq_rows = (
-    JE_raw.withColumn("_yr", F.year(_parse_eff_date(JE_raw)))
-          .withColumn("_q",  F.quarter(_parse_eff_date(JE_raw)))
+    JE_raw.withColumn("_yr", F.year(to_date_clean("Default Effective Date")))
+          .withColumn("_q",  F.quarter(to_date_clean("Default Effective Date")))
           .where(F.col("_yr") == _max_year)
           .select("_q").distinct().collect()
 )
@@ -130,6 +183,10 @@ print(f"[CONFIG] Current FY (derived): {CURRENT_FY}  |  Prior FY (derived): {PRI
 print(f"[CONFIG] Current Quarter label (derived, for filename only): {CURRENT_QUARTER}")
 print(f"[CONFIG] Carry-forward: always assumed present.")
 
+# Per-pipeline scratch/checkpoint roots. Each pipeline writes its
+# intermediate materialize_df() output and exhaustive_match() checkpoints
+# under its own path so P1/P2/P3 runs never collide or overwrite each
+# other's staged parquet files.
 STAGE_PATH_P1 = f"{output_path}/_stage/p1"
 STAGE_PATH_P2 = f"{output_path}/_stage/p2"
 STAGE_PATH_P3 = f"{output_path}/_stage/p3"
@@ -138,21 +195,27 @@ STAGE_PATH_P3 = f"{output_path}/_stage/p3"
 
 # DBTITLE 1,Utility Function
 # =============================================================================
-# CELL 3 — UTILITY FUNCTIONS
+# CELL 3 — SHARED UTILITY FUNCTIONS USED BY ALL THREE PIPELINES
 # =============================================================================
 
+# _path_exists(): existence check used by exhaustive_match()'s checkpoint
+# logic (both for the meta file and for each per-iteration pairs_*.parquet
+# it references). Returns False on ANY failure (not found, permission,
+# transient), which is the conservative choice for a checkpoint check —
+# "can't confirm it's there" and "not there" both mean "start fresh".
 def _path_exists(path: str) -> bool:
     try:
-        jvm = spark._jvm
-        hconf = spark._jsc.hadoopConfiguration()
-        jpath = jvm.org.apache.hadoop.fs.Path(path)
-        fs = jpath.getFileSystem(hconf)
-        return fs.exists(jpath)
-    except Exception as e:
-        print(f"[WARN] _path_exists unexpected error for {path}: {e}")
+        dbutils.fs.ls(path)
+        return True
+    except Exception:
         return False
 
 
+# write_table(): the terminal write for anything meant to be a FINAL,
+# user-facing output table — always writes to output_path_et (or an
+# explicit base_path override) rather than a pipeline's scratch
+# STAGE_PATH. Returns the path it wrote to, so materialize_df() (below)
+# can read straight back off it without duplicating the cp.write() call.
 def write_table(df, name: str, log: bool = True, base_path: str = None):
     if df is None:
         print(f"  [SKIP] {name} – no data")
@@ -161,34 +224,51 @@ def write_table(df, name: str, log: bool = True, base_path: str = None):
     cp.write(df, path, "overwrite", register=True)
     if log:
         print(f"  [WRITTEN] {path}")
+    return path
 
 
+# materialize_df(): the workhorse used everywhere a lazy Spark transform
+# chain needs to be forced to disk and re-read as a fresh DataFrame — this
+# breaks lineage so later stages don't re-evaluate an ever-growing chain of
+# joins/filters, and (via repartition_key) lets a call site pre-shuffle on
+# the column that the next join/groupBy will use. Delegates the actual
+# write to write_table() so there's exactly one place that calls
+# cp.write(..., "overwrite", register=True).
 def materialize_df(df, name: str, repartition_key: str = None,
                    stage_path: str = None, num_partitions: int = NUM_PARTITIONS):
     print(f"  [MATERIALIZE] {name}")
-    base = stage_path or output_path
     if repartition_key and repartition_key in df.columns:
         df = df.repartition(num_partitions, repartition_key)
-    path = f"{base}/{name}.parquet"
-    cp.write(df, path, "overwrite", register=True)
+    path = write_table(df, name, log=False, base_path=stage_path)
     return cp.read(path)
 
 
-# NOTE: debug_count / debug_group_count / audit_summary are the "major" data
-# reporting calls (per user request) — they now render via Databricks
-# display() instead of print(), so counts/profiles/audits show as proper
-# tables in the notebook output. exhaustive_match()'s internal per-iteration
-# progress logging is left as plain print() (status/progress, not data).
+# debug_count / display_metric / debug_group_count / audit_summary all
+# render through Databricks display() rather than print(), so every count,
+# profile, and audit shows as a proper notebook table instead of console
+# text. The one deliberate exception is exhaustive_match()'s own
+# per-iteration progress logging ("Iter N: ...", "[CKPT] ..."), which stays
+# on plain print() — that's live status output about a loop still running,
+# not a finished result worth a table.
 
 def debug_count(label: str, df):
-    """Show a one-row [Metric, Count] table via display() instead of printing text."""
+    """One-row [Metric, Count] table for a DataFrame's row count."""
     n = df.count() if df is not None else None
     row_df = spark.createDataFrame([(label, n)], ["Metric", "Count"])
     display(row_df)
 
 
+def display_metric(label: str, value):
+    """Same one-row [Metric, Count] shape as debug_count, but for a value
+    that's already a plain Python scalar (e.g. an accumulated total pairs
+    count) rather than something with a live .count() to call."""
+    display(spark.createDataFrame([(label, value)], ["Metric", "Count"]))
+
+
 def debug_group_count(df, col_name: str, label: str, limit: int = 20):
-    """Show a groupBy(col_name).count() breakdown via display() instead of .show()."""
+    """groupBy(col_name).count() breakdown, top `limit` rows by count desc,
+    rendered as a table — the standard "distribution of X" profile call
+    used throughout every pipeline stage."""
     print(f"\n  [PROFILE] {label}")
     profiled = (
         df.groupBy(col_name)
@@ -200,7 +280,11 @@ def debug_group_count(df, col_name: str, label: str, limit: int = 20):
 
 
 def audit_summary(datasets: dict):
-    """Show a [Dataset, Count] table (+ TOTAL row) via display() instead of printing text."""
+    """Row-count table across every named dataset in a pipeline stage, plus
+    a TOTAL row — the per-pipeline reconciliation check (e.g. does
+    INVALID + EXC_1 + UNIQUE_* + DUP_* + MATCHED_* + UNMATCHED add up to
+    the pipeline's input row count?). Returns False if any dataset was
+    None, so a caller can assert on it if desired."""
     rows  = []
     total = 0
     ok    = True
@@ -218,6 +302,12 @@ def audit_summary(datasets: dict):
     return ok
 
 
+# export_to_excel(): the Cell 8 terminal step. Takes {sheet_name: df},
+# strips every internal/derived working column (primary keys, cleaned
+# helper columns, validity flags — none of which are meant for a client-
+# facing workbook) via _drop, pins a handful of the most load-bearing
+# business columns to the front of each sheet via _front, and writes one
+# multi-sheet .xlsx.
 def export_to_excel(sheets: dict, path: str):
     _front = ["primary_key", "JE Category", "Net Entered",
               "Default Effective Date", "Source Quarter"]
@@ -247,6 +337,13 @@ def export_to_excel(sheets: dict, path: str):
 
 # ── Schema helpers ───────────────────────────────────────────────────────────
 
+# ensure_required_columns(): forces any input frame onto the exact column
+# list a pipeline expects (BASE_RAW_COLUMNS or PIPE2_RAW_COLUMNS) — missing
+# columns are null-padded in, anything not in the list is dropped by the
+# final select(). Also backfills "Company Description" from "Company" when
+# the former is null, since some source extracts only populate one or the
+# other. This is what lets P1's ragged output be fed straight into P2's
+# base_tag() without a manual reconciliation step.
 def ensure_required_columns(df, required_cols: list):
     for c in required_cols:
         if c not in df.columns:
@@ -261,6 +358,15 @@ def ensure_required_columns(df, required_cols: list):
     return df.select(*required_cols)
 
 
+# ensure_row_id(): every row needs a stable, unique row_id so it can be
+# tracked through the join/anti-join dance in rank_based_match() and
+# rejoined to its original values in resolve_to_original(). If the frame
+# already carries a row_id (e.g. a re-tagged P1/P2 leftover frame) it's
+# just re-cast to string and left alone. Otherwise a fresh row_number() is
+# assigned over a deterministic natural sort — deterministic so the same
+# input always produces the same row_id, which matters for checkpoint
+# resume (a checkpointed sales/credit frame has to line up with a fresh
+# re-run of base_tag() on the same input).
 def ensure_row_id(df):
     if "row_id" in df.columns:
         return df.withColumn("row_id", F.col("row_id").cast("string"))
@@ -280,6 +386,11 @@ def ensure_row_id(df):
 
 # ── Type-conversion helpers ──────────────────────────────────────────────────
 
+# to_decimal_clean(): normalizes a raw amount string into DECIMAL_TYPE —
+# strips thousands separators, converts accounting-style "(123.45)"
+# negatives into "-123.45", and turns "" into NULL rather than 0 (an empty
+# amount is missing data, not a zero dollar amount — is_valid_row in
+# base_tag() depends on this distinction).
 def to_decimal_clean(col_name: str, precision: int = 38, scale: int = 6):
     cleaned = F.trim(F.col(col_name).cast("string"))
     cleaned = F.regexp_replace(cleaned, ",", "")
@@ -291,18 +402,19 @@ def to_decimal_clean(col_name: str, precision: int = 38, scale: int = 6):
     return cleaned.cast(T.DecimalType(precision, scale))
 
 
-def to_date_clean(col_name: str):
-    raw = F.trim(F.col(col_name).cast("string"))
-    return F.coalesce(
-        F.to_date(raw, "MM/dd/yyyy"),
-        F.to_date(raw, "M/d/yyyy"),
-        F.to_date(raw, "yyyy-MM-dd"),
-        F.to_date(raw, "dd-MMM-yy"),
-        F.to_date(raw, "dd-MMM-yyyy"),
-        F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
-    )
+# (to_date_clean lives in Cell 1 — Cell 2's year/quarter derivation runs
+# before this cell and needs it too, so there is exactly one copy of the
+# date-format coalesce list for the whole notebook.)
 
 
+# month_from_business_column(): parses the raw "Month" business column
+# (typically "MMM-yy" style, e.g. "Mar-26") into a real date, with two
+# extra fallbacks that prepend "01-" so a bare "Mar-26"/"March-2026" string
+# still resolves to the 1st of that month, plus the same numeric/ISO
+# fallbacks to_date_clean uses in case "Month" was populated with a full
+# date instead of a month label. month_dt (not eff_dt) is what
+# rank_based_match() uses for month_lag, since "Month" is the business
+# period a JE was booked to, which can differ from its effective date.
 def month_from_business_column(month_col):
     raw = F.trim(month_col.cast("string"))
     return F.coalesce(
@@ -318,6 +430,12 @@ def month_from_business_column(month_col):
 
 # ── DataFrame set helpers ────────────────────────────────────────────────────
 
+# union_non_null(): unionByName across any number of DataFrames, silently
+# skipping any that are None (e.g. a pipeline stage that found zero rows
+# for a given match_type and returned None instead of an empty frame).
+# allowMissingColumns=True so frames with slightly different derived-column
+# sets (e.g. a P1 frame without Year Flag vs a P2 frame with it) can still
+# be unioned — missing columns are null-filled on the narrower side.
 def union_non_null(*dfs):
     valid = [df for df in dfs if df is not None]
     if not valid:
@@ -330,10 +448,39 @@ def union_non_null(*dfs):
 
 # ── Pipeline base transformation ─────────────────────────────────────────────
 
+# base_tag(): the single entry point every pipeline (P1/P2/P3) runs its raw
+# input through before any matching happens. Given a raw frame and the
+# column list it should conform to, this:
+#   1. Pads/selects onto required_cols (ensure_required_columns)
+#   2. Assigns a stable row_id (ensure_row_id)
+#   3. Derives every "clean" helper column matching logic depends on:
+#        invoice_ref_clean / cat_clean / company_desc_clean / vendor_num_clean
+#          — trimmed/uppercased raw text, used for equality comparisons
+#            that need to ignore casing/whitespace noise from source data.
+#        eff_dt   — Default Effective Date, parsed to a real date (also
+#                    overwrites the original string column with the parsed
+#                    date, so every downstream reference to "Default
+#                    Effective Date" is already a proper date).
+#        Source Quarter / Year Flag — recomputed HERE, per row, straight
+#          from this row's own eff_dt, every single time base_tag() runs
+#          (P1, P2, and P3 all call it fresh) — Q1=Jan-Mar...Q4=Oct-Dec,
+#          Year Flag="FY"+last 2 digits of the calendar year. This is what
+#          makes carry-forward rows correctly self-tag as whatever prior
+#          FY/quarter they actually belong to, rather than being stamped
+#          with a single global PRIOR_FY constant.
+#        month_dt        — parsed "Month" business column (see above)
+#        entered_net_dec / abs_entered_dec / abs_entered_key
+#          — the cleaned amount, its absolute value, and that absolute
+#            value as a string (used as one leg of primary_key, below).
+#        valid_company_desc / valid_vendor_num
+#          — booleans gating whether this row has enough identifying info
+#            to form a primary_key at all.
+#        primary_key = "{company}_{vendor}_{|amount|}" — the join key every
+#          matching pass groups Sales Invoices against Credit Memos on.
+#          NULL if company/vendor/amount is missing (see valid_* above).
+#        is_valid_row — the row-id/amount/date/primary_key completeness
+#          gate that Cell 4/5/6 split INVALID vs prep rows on.
 def base_tag(df, required_cols: list):
-    # Source Quarter / Year Flag are derived unconditionally further below
-    # (from eff_dt), regardless of whether they're in required_cols, so no
-    # special-casing is needed here anymore — just pad/select as normal.
     df = ensure_required_columns(df, required_cols)
     df = ensure_row_id(df)
     df = (
@@ -344,15 +491,6 @@ def base_tag(df, required_cols: list):
         .withColumn("vendor_num_clean",   F.trim(F.col("Vendor/Customer Number").cast("string")))
         .withColumn("eff_dt",             to_date_clean("Default Effective Date"))
         .withColumn("Default Effective Date", F.col("eff_dt"))
-        # Source Quarter / Year Flag are NOT hardcoded/stamped anymore —
-        # derived directly, per row, from this row's own effective date.
-        # Overwrites whatever (if anything) was padded in by
-        # ensure_required_columns(), so every row's quarter/year always
-        # matches its own Default Effective Date, in every pipeline (P1/P2/P3).
-        # Source Quarter = calendar quarter of eff_dt (Q1=Jan-Mar, Q2=Apr-Jun,
-        # Q3=Jul-Sep, Q4=Oct-Dec). Year Flag = "FY" + last 2 digits of the
-        # calendar year, e.g. 09/12/2025 -> Q3 / FY25, 02/24/2026 -> Q1 / FY26,
-        # 04/09/2026 -> Q2 / FY26 — both derived fresh per row from eff_dt.
         .withColumn("Source Quarter",     F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
         .withColumn("Year Flag",          F.concat(F.lit("FY"), F.date_format(F.col("eff_dt"), "yy")))
         .withColumn("month_dt",           month_from_business_column(F.col("Month")))
@@ -388,6 +526,12 @@ def base_tag(df, required_cols: list):
 
 # ── Matching helpers ──────────────────────────────────────────────────────────
 
+# make_sales() / make_credit(): project a base_tag()'d frame down to just
+# the "Sales Invoices" (resp. "Credit Memos") rows, keep only the columns
+# rank_based_match() actually needs, alias every column with a sales_/
+# credit_ prefix so a self-join on primary_key doesn't collide column
+# names, and repartition on the join key up front so the join in
+# rank_based_match() doesn't have to re-shuffle every iteration.
 def make_sales(src_df, pk_col: str = "primary_key"):
     return (
         src_df.filter(F.col("cat_clean") == "SALES INVOICES")
@@ -418,6 +562,11 @@ def make_credit(src_df, pk_col: str = "primary_key"):
     )
 
 
+# build_unmatched_rows(): given whatever's left in the sales/credit sides
+# after all match steps for a pipeline have run, pulls the row_ids that
+# never got consumed, and joins back to the pipeline's base_df (the
+# DUP_SI_CM frame — see Cell 4/5) to recover their full original rows.
+# This is how "P1_REMAIN_UNMATCHED" / "P2_REMAIN_UNMATCHED" get built.
 def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df,
                          name: str, stage_path: str = None):
     remaining_ids = (
@@ -429,6 +578,24 @@ def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df,
     return materialize_df(unmatched, name, "primary_key", stage_path=stage_path)
 
 
+# resolve_to_original(): takes the SLIM pairs table (just sales_row_id /
+# credit_row_id / match_type) that a completed exhaustive_match() run
+# produced, and expands it back out to full original rows for both legs of
+# every pair. Also:
+#   1. Assigns a pair_id ("{match_label}_{n}") — a stable identifier per
+#      confirmed pair, deterministic via row_number() over a fixed sort so
+#      the same pairing always gets the same pair_id.
+#   2. (has_year_flag=True, Pipeline 2 only) Computes "Year Pair Flag" —
+#      e.g. "CY Sales Inv with PY Credit Memo". CY means this leg's own
+#      Year Flag equals CURRENT_FY; PY means anything else (any number of
+#      years back — carry-forward isn't assumed to be exactly one year
+#      old). This is a quick-glance label only; the row's real Year
+#      Flag/Source Quarter (carried all the way to the final export) is
+#      what you'd filter on to know exactly which prior period a row is
+#      actually from.
+# Both legs of every pair (the sales row AND the credit row) are unioned
+# together into one output frame — every resolved dataset has exactly 2
+# rows per confirmed pair.
 def resolve_to_original(pairs_df, base_df, match_label: str,
                         stage_name: str, stage_path: str = None,
                         has_year_flag: bool = False):
@@ -464,15 +631,6 @@ def resolve_to_original(pairs_df, base_df, match_label: str,
             F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("credit_year_flag"),
             F.upper(F.trim(F.col("Source Quarter").cast("string"))).alias("credit_quarter_flag"),
         )
-        # CHANGED: carry-forward is no longer guaranteed to be exactly one
-        # prior year/quarter — it can span any number of PY quarters/years.
-        # So "CY" vs "PY" is now decided generically (CY = matches
-        # CURRENT_FY exactly, PY = anything else, however many years back)
-        # instead of requiring an exact match to a single PRIOR_FY constant.
-        # The row's actual "Year Flag" / "Source Quarter" columns (already
-        # carried all the way to the final export) are what you filter on
-        # if you need to know exactly WHICH prior year/quarter a row is
-        # from — "Year Pair Flag" is only a quick CY/PY-at-a-glance label.
         _sales_cy_py  = F.when(F.col("sales_year_flag")  == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
         _credit_cy_py = F.when(F.col("credit_year_flag") == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
 
@@ -513,6 +671,27 @@ def resolve_to_original(pairs_df, base_df, match_label: str,
     return materialize_df(resolved, stage_name, "primary_key", stage_path=stage_path)
 
 
+# rank_based_match(): ONE greedy matching pass. Cross-joins sales/credit
+# candidates that share a primary_key, computes amount_diff
+# (|sales_amt + credit_amt| — zero means they exactly cancel) and month_lag
+# (how many calendar months apart their "Month" business periods are), then
+# hands the joined candidates to condition_fn (one of MATCH_STEPS' lambdas)
+# to filter down to whichever specific rule this pass is enforcing.
+#
+# Among the surviving candidates, this does a MUTUAL best-match pick, not a
+# first-match pick: for every sales row, rank its candidate credits by
+# (amount_diff, month_lag, credit_eff_dt, credit_row_id) and take rank 1;
+# separately, for every credit row, rank its candidate sales the mirrored
+# way and take rank 1. A candidate pair only survives BOTH rankings
+# (rn_sales==1 AND rn_credit==1) — i.e. it has to be each other's best
+# option, not just one side's. This is what prevents a popular sales row
+# from being greedily claimed by the first credit row it's checked against
+# when a better mutual pairing exists elsewhere in the same primary_key
+# group.
+# Returns (confirmed_pairs, remaining_sales, remaining_credit) — confirmed
+# rows are removed from both sides via left_anti join before returning the
+# remainders, so a caller can feed those remainders into the next
+# iteration/step without re-matching what's already settled.
 def rank_based_match(sales_df, credit_df, condition_fn, match_label: str,
                      stage_path: str = None):
     candidates = (
@@ -578,10 +757,41 @@ def rank_based_match(sales_df, credit_df, condition_fn, match_label: str,
     return confirmed, rem_sales, rem_credit
 
 
+# exhaustive_match(): runs rank_based_match() REPEATEDLY against the same
+# condition_fn until one of three natural stop conditions fires:
+#   1. one side (sales or credit) is completely drained, or
+#   2. a fresh pass finds zero candidates matching condition_fn at all, or
+#   3. a fresh pass finds candidates but the mutual-best-match ranking in
+#      rank_based_match() confirms zero pairs from them.
+# This repetition is the "exhaustive" part — a single rank_based_match()
+# pass only grabs each row's single best mutual match; some rows only
+# become any row's best match AFTER their original best match has been
+# claimed and removed in an earlier iteration, so this loop keeps
+# re-running the same rule against the shrinking remainder until nothing
+# more falls out. Each iteration strictly shrinks both sides (matched
+# row_ids are removed via left_anti in rank_based_match()), so the loop is
+# guaranteed to terminate — there is no iteration cap, because the 3 stop
+# conditions above already guarantee it will.
+#
+# CHECKPOINTING: every iteration writes 3 files under stage_path —
+# CKPT_{label}_meta (last_completed_iteration + running total_pairs),
+# CKPT_{label}_rem_sales/_rem_credit (the surviving sales/credit frames as
+# of that iteration). If this cell is re-run after a partial failure,
+# exhaustive_match() reads the meta file, confirms every iteration's
+# pairs_{label}_i{n}.parquet file it claims to have produced still exists
+# on disk, and if so resumes from iteration (last_completed_iteration + 1)
+# instead of re-matching from scratch. last_completed_iteration == -1 is
+# the "this match_label finished cleanly on a prior run" sentinel.
+#
+# Once the loop stops, every iteration's slim pairs table
+# (pairs_{label}_i{n}) is unioned into one SLIM_{label} frame, expanded
+# back to full original rows via resolve_to_original(), and the
+# intermediate per-iteration parquet files + checkpoint remainder files are
+# deleted (they've served their purpose — SLIM_{label} and the checkpoint
+# meta's final -1 sentinel are what matters going forward).
 def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
                      base_df, stage_path: str = None,
-                     has_year_flag: bool = False,
-                     max_iterations: int = 50):
+                     has_year_flag: bool = False):
     print(f"\n[EXHAUSTIVE MATCH] {match_label}")
     base = stage_path or output_path
 
@@ -595,6 +805,11 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
     cur_credit       = credit_df
     total_pairs      = 0
 
+    # Checkpoint resume: only trusted if every referenced per-iteration
+    # pairs file is still physically present — a stale/partial checkpoint
+    # (files cleaned up by a prior run's own cleanup step, or manually
+    # deleted) falls back to starting fresh rather than resuming onto
+    # missing data.
     if _path_exists(ckpt_meta_path):
         try:
             ckpt_row  = cp.read(ckpt_meta_path).collect()[0]
@@ -633,7 +848,12 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
     else:
         print(f"  [CKPT] No checkpoint found — starting fresh.")
 
-    for iteration in range(start_iteration, max_iterations + 1):
+    # Main loop — see function docstring above for the 3 stop conditions
+    # and why no iteration cap is needed. Per-iteration status stays on
+    # print() by design (live progress on a running loop, not a finished
+    # result).
+    iteration = start_iteration
+    while True:
 
         if cur_sales.limit(1).count() == 0 or cur_credit.limit(1).count() == 0:
             print(f"  Iter {iteration}: one side exhausted — stopping.")
@@ -677,17 +897,23 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
         )
         cp.write(ckpt_meta, ckpt_meta_path, "overwrite", register=True)
         print(f"  [CKPT] Iter {iteration} saved. Cumulative pairs: {total_pairs:,}")
+        iteration += 1
 
+    # Nothing matched at all across every iteration — nothing further to
+    # resolve; caller gets the original sides back untouched.
     if not accumulated:
-        print(f"  [{match_label}] Total pairs: 0")
+        display_metric(f"[{match_label}] Total pairs", 0)
         return None, sales_df, credit_df
 
+    # Union every iteration's slim pairs table into one frame, expand back
+    # to full rows, then clean up the now-redundant per-iteration files —
+    # SLIM_{match_label} (via resolve_to_original below) supersedes them.
     slim_df = cp.read(accumulated[0][1])
     for _, path in accumulated[1:]:
         slim_df = slim_df.unionByName(cp.read(path))
 
     slim_all = materialize_df(slim_df, f"SLIM_{match_label}", stage_path=base)
-    print(f"  [{match_label}] Total pairs: {total_pairs:,}")
+    display_metric(f"[{match_label}] Total pairs", total_pairs)
 
     for iter_lbl, path in accumulated:
         try:
@@ -707,10 +933,13 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
         f"RESOLVED_{match_label}", base, has_year_flag,
     )
 
-    print(f"  [{match_label}] Resolved rows   : {resolved.count():,}")
-    print(f"  [{match_label}] Remaining sales  : {cur_sales.count():,}")
-    print(f"  [{match_label}] Remaining credit : {cur_credit.count():,}")
+    debug_count(f"[{match_label}] Resolved rows",   resolved)
+    debug_count(f"[{match_label}] Remaining sales",  cur_sales)
+    debug_count(f"[{match_label}] Remaining credit", cur_credit)
 
+    # Write the -1 "completed cleanly" sentinel so a future re-run of this
+    # cell recognizes this match_label is done and skips straight past it
+    # instead of re-matching (see the checkpoint-read branch above).
     ckpt_done = spark.createDataFrame(
         [(match_label, -1, total_pairs)],
         schema=T.StructType([
@@ -725,31 +954,45 @@ def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
 
 
 # ── AA Comment logic ─────────────────────────────────────────────────────────
-# CHANGED:
-#   - Rule Group 1 (ONE_TO_MANY)             -> AA_ONE_TO_MANY ("One to Many")
-#   - Rule 2a (DATE_SYNC)   exact/approx     -> AA_EXACT_MATCH_SYNC / AA_APPROX_MATCH
-#   - Rule 2b (DATE_UNSYNC) exact/approx     -> AA_EXACT_MATCH_UNSYNC / AA_APPROX_MATCH
-#   - Rule 3 Priority 4 (start-of-quarter flag) REMOVED. Rows that used to
-#     hit that rule now fall through to the catch-all AA_CLIENT_CONFIRM.
-#   - Rule 3 Priorities 1/2/3/(old 5, now 4) unchanged in text.
 
+# assign_aa_comment(): the final labeling pass, run once in Cell 7 against
+# every row that survived all of Pipeline 3 still unmatched. Writes two new
+# columns — "AA Comment" (client-facing explanation, values are the
+# AA_* constants defined in Cell 1) and "AA Rule" (which specific branch
+# produced that comment — an internal audit trail, not shown to the
+# client). Both columns are filled via a chain of
+# ".withColumn(..., F.when(<col>.isNull() & <condition>, ...).otherwise(<col>))"
+# steps — "first match wins": once a row's AA Comment is set by an earlier
+# rule in the chain, every later rule's isNull() guard skips it.
+#
+# RULE PRIORITY (first match wins, top to bottom):
+#   Group 1  — match_type == ONE_TO_MANY              -> AA_ONE_TO_MANY
+#              (this row was one of several tolerance-match candidates in
+#              Pipeline 3 — ambiguous, so it's flagged rather than picked)
+#   Group 2a — match_type == ONE_TO_ONE_DATE_SYNC      -> AA_EXACT_MATCH_SYNC
+#              if the pair's net amount is exactly zero (looked up via
+#              oto_df, Pipeline 3's classified one-to-one candidates),
+#              else AA_APPROX_MATCH (within P3_TOLERANCE but not exact)
+#   Group 2b — match_type == ONE_TO_ONE_DATE_UNSYNC    -> mirrors 2a but
+#              for the case where the credit memo's date is BEFORE the
+#              sales invoice's (AA_EXACT_MATCH_UNSYNC / AA_APPROX_MATCH)
+#   Group 3  — match_type == NO_MATCH_FOUND AND cat_clean == CREDIT MEMOS
+#              (Sales Invoices that reach NO_MATCH_FOUND get no AA Comment
+#              at all — this whole group only labels unmatched credits):
+#                P1: vendor has zero Sales Invoices anywhere in raw_df
+#                    -> AA_ONLY_CREDITS (nothing this credit could ever match)
+#                P2: vendor has exactly 1 distinct (vendor, amount) credit
+#                    combination in raw_df -> AA_SINGLE_CREDIT_COMBO
+#                P3: |amount| <= small_amt_threshold -> AA_SMALL_AMOUNT
+#                P4: catch-all, everything else -> AA_CLIENT_CONFIRM
+#
+# raw_df here is the FULL raw dataset (current + carry-forward, via
+# raw_for_stats in Cell 7) — vendor-level stats (does this vendor have any
+# sales invoices at all? how many distinct credit combinations?) need to be
+# computed against everything the vendor ever did, not just the narrow
+# slice of rows that happened to reach Pipeline 3 unmatched.
 def assign_aa_comment(df, raw_df, oto_df=None,
                       small_amt_threshold: float = SMALL_AMT_MAX):
-    """
-    Final labeling step. See module header for the updated comment text.
-
-    RULE PRIORITY (first match wins):
-      Group 1  — match_type == ONE_TO_MANY               -> AA_ONE_TO_MANY
-      Group 2a — match_type == ONE_TO_ONE_DATE_SYNC       -> AA_EXACT_MATCH_SYNC or AA_APPROX_MATCH
-      Group 2b — match_type == ONE_TO_ONE_DATE_UNSYNC     -> AA_EXACT_MATCH_UNSYNC or AA_APPROX_MATCH
-      Group 3  — match_type == NO_MATCH_FOUND, CREDIT MEMOS only, sub-priority:
-                 P1: vendor has zero sales invoices anywhere        -> AA_ONLY_CREDITS
-                 P2: vendor has exactly 1 distinct credit combo     -> AA_SINGLE_CREDIT_COMBO
-                 P3: abs(amount) <= small_amt_threshold             -> AA_SMALL_AMOUNT
-                 P4: anything else (catch-all)                      -> AA_CLIENT_CONFIRM
-                 (old "start of quarter" Priority-4 rule removed)
-    """
-
     if "abs_entered_dec" not in df.columns:
         df = df.withColumn("abs_entered_dec", F.abs(to_decimal_clean("Net Entered")))
     if "eff_dt" not in df.columns:
@@ -769,6 +1012,11 @@ def assign_aa_comment(df, raw_df, oto_df=None,
 
     _no_match_cm  = no_match_expr & (F.col("cat_clean") == "CREDIT MEMOS")
 
+    # _exact_cancel: was this row part of a Pipeline-3 pair whose net
+    # amount was EXACTLY zero (not just within tolerance)? oto_df is P3's
+    # classified one-to-one candidates (both sync and unsync); this row's
+    # own amount_net is looked up by row_id regardless of which side
+    # (sales or credit) it was.
     if oto_df is not None:
         oto_lookup = (
             oto_df.select(
@@ -834,6 +1082,11 @@ def assign_aa_comment(df, raw_df, oto_df=None,
     )
 
     # ── Rule Group 3: NO_MATCH_FOUND — vendor-level stats ───────────────────
+    # vendor_stats: per-vendor counts computed against the FULL raw dataset
+    # (raw_df), not just the unmatched slice — this is deliberate, see
+    # function docstring above. Three counts: distinct Sales Invoice
+    # references, distinct Credit Memo references, and distinct
+    # (vendor, amount) credit-memo combinations.
     vendor_stats = (
         raw_df
         .withColumn("_vn_clean", F.trim(F.col("Vendor/Customer Number").cast("string")))
@@ -915,9 +1168,8 @@ def assign_aa_comment(df, raw_df, oto_df=None,
         ).otherwise(F.col("AA Rule"))
     )
 
-    # (Old Priority 4 "start of quarter" rule REMOVED per request.)
-
-    # Priority 4 (was 5) — catch-all: any remaining unmatched Credit Memo.
+    # Priority 4 — catch-all: any remaining unmatched Credit Memo that
+    # didn't hit P1/P2/P3 above. Genuinely unexplained; needs a human.
     df = df.withColumn("AA Comment",
         F.when(
             F.col("AA Comment").isNull() & _no_match_cm,
@@ -934,6 +1186,37 @@ def assign_aa_comment(df, raw_df, oto_df=None,
 
 
 # ── Match-step config ────────────────────────────────────────────────────────
+
+# MATCH_STEPS: the ordered list of rules run_match_pipeline() feeds through
+# exhaustive_match(), one at a time, each pass working on whatever the
+# PREVIOUS step's remainder is. Order matters — once a row is matched by an
+# earlier step it's gone before a later step ever sees it, so the earlier
+# steps are the more specific/preferred matches:
+#   NEXT_MONTH_EXACT  — credit memo posted exactly 1 business-month after
+#                        its sales invoice, sales date <= credit date,
+#                        amounts exactly cancel. The "normal" case: invoice
+#                        one month, credit memo issued the next.
+#   SAME_MONTH_EXACT  — same business month, sales date <= credit date,
+#                        exact cancel. Invoice and its credit memo booked
+#                        in the same period.
+#   LAG_1_2_MONTH     — up to a 2-month gap (covers NEXT_MONTH_EXACT's
+#                        1-month case plus a 2-month case), sales date <=
+#                        credit date, exact cancel. A deliberately looser
+#                        net that still requires an exact amount match —
+#                        this is what actually needs the "exhaustive"
+#                        repetition inside exhaustive_match(): a wider
+#                        month window means more sales/credit rows are
+#                        each other's candidate, so the mutual-best-match
+#                        ranking in rank_based_match() settles the
+#                        unambiguous pairs first and leaves rows that only
+#                        become unambiguous after that removal for the
+#                        next iteration.
+# (A fourth, SAME_MONTH_ITERATIVE, existed in an earlier version of this
+# list with a condition byte-for-byte identical to SAME_MONTH_EXACT above —
+# removed as a no-op: the "iterative" part of matching already happens
+# inside exhaustive_match()'s own loop, so a second step re-running the
+# identical rule against SAME_MONTH_EXACT's already-exhausted remainder
+# only ever finds zero further pairs.)
 MATCH_STEPS = [
     (
         "NEXT_MONTH_EXACT",
@@ -959,16 +1242,14 @@ MATCH_STEPS = [
             & (F.col("amount_diff") == EXACT_ZERO)
         ),
     ),
-    (
-        "SAME_MONTH_ITERATIVE",
-        lambda df: df.filter(
-            (F.col("month_lag") == 0)
-            & (F.col("s.sales_eff_dt") <= F.col("c.credit_eff_dt"))
-            & (F.col("amount_diff") == EXACT_ZERO)
-        ),
-    ),
 ]
 
+# run_match_pipeline(): drives MATCH_STEPS through exhaustive_match() in
+# order, threading each step's remaining sales/credit frames into the
+# next. Returns the list of (match_label, resolved_df) pairs (one per
+# step — some may be None if that step matched nothing) plus whatever's
+# left over after every step has run, for the caller to build an
+# "unmatched" dataset from.
 def run_match_pipeline(sales_df, credit_df, base_df,
                        steps: list, stage_path: str,
                        has_year_flag: bool = False):
@@ -984,10 +1265,6 @@ def run_match_pipeline(sales_df, credit_df, base_df,
 
     return resolved_datasets, cur_s, cur_c
 
-STAGE_PATH_P1 = f"{output_path}/_stage/p1"
-STAGE_PATH_P2 = f"{output_path}/_stage/p2"
-STAGE_PATH_P3 = f"{output_path}/_stage/p3"
-
 print("[UTIL] All utility functions loaded.")
 
 
@@ -995,13 +1272,47 @@ print("[UTIL] All utility functions loaded.")
 
 # DBTITLE 1,Pipeline 1 : Current Quarter Exact Match
 # =============================================================================
-# CELL 4 — PIPELINE 1  (unchanged from original)
+# CELL 4 — PIPELINE 1: match Sales Invoices against Credit Memos using ONLY
+# the current quarter's own data (JE_raw). No carry-forward, no tolerance —
+# strict exact-amount matching via MATCH_STEPS.
+#
+# DATA LINEAGE THROUGH THIS CELL:
+#   JE_raw
+#     -> je_tagged = base_tag(JE_raw)                             [tag]
+#     -> split on is_valid_row:
+#          P1_INVALID  (missing row_id/amount/date/primary_key)
+#          je_prep     (everything valid)
+#     -> split je_prep on blank invoice_ref_clean:
+#          P1_EXC_1    (blank invoice ref — can't be matched, exported as-is)
+#          je_working  (has an invoice ref)
+#     -> split je_working on primary_key cardinality (how many rows share
+#        the same company/vendor/|amount| combination):
+#          pk_row_count == 1  -> _unique, further split by category:
+#              P1_UNIQUE_OTHER    (not Sales/Credit — nothing to match)
+#              P1_UNIQUE_SALES    (only sales invoice at this PK — no
+#                                   candidate credit memo exists at all)
+#              P1_UNIQUE_CREDITS  (mirror of the above for credits)
+#          pk_row_count > 1   -> _dup, further split:
+#              P1_DUP_OTHER_OR_ZERO (not Sales/Credit, OR amount is exactly
+#                                     zero — a zero-dollar JE has nothing
+#                                     to net against)
+#              P1_DUP_SI_CM         (Sales/Credit rows, non-zero amount —
+#                                     THE ACTUAL MATCHING POOL)
+#     -> p1_sales / p1_credit = make_sales/make_credit(P1_DUP_SI_CM)
+#     -> run_match_pipeline() over MATCH_STEPS
+#          -> p1_resolved_list  (one resolved frame per match step)
+#          -> p1_rem_sales / p1_rem_credit (whatever never matched)
+#     -> P1_UNMATCHED = build_unmatched_rows(P1_DUP_SI_CM, rem_sales, rem_credit)
+#
+#   P1_ALL_MATCHED   = union of every resolved match-step frame
+#   P1_ALL_UNMATCHED = P1_UNIQUE_SALES + P1_UNIQUE_CREDITS + P1_UNMATCHED
+#                      (this is Pipeline 2's input — see Cell 5)
 # =============================================================================
 print("\n" + "="*70)
 print("PIPELINE 1 — CY Sales Invoice ↔ Credit Memo matching")
 print("="*70)
 
-print(f"\n[P1-S0] Raw row count = {JE_raw.count():,}")
+debug_count("P1 Raw row count", JE_raw)
 
 print("\n[P1-S1] Base prep...")
 
@@ -1024,6 +1335,8 @@ debug_group_count(je_prep, "cat_clean", "P1 JE Category distribution")
 
 print("\n[P1-S2] Splitting on blank invoice reference...")
 
+# _blank is reused as-is by Pipeline 2 (Cell 5) — same definition, same
+# meaning, no need to recompute per pipeline.
 _blank     = F.col("invoice_ref_clean").isNull() | (F.trim(F.col("invoice_ref_clean")) == "")
 
 P1_EXC_1   = materialize_df(je_prep.filter(_blank),  "P1_DATASET_EXC_1", "primary_key", stage_path=STAGE_PATH_P1)
@@ -1081,6 +1394,8 @@ debug_count("P1 credit_all", p1_credit)
 
 print("\n[P1-S5-8] Running all match steps...")
 
+# has_year_flag=False — Pipeline 1 never needs a CY/PY label since
+# everything in it is current-quarter data by construction.
 p1_resolved_list, p1_rem_sales, p1_rem_credit = run_match_pipeline(
     p1_sales, p1_credit, P1_DUP_SI_CM, MATCH_STEPS,stage_path=STAGE_PATH_P1, has_year_flag=False
 )
@@ -1105,6 +1420,8 @@ for lbl, df in p1_resolved_list:
 write_table(P1_UNMATCHED,         "P1_REMAIN_UNMATCHED",     base_path=output_path_et)
 
 print("\n[P1-S11] === PIPELINE 1 AUDIT ===")
+# Reconciliation check: every dataset produced by this cell, summed, should
+# equal je_working's row count (the input to the PK-cardinality split).
 audit_summary({
     "P1_INVALID":           P1_INVALID,
     "P1_EXC_1":             P1_EXC_1,
@@ -1125,15 +1442,42 @@ print("\n[P1] Done.")
 
 # DBTITLE 1,Pipeline 2 : Exact match Using PY quarter
 # =============================================================================
-# CELL 5 — PIPELINE 2  (Year Flag / Source Quarter are derived PER ROW from
-# Default Effective Date inside base_tag() below — nothing stamped here.
-# Carry-forward is ALWAYS unioned in — no flag/branch needed anymore
-# anymore, but the guard is kept in case JE_raw_2_aligned is ever empty/absent.)
+# CELL 5 — PIPELINE 2: take everything Pipeline 1 couldn't match
+# (P1_ALL_UNMATCHED), add in the prior-year carry-forward data
+# (JE_raw_2_aligned, if HAS_CF), and run the SAME MATCH_STEPS again — this
+# time a sales invoice from the current quarter can match a credit memo
+# from any prior period the carry-forward data covers, or vice versa. This
+# is the only pipeline where has_year_flag=True, since it's the only one
+# where a pair can legitimately span two different fiscal years.
+#
+# DATA LINEAGE THROUGH THIS CELL:
+#   P1_ALL_UNMATCHED
+#     -> align_to_raw(): drop every column base_tag() added (row_id,
+#        *_clean helpers, primary_key, pk_row_count, ...) and rename back
+#        to raw column names, so this frame is shaped exactly like a fresh
+#        raw extract again -> cy_unmatched
+#   cy_unmatched (+ JE_raw_2_aligned, if HAS_CF) -> JE_raw_pipe2
+#     -> je_tagged_p2 = base_tag(JE_raw_pipe2, PIPE2_RAW_COLUMNS)  [re-tag —
+#        Source Quarter/Year Flag recomputed fresh per row here, same as
+#        Pipeline 1, so carry-forward rows self-tag as whatever prior
+#        FY/quarter they actually belong to]
+#     -> same INVALID / EXC_1 / UNIQUE_* / DUP_* split as Pipeline 1
+#     -> P2_DUP_SI_CM is the matching pool
+#     -> p2_sales / p2_credit -> run_match_pipeline(..., has_year_flag=True)
+#     -> P2_UNMATCHED = build_unmatched_rows(...)
+#
+#   P2_ALL_MATCHED   = union of every resolved match-step frame (each row
+#                      carries "Year Pair Flag" — see resolve_to_original())
+#   P2_ALL_UNMATCHED = P2_UNIQUE_SALES + P2_UNIQUE_CREDITS + P2_UNMATCHED
+#                      (this is Pipeline 3's input — see Cell 6)
 # =============================================================================
 print("\n" + "="*70)
 print("PIPELINE 2 — Cross-year matching (CY unmatched + PY carry-forward)")
 print("="*70)
 
+# _P1_DROP: every base_tag()-derived column to strip back off before
+# re-tagging, so align_to_raw() hands base_tag() a genuinely raw-shaped
+# frame rather than one still carrying stale P1-derived values.
 _P1_DROP = [
     "row_id", "invoice_ref_clean", "cat_clean", "company_desc_clean",
     "vendor_num_clean", "eff_dt", "month_dt", "entered_net_dec",
@@ -1150,21 +1494,18 @@ def align_to_raw(df, drop_cols, rename_map, target_cols):
     return df.select(*[c for c in target_cols if c in df.columns])
 
 
-# cy_unmatched: Pipeline-1 leftovers, reshaped back to raw schema. No
-# Source Quarter / Year Flag stamping happens here anymore — base_tag()
-# (called just below) now derives both columns directly, per row, from
-# each row's own "Default Effective Date". Nothing hardcoded here.
 cy_unmatched = align_to_raw(P1_ALL_UNMATCHED, _P1_DROP, _RENAME, BASE_RAW_COLUMNS)
 
-# Carry-forward data — always unioned in now (assumed present by design; guard kept defensively in case the frame is missing/empty). Its
-# Source Quarter / Year Flag will also be derived from its own Default
-# Effective Date inside base_tag() below — not tagged here.
-if 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None:
+# HAS_CF (set once in Cell 1) gates whether carry-forward is actually
+# unioned in — defensive fallback for the case where JE_raw_2_aligned is
+# ever missing/empty, even though carry-forward is assumed present by
+# design.
+if HAS_CF:
     JE_raw_pipe2 = cy_unmatched.unionByName(JE_raw_2_aligned, allowMissingColumns=True)
-    print(f"[P2-S0] Combined input count = {JE_raw_pipe2.count():,} (current + carry-forward)")
+    debug_count("P2-S0 Combined input (current + carry-forward)", JE_raw_pipe2)
 else:
     JE_raw_pipe2 = cy_unmatched
-    print(f"[P2-S0] Only current unmatched data count = {JE_raw_pipe2.count():,}")
+    debug_count("P2-S0 Current unmatched only (no carry-forward)", JE_raw_pipe2)
 
 print("\n[P2-S1] Base prep...")
 
@@ -1186,6 +1527,7 @@ debug_count("P2 Valid prep", je_prep_p2)
 
 print("\n[P2-S2] Blank invoice reference split...")
 
+# Reuses _blank from Cell 4 — same predicate, same meaning.
 P2_EXC_1   = materialize_df(je_prep_p2.filter(_blank),   "P2_EXC_1",      "primary_key", stage_path=STAGE_PATH_P2)
 je_work_p2 = materialize_df(je_prep_p2.filter(~_blank),  "P2_je_working", "primary_key", stage_path=STAGE_PATH_P2)
 
@@ -1241,6 +1583,9 @@ debug_count("P2 credit_all", p2_credit)
 
 print("\n[P2-S5-8] Running all match steps (with Year Pair Flag)...")
 
+# has_year_flag=True — the one place Year Pair Flag (CY/PY label) gets
+# computed, since this is the only pipeline where a confirmed pair can
+# legitimately span two different fiscal years.
 p2_resolved_list, p2_rem_sales, p2_rem_credit = run_match_pipeline(
     p2_sales, p2_credit, P2_DUP_SI_CM, MATCH_STEPS, stage_path=STAGE_PATH_P2, has_year_flag=True
 )
@@ -1284,7 +1629,50 @@ print("\n[P2] Done.")
 
 # DBTITLE 1,Pipeline 3 : Approx match using PQ and CQ Data
 # =============================================================================
-# CELL 6 — PIPELINE 3  (unchanged from original — tolerance matching)
+# CELL 6 — PIPELINE 3: everything Pipeline 2 couldn't match
+# (P2_ALL_UNMATCHED) gets one more pass with two rules loosened:
+#   1. The join key drops amount from primary_key entirely — p3_primary_key
+#      is just "{company}_{vendor}", so a sales invoice and a credit memo
+#      no longer need the SAME |amount| to even be considered candidates.
+#   2. Instead of requiring an exact cancel, candidates are accepted if
+#      their combined net is within P3_TOLERANCE ($100).
+# Because the join key is now looser, the "one sales row can only match one
+# credit row" assumption from Pipeline 1/2 no longer safely holds — a
+# single sales invoice might have several within-tolerance credit-memo
+# candidates (or vice versa). This cell explicitly detects and separates
+# that ambiguity (ONE_TO_MANY) rather than silently picking one.
+#
+# DATA LINEAGE THROUGH THIS CELL:
+#   P2_ALL_UNMATCHED
+#     -> p3_input = base_tag(P2_ALL_UNMATCHED, PIPE2_RAW_COLUMNS)   [re-tag]
+#     -> p3_primary_key computed (company+vendor only, no amount)
+#     -> split on p3_primary_key nullness:
+#          p3_invalid_pk  (missing company or vendor — can't even attempt
+#                          a looser match; folds into NO_MATCH_FOUND later)
+#          p3_base        (valid PK — the tolerance-match pool)
+#     -> p3_sales / p3_credit = make_sales/make_credit(p3_base, "p3_primary_key")
+#     -> p3_candidates = cross-join within p3_primary_key, keep pairs where
+#                        |sales_amt + credit_amt| <= P3_TOLERANCE
+#     -> p3_classified = candidates + counts of how many credit rows each
+#                        sales row matched (and vice versa) -> is_one_to_many
+#     -> split by is_one_to_many:
+#          P3_ONE_TO_MANY   (either side had >1 candidate — ambiguous)
+#          oto              (the unambiguous one-to-one candidates)
+#            -> split oto by date_sync (does sales_eff_dt < credit_eff_dt?):
+#                 P3_DATE_SYNC    (normal order: sales before credit)
+#                 P3_DATE_UNSYNC  (credit memo dated BEFORE its sales inv.)
+#     -> P3_NO_MATCH_FOUND = p3_base rows touched by none of the above,
+#                            UNION p3_invalid_pk (both get match_type =
+#                            NO_MATCH_FOUND)
+#
+#   Row-count invariant asserted explicitly at the end of this cell:
+#     count(p3_input) == count(ONE_TO_MANY)+count(DATE_SYNC)
+#                        +count(DATE_UNSYNC)+count(NO_MATCH_FOUND)
+#   i.e. every row that went in comes back out in exactly one bucket.
+#
+#   `oto` (defined mid-cell) is NOT just an intermediate — Cell 7 reuses it
+#   directly to look up each pair's exact net amount for the AA Comment
+#   exact-vs-approx distinction (AA_EXACT_MATCH_* vs AA_APPROX_MATCH).
 # =============================================================================
 print("\n" + "="*70)
 print("PIPELINE 3 — Tolerance matching on looser PK (no amount in key)")
@@ -1320,7 +1708,7 @@ debug_count("P3 valid PK",   p3_base)
 debug_count("P3 invalid PK", p3_invalid_pk)
 
 print("\n  [PROFILE] PK failure breakdown")
-p3_invalid_pk.select(
+display(p3_invalid_pk.select(
     F.sum(
         F.when(F.col("company_desc_clean").isNull() | (F.col("company_desc_clean") == ""), 1)
          .otherwise(0)
@@ -1336,7 +1724,7 @@ p3_invalid_pk.select(
             1
         ).otherwise(0)
     ).alias("missing_both"),
-).show(truncate=False)
+))
 
 print("\n[P3-S2] Building sales / credit side tables...")
 
@@ -1350,6 +1738,9 @@ print(f"\n[P3-S3] Cross-joining within PK; tolerance = {P3_TOLERANCE}...")
 
 _tol = F.lit(P3_TOLERANCE).cast(DECIMAL_TYPE)
 
+# amount_net here (not amount_diff — a different name than the P1/P2
+# match helpers use) is what Cell 7's _exact_cancel check reads off `oto`
+# by row_id to decide AA_EXACT_MATCH_* vs AA_APPROX_MATCH.
 p3_candidates = (
     p3_sales.alias("s")
     .join(p3_credit.alias("c"), on="primary_key", how="inner")
@@ -1369,6 +1760,10 @@ debug_count("P3 candidates (within tolerance)", p3_candidates)
 
 print("\n[P3-S4] Classifying one-to-many vs one-to-one...")
 
+# credit_count_per_sale / sales_count_per_credit: how many candidates each
+# side has. is_one_to_many is true if EITHER side has more than one
+# candidate — a many-to-one is still ambiguous from the "one" side's
+# perspective, so it's treated the same as a genuine many-to-many.
 sales_match_cts = (
     p3_candidates
     .groupBy("sales_row_id")
@@ -1410,6 +1805,15 @@ debug_count("P3_ONE_TO_MANY", P3_ONE_TO_MANY)
 
 print("\n[P3-S6] Building DATE_SYNC / DATE_UNSYNC datasets...")
 
+# oto = "one-to-one" — the unambiguous leftover after ONE_TO_MANY rows are
+# pulled out. date_sync = True means the normal chronological order (sales
+# invoice dated before its credit memo); False means the credit memo's
+# effective date is actually earlier than the sales invoice it's paired
+# with (DATE_UNSYNC) — still within tolerance, just an unusual date order
+# worth calling out separately in the AA Comment.
+# NOTE: `oto` is reused directly by Cell 7 (assign_aa_comment's oto_df
+# argument) to look up each pair's exact amount_net — not just a
+# throwaway intermediate for this cell.
 oto = (
     p3_classified.filter(~F.col("is_one_to_many"))
     .withColumn("date_sync", F.col("sales_eff_dt") < F.col("credit_eff_dt"))
@@ -1452,12 +1856,19 @@ matched_ids_all = (
     .distinct()
 )
 
+# p3_no_match: p3_base rows that appeared in NONE of the three matched
+# buckets above (e.g. a row with a valid p3_primary_key but zero
+# within-tolerance candidates on the other side at all).
 p3_no_match = materialize_df(
     p3_base.join(matched_ids_all, on="row_id", how="left_anti")
            .withColumn("match_type", F.lit("NO_MATCH_FOUND")),
     "P3_no_match", stage_path=STAGE_PATH_P3,
 )
 
+# P3_NO_MATCH_FOUND = p3_no_match UNION p3_invalid_pk (rows that couldn't
+# even form a p3_primary_key) — both are "this row has no match", just for
+# different reasons, and both feed Cell 7's assign_aa_comment() the same
+# way as NO_MATCH_FOUND rows.
 P3_NO_MATCH_FOUND = materialize_df(
     union_non_null(
         p3_no_match,
@@ -1469,6 +1880,11 @@ debug_count("P3_NO_MATCH_FOUND", P3_NO_MATCH_FOUND)
 
 print("\n[P3-S8] === PIPELINE 3 AUDIT ===")
 
+# Explicit row-conservation assertion — every p3_input row must land in
+# exactly one of the four output buckets. This is a hard assert (not just
+# a printed warning) because Pipeline 3 is the last matching pass before
+# AA Comment assignment; a silent row loss here would silently vanish from
+# the final client-facing workbook.
 cnt_in       = p3_input.count()
 cnt_otm      = P3_ONE_TO_MANY.count()
 cnt_sync     = P3_DATE_SYNC.count()
@@ -1508,8 +1924,24 @@ print("\n[P3] Done.")
 # COMMAND ----------
 
 # =============================================================================
-# CELL 7 — AA COMMENT ASSIGNMENT  (unchanged mechanics, new comment text
-# comes from the updated assign_aa_comment() in Cell 3)
+# CELL 7 — AA COMMENT ASSIGNMENT: label every Pipeline-3 unmatched row with
+# WHY it's unmatched, using assign_aa_comment() (Cell 3). See that
+# function's docstring for the full rule-priority breakdown.
+#
+# DATA LINEAGE THROUGH THIS CELL:
+#   P3_ONE_TO_MANY + P3_DATE_SYNC + P3_DATE_UNSYNC + P3_NO_MATCH_FOUND
+#     -> P3_ALL_UNMATCHED (union of all four Pipeline-3 output buckets —
+#        every row Pipeline 3 didn't confirm as a clean pair)
+#   raw_for_stats = JE_raw (+ JE_raw_2_aligned if HAS_CF) — the FULL raw
+#     dataset, used only for the vendor-level stats inside
+#     assign_aa_comment()'s Rule Group 3 (does this vendor have any sales
+#     invoices at all, anywhere? how many distinct credit combinations?)
+#   oto (from Cell 6) — reused here as assign_aa_comment()'s oto_df, so the
+#     exact-vs-approx distinction (AA_EXACT_MATCH_* vs AA_APPROX_MATCH) can
+#     be computed from each row's real pair amount.
+#   -> P3_ALL_UNMATCHED_COMMENTED — same rows as P3_ALL_UNMATCHED, plus
+#      "AA Comment" and "AA Rule" columns. This is what feeds the
+#      "Unmatched_Items" sheet in the final Excel export (Cell 8).
 # =============================================================================
 print("\n" + "="*70)
 print("AA COMMENT ASSIGNMENT")
@@ -1522,6 +1954,9 @@ P3_ALL_UNMATCHED = union_non_null(
     P3_NO_MATCH_FOUND,
 )
 
+# Defensive re-derivation in case any of the four unioned frames dropped a
+# helper column somewhere upstream — assign_aa_comment() needs all of
+# these present.
 if "abs_entered_dec" not in P3_ALL_UNMATCHED.columns:
     P3_ALL_UNMATCHED = P3_ALL_UNMATCHED.withColumn(
         "abs_entered_dec", F.abs(to_decimal_clean("Net Entered"))
@@ -1536,8 +1971,11 @@ if "vendor_num_clean" not in P3_ALL_UNMATCHED.columns:
         F.trim(F.col("Vendor/Customer Number").cast("string"))
     )
 
-# raw_for_stats: full raw data (current + carry-forward, always both now).
-if 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None:
+# raw_for_stats: full raw data (current + carry-forward, via the same
+# HAS_CF flag set once in Cell 1) — see function docstring on
+# assign_aa_comment() for why vendor stats need the FULL dataset, not just
+# the unmatched slice.
+if HAS_CF:
     raw_for_stats = JE_raw.unionByName(JE_raw_2_aligned, allowMissingColumns=True)
 else:
     raw_for_stats = JE_raw
@@ -1566,8 +2004,34 @@ print("\n[AA] Done.")
 # COMMAND ----------
 
 # =============================================================================
-# CELL 8 — FINAL EXCEL EXPORT  (unchanged mechanics; CURRENT_QUARTER label
-# in the filename is now the derived label from Cell 2, not a widget value)
+# CELL 8 — FINAL EXCEL EXPORT: assembles every pipeline's output into one
+# multi-sheet workbook, then runs the top-level row-conservation check
+# across the ENTIRE notebook (every row that entered via JE_raw must be
+# accounted for somewhere in the final export).
+#
+# SHEET LINEAGE:
+#   INVALID_PREP_ROWS   = P1_INVALID + P2_INVALID
+#                          (rows that never had a valid row_id/amount/date/
+#                          primary_key, from either pipeline's prep step)
+#   BLANK_INVOICE_REF   = P1_EXC_1 + P2_EXC_1
+#                          (rows with no invoice reference to match on)
+#   OTHER_Duplicate_PKs = P1_DUP_OTHER_OR_ZERO + P2_DUP_OTHER_OR_ZERO
+#                          (duplicate-PK rows that were zero-amount, or not
+#                          Sales/Credit category, so never entered matching)
+#   Other_Unique_PKs    = P1_UNIQUE_OTHER + P2_UNIQUE_OTHER
+#                          (unique-PK rows that weren't Sales/Credit at all)
+#   P1_MATCHED_PAIRS    = P1_ALL_MATCHED  (Pipeline 1's confirmed pairs)
+#   P2_MATCHED_PAIRS    = P2_ALL_MATCHED  (Pipeline 2's confirmed pairs,
+#                          each carrying its Year Pair Flag)
+#   Unmatched_Items     = P3_ALL_UNMATCHED_COMMENTED (every row that
+#                          survived all 3 pipelines unmatched, each with
+#                          its AA Comment explaining why)
+#
+# Note P1_UNIQUE_SALES/P1_UNIQUE_CREDITS/P2_UNIQUE_SALES/P2_UNIQUE_CREDITS
+# are NOT their own sheet — they flow forward as unmatched input into the
+# next pipeline (P1's -> P2's input, P2's -> P3's input) and ultimately
+# surface inside Unmatched_Items via P3_ALL_UNMATCHED_COMMENTED once
+# Pipeline 3 has had a chance at them too.
 # =============================================================================
 print("\n" + "="*70)
 print("FINAL EXCEL EXPORT")
@@ -1593,6 +2057,13 @@ export_to_excel(
 
 print("\n[FINAL] === END-TO-END ROW CONSERVATION CHECK ===")
 
+# This is the top-level invariant the whole notebook is built around: every
+# row in JE_raw must show up in exactly one of the 7 buckets below. Unlike
+# Pipeline 3's internal check (Cell 6, a hard assert), this one is
+# informational only — it deliberately doesn't assert, since
+# JE_raw_2_aligned rows are legitimately included in some of these totals
+# (via Pipeline 2) but total_raw only counts JE_raw, so some intentional
+# "surplus" from carry-forward rows is expected and not a bug.
 total_raw = JE_raw.count()
 
 dfs = {
