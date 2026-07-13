@@ -53,10 +53,13 @@ def _agg_block(df):
 
 
 def build_company_summary(company_desc: str):
-    """Returns a pandas DataFrame for one company: stacked blocks of
+    """Returns a SPARK DataFrame for one company:
     [Account Description, Dataset, Count, Entered Dr, Entered CR, Net Entered],
-    "Total" block first, then one block per Account Description present for
-    this company across any of the 4 datasets."""
+    one row per (Account Description, Dataset) pair, "Total" first, then one
+    row-group per Account Description present for this company across any
+    of the 4 datasets. Kept as a Spark DataFrame (not .toPandas()'d) so it
+    can go straight into export_to_excel() the same way every other sheet
+    in this notebook does."""
     per_company = {
         name: df.filter(F.trim(F.upper(F.col("Company Description"))) == company_desc.strip().upper())
         for name, df in SUMMARY_DATASETS.items()
@@ -83,32 +86,23 @@ def build_company_summary(company_desc: str):
 
     return spark.createDataFrame(
         rows, ["Account Description", "Dataset", "Count", "Entered Dr", "Entered CR", "Net Entered"]
-    ).toPandas()
+    )
 
 
+# write_summary_workbook: same multi-sheet write mechanism Cell 8 already
+# uses for the main pipeline export — {tab_name: spark_df} straight into
+# export_to_excel(sheets, path), no second Excel-writing code path.
+# export_to_excel's own _front/_drop logic is a no-op here (none of those
+# column names exist on this summary shape), which is fine — it only acts
+# on columns that are actually present.
 def write_summary_workbook(path: str):
-    """One sheet per company, each sheet's rows stacked block-by-block in
-    the order Total, then each Account Description — matches the layout of
-    the reference workbook (image), just generalized to every Account
-    Description instead of two hardcoded fee types."""
     sheets = {}
     for company in COMPANIES:
-        pdf = build_company_summary(company)
-        # short, sheet-name-safe tab label
+        # short, sheet-name-safe tab label (Excel's 31-char sheet name limit)
         tab = company.replace("Tradeweb ", "TW ").replace(" ", "")[:31]
-        sheets[tab] = pdf
+        sheets[tab] = build_company_summary(company)
 
-    with __import__("pandas").ExcelWriter(path, engine="openpyxl") as writer:
-        for tab, pdf in sheets.items():
-            start_row = 0
-            for acct, block in pdf.groupby("Account Description", sort=False):
-                block = block.drop(columns=["Account Description"])
-                header_df = __import__("pandas").DataFrame({tab: [acct]})
-                header_df.to_excel(writer, sheet_name=tab, startrow=start_row, index=False, header=False)
-                block.to_excel(writer, sheet_name=tab, startrow=start_row + 1, index=False)
-                start_row += len(block) + 3  # +1 header row, +1 title row, +1 blank spacer
-
-    print(f"  [EXCEL] Written -> {path}")
+    export_to_excel(sheets=sheets, path=path)
 
 
 write_summary_workbook(f"{output_path_et}/Account_Description_Summary - {CURRENT_FY} {CURRENT_QUARTER}.xlsx")
