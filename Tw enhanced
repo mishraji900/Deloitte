@@ -1,233 +1,114 @@
-def rank_based_match(sales_df, credit_df, condition_fn, match_label: str,
-                     stage_path: str = None):
-    candidates = (
-        sales_df.alias("s")
-        .join(credit_df.alias("c"), on="primary_key", how="inner")
-        .withColumn("amount_diff",
-            F.abs(F.col("s.sales_amt") + F.col("c.credit_amt")))
-        .withColumn("month_lag",
-            F.months_between(
-                F.col("c.credit_month").cast("date"),
-                F.col("s.sales_month").cast("date"),
-            ).cast("int"))
+# =============================================================================
+# CELL — ACCOUNT DESCRIPTION SUMMARY, 4 DATASETS x ALL ACCOUNTS x 4 COMPANIES
+# =============================================================================
+# 4 input datasets, kept separate (not unioned):
+#   P1_ALL_MATCHED
+#   P2_ALL_MATCHED
+#   P3_ALL_MATCHED_Lag_Greater_than_2
+#   P3_ALL_UNMATCHED_COMMENTED  -> filtered to CURRENT_QUARTER/CURRENT_FY only
+#                                  (reuses is_current_period from Cell 8)
+#
+# Per Company Description (Tradeweb Europe Limited, TW SEF, Tradeweb LLC,
+# Tradeweb Direct LLC) -> one Excel sheet. Within each sheet:
+#   "Total" block (all Account Descriptions combined) first, then one block
+#   per distinct Account Description actually present for that company.
+# Each block = 4 rows (one per dataset above) x
+#   [Count(primary_key), Sum(Entered Dr), Sum(Entered CR), Sum(Net Entered)]
+# =============================================================================
+
+COMPANIES = ["Tradeweb Europe Limited", "TW SEF", "Tradeweb LLC", "Tradeweb Direct LLC"]
+
+# is_current_period: same definition already used in Cell 8's row filter —
+# reused here rather than redefined, so "current period" means one thing
+# everywhere in the notebook.
+is_current_period = (
+    (F.upper(F.trim(F.col("Source Quarter"))) == F.lit(CURRENT_QUARTER))
+    & (F.upper(F.trim(F.col("Year Flag"))) == F.lit(CURRENT_FY))
+)
+
+SUMMARY_DATASETS = {
+    "P1_ALL_MATCHED":                     P1_ALL_MATCHED,
+    "P2_ALL_MATCHED":                     P2_ALL_MATCHED,
+    "P3_ALL_MATCHED_Lag_Greater_than_2":  P3_ALL_MATCHED_Lag_Greater_than_2,
+    "P3_ALL_UNMATCHED_COMMENTED":         P3_ALL_UNMATCHED_COMMENTED.filter(is_current_period),
+}
+
+
+def _agg_block(df):
+    """One row's worth of numbers for a (dataset, account, company) slice."""
+    if df is None:
+        return (0, 0.0, 0.0, 0.0)
+    row = df.agg(
+        F.count("primary_key").alias("cnt"),
+        F.sum("Entered Dr").alias("dr"),
+        F.sum("Entered CR").alias("cr"),
+        F.sum("Net Entered").alias("net"),
+    ).collect()[0]
+    return (
+        row["cnt"] or 0,
+        float(row["dr"]) if row["dr"] is not None else 0.0,
+        float(row["cr"]) if row["cr"] is not None else 0.0,
+        float(row["net"]) if row["net"] is not None else 0.0,
     )
-    candidates = condition_fn(candidates)
- 
-    if candidates.limit(1).count() == 0:
-        return None, sales_df, credit_df
- 
-    w_sales = Window.partitionBy("primary_key", "s.sales_row_id").orderBy(
-        F.col("amount_diff").asc(), F.col("month_lag").asc(),
-        F.col("c.credit_eff_dt").asc(), F.col("c.credit_row_id").asc(),
+
+
+def build_company_summary(company_desc: str):
+    """Returns a pandas DataFrame for one company: stacked blocks of
+    [Account Description, Dataset, Count, Entered Dr, Entered CR, Net Entered],
+    "Total" block first, then one block per Account Description present for
+    this company across any of the 4 datasets."""
+    per_company = {
+        name: df.filter(F.trim(F.upper(F.col("Company Description"))) == company_desc.strip().upper())
+        for name, df in SUMMARY_DATASETS.items()
+    }
+
+    # Account Descriptions actually present for this company, across all 4
+    # datasets combined — not a fixed list, so any new account shows up
+    # automatically instead of needing to be hardcoded.
+    acct_values = (
+        union_non_null(*[df.select("Account Description") for df in per_company.values()])
+        .filter(F.col("Account Description").isNotNull())
+        .distinct()
+        .orderBy("Account Description")
+        .collect()
     )
-    w_credit = Window.partitionBy("primary_key", "c.credit_row_id").orderBy(
-        F.col("amount_diff").asc(), F.col("month_lag").asc(),
-        F.col("s.sales_eff_dt").asc(), F.col("s.sales_row_id").asc(),
-    )
- 
-    confirmed = (
-        candidates
-        .withColumn("rn_sales",  F.row_number().over(w_sales))
-        .filter(F.col("rn_sales") == 1)
-        .withColumn("rn_credit", F.row_number().over(w_credit))
-        .filter(F.col("rn_credit") == 1)
-        .select(
-            F.col("primary_key"),
-            F.col("s.sales_row_id").alias("sales_row_id"),
-            F.col("c.credit_row_id").alias("credit_row_id"),
-            F.col("s.sales_amt").alias("sales_amt"),
-            F.col("c.credit_amt").alias("credit_amt"),
-            F.col("amount_diff"),
-            F.col("s.sales_eff_dt").alias("sales_eff_dt"),
-            F.col("c.credit_eff_dt").alias("credit_eff_dt"),
-            F.col("s.sales_month").alias("sales_month"),
-            F.col("c.credit_month").alias("credit_month"),
-            F.col("s.sales_ref").alias("sales_ref"),
-            F.col("c.credit_ref").alias("credit_ref"),
-            F.col("month_lag"),
-            F.lit(match_label).alias("match_type"),
-        )
-    )
- 
-    if confirmed.limit(1).count() == 0:
-        return None, sales_df, credit_df
- 
-    # This is the ONLY write of "pairs_{match_label}" — match_type is
-    # already stamped in the select() above. Do NOT re-materialize this
-    # same output again under the same path in the caller (exhaustive_match);
-    # writing "overwrite" to a path a lazy DF handle already points to,
-    # then later re-reading via that stale handle/lineage, is what produced
-    # the FILE_NOT_EXIST error on old tid-stamped part files.
-    confirmed = materialize_df(confirmed, f"pairs_{match_label}", stage_path=stage_path)
- 
-    matched_s_ids = confirmed.select("sales_row_id").distinct()
-    matched_c_ids = confirmed.select("credit_row_id").distinct()
- 
-    rem_sales  = sales_df.join(matched_s_ids,  on="sales_row_id",  how="left_anti")
-    rem_credit = credit_df.join(matched_c_ids, on="credit_row_id", how="left_anti")
- 
-    return confirmed, rem_sales, rem_credit
- 
- 
-def exhaustive_match(sales_df, credit_df, condition_fn, match_label: str,
-                     base_df, stage_path: str = None,
-                     has_year_flag: bool = False):
-    """
-    RECTIFIED: previously this function re-materialized `pairs` to the
-    exact same path (f"pairs_{iter_lbl}.parquet") that rank_based_match()
-    had just written and read back from. That second overwrite of a path
-    whose old file handle/lineage was still referenced elsewhere (directly
-    by `pairs`, and indirectly by anything resuming off the checkpoint)
-    caused Spark Connect to later look for a part file under a tid that no
-    longer existed on disk -> FILE_NOT_EXIST / KD001.
- 
-    Fix: rank_based_match() already materializes + writes
-    "pairs_{match_label}" (== "pairs_{iter_lbl}" here) with match_type
-    already set. The redundant second materialize_df() call on the same
-    path has been removed — `pairs` returned from rank_based_match() is
-    used as-is.
-    """
-    print(f"\n[EXHAUSTIVE MATCH] {match_label}")
-    base = stage_path or output_path
- 
-    ckpt_meta_path   = f"{base}/CKPT_{match_label}_meta.parquet"
-    ckpt_sales_path  = f"{base}/CKPT_{match_label}_rem_sales.parquet"
-    ckpt_credit_path = f"{base}/CKPT_{match_label}_rem_credit.parquet"
- 
-    start_iteration  = 1
-    accumulated      = []
-    cur_sales        = sales_df
-    cur_credit       = credit_df
-    total_pairs      = 0
- 
-    if _path_exists(ckpt_meta_path):
-        try:
-            ckpt_row  = cp.read(ckpt_meta_path).collect()[0]
-            last_iter = ckpt_row["last_completed_iteration"]
- 
-            if last_iter == -1:
-                print(f"  [CKPT] Prior run completed cleanly — starting fresh.")
- 
-            elif last_iter > 0:
-                _candidate_paths = [
-                    (f"{match_label}_i{i}", f"{base}/pairs_{match_label}_i{i}.parquet")
-                    for i in range(1, last_iter + 1)
-                ]
-                try:
-                    _all_exist = all(
-                        _path_exists(p) for _, p in _candidate_paths
-                    )
-                except Exception:
-                    _all_exist = False
- 
-                if _all_exist:
-                    total_pairs     = ckpt_row["total_pairs"]
-                    cur_sales       = cp.read(ckpt_sales_path)
-                    cur_credit      = cp.read(ckpt_credit_path)
-                    accumulated     = list(_candidate_paths)
-                    start_iteration = last_iter + 1
-                    print(f"  [CKPT] Resuming from iteration {start_iteration} "
-                          f"(pairs so far: {total_pairs:,})")
-                else:
-                    print(f"  [CKPT] Stale checkpoint (pair files missing) — starting fresh.")
-            else:
-                print(f"  [CKPT] Checkpoint unreadable (last_iter={last_iter}) — starting fresh.")
- 
-        except Exception:
-            print(f"  [CKPT] Checkpoint unreadable — starting fresh.")
-    else:
-        print(f"  [CKPT] No checkpoint found — starting fresh.")
- 
-    iteration = start_iteration
-    while True:
- 
-        if cur_sales.limit(1).count() == 0 or cur_credit.limit(1).count() == 0:
-            print(f"  Iter {iteration}: one side exhausted — stopping.")
-            break
- 
-        iter_lbl = f"{match_label}_i{iteration}"
-        print(f"  Iter {iteration} — matching...")
- 
-        pairs, rem_s, rem_c = rank_based_match(
-            cur_sales, cur_credit, condition_fn, iter_lbl, stage_path=base
-        )
- 
-        if pairs is None:
-            print(f"  Iter {iteration}: no candidates — stopping.")
-            break
- 
-        n = pairs.count()
-        print(f"  Iter {iteration}: {n:,} pairs.")
-        if n == 0:
-            break
- 
-        total_pairs += n
- 
-        # --- FIX: removed the duplicate materialize_df(pairs, f"pairs_{iter_lbl}", ...)
-        # call that used to sit here. `pairs` is already the materialized,
-        # match_type-stamped output of rank_based_match() at path
-        # f"{base}/pairs_{iter_lbl}.parquet" — reuse it directly instead of
-        # overwriting the same path a second time.
-        accumulated.append((iter_lbl, f"{base}/pairs_{iter_lbl}.parquet"))
- 
-        cur_sales  = materialize_df(rem_s, f"rem_s_{match_label}_cur", stage_path=base)
-        cur_credit = materialize_df(rem_c, f"rem_c_{match_label}_cur", stage_path=base)
- 
-        cp.write(cur_sales,  ckpt_sales_path,  "overwrite", register=True)
-        cp.write(cur_credit, ckpt_credit_path, "overwrite", register=True)
-        ckpt_meta = spark.createDataFrame(
-            [(match_label, iteration, total_pairs)],
-            schema=T.StructType([
-                T.StructField("match_label",              T.StringType()),
-                T.StructField("last_completed_iteration", T.IntegerType()),
-                T.StructField("total_pairs",              T.LongType()),
-            ])
-        )
-        cp.write(ckpt_meta, ckpt_meta_path, "overwrite", register=True)
-        print(f"  [CKPT] Iter {iteration} saved. Cumulative pairs: {total_pairs:,}")
-        iteration += 1
- 
-    if not accumulated:
-        display_metric(f"[{match_label}] Total pairs", 0)
-        return None, sales_df, credit_df
- 
-    slim_df = cp.read(accumulated[0][1])
-    for _, path in accumulated[1:]:
-        slim_df = slim_df.unionByName(cp.read(path))
- 
-    slim_all = materialize_df(slim_df, f"SLIM_{match_label}", stage_path=base)
-    display_metric(f"[{match_label}] Total pairs", total_pairs)
- 
-    for iter_lbl, path in accumulated:
-        try:
-            dbutils.fs.rm(path, recurse=True)
-            print(f"  [CLEANUP] Removed {path}")
-        except Exception:
-            pass
- 
-    for suffix in [f"rem_s_{match_label}_cur", f"rem_c_{match_label}_cur"]:
-        try:
-            dbutils.fs.rm(f"{base}/{suffix}.parquet", recurse=True)
-        except Exception:
-            pass
- 
-    resolved = resolve_to_original(
-        slim_all, base_df, match_label,
-        f"RESOLVED_{match_label}", base, has_year_flag,
-    )
- 
-    debug_count(f"[{match_label}] Resolved rows",   resolved)
-    debug_count(f"[{match_label}] Remaining sales",  cur_sales)
-    debug_count(f"[{match_label}] Remaining credit", cur_credit)
- 
-    ckpt_done = spark.createDataFrame(
-        [(match_label, -1, total_pairs)],
-        schema=T.StructType([
-            T.StructField("match_label",              T.StringType()),
-            T.StructField("last_completed_iteration", T.IntegerType()),
-            T.StructField("total_pairs",              T.LongType()),
-        ])
-    )
-    cp.write(ckpt_done, ckpt_meta_path, "overwrite", register=True)
- 
-    return resolved, cur_sales, cur_credit
+    acct_list = ["Total"] + [r["Account Description"] for r in acct_values]
+
+    rows = []
+    for acct in acct_list:
+        for ds_name, df in per_company.items():
+            sub = df if acct == "Total" else df.filter(F.col("Account Description") == acct)
+            cnt, dr, cr, net = _agg_block(sub)
+            rows.append((acct, ds_name, cnt, dr, cr, net))
+
+    return spark.createDataFrame(
+        rows, ["Account Description", "Dataset", "Count", "Entered Dr", "Entered CR", "Net Entered"]
+    ).toPandas()
+
+
+def write_summary_workbook(path: str):
+    """One sheet per company, each sheet's rows stacked block-by-block in
+    the order Total, then each Account Description — matches the layout of
+    the reference workbook (image), just generalized to every Account
+    Description instead of two hardcoded fee types."""
+    sheets = {}
+    for company in COMPANIES:
+        pdf = build_company_summary(company)
+        # short, sheet-name-safe tab label
+        tab = company.replace("Tradeweb ", "TW ").replace(" ", "")[:31]
+        sheets[tab] = pdf
+
+    with __import__("pandas").ExcelWriter(path, engine="openpyxl") as writer:
+        for tab, pdf in sheets.items():
+            start_row = 0
+            for acct, block in pdf.groupby("Account Description", sort=False):
+                block = block.drop(columns=["Account Description"])
+                header_df = __import__("pandas").DataFrame({tab: [acct]})
+                header_df.to_excel(writer, sheet_name=tab, startrow=start_row, index=False, header=False)
+                block.to_excel(writer, sheet_name=tab, startrow=start_row + 1, index=False)
+                start_row += len(block) + 3  # +1 header row, +1 title row, +1 blank spacer
+
+    print(f"  [EXCEL] Written -> {path}")
+
+
+write_summary_workbook(f"{output_path_et}/Account_Description_Summary - {CURRENT_FY} {CURRENT_QUARTER}.xlsx")
