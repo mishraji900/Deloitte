@@ -2070,6 +2070,8 @@ print("Residual Analytic:", residual_result)
 
 # COMMAND ----------
 
+# COMMAND ----------
+
 # =====================================================================
 # SECTION 8 — "3a. Times M by Entity" sheet
 # =====================================================================
@@ -2088,6 +2090,7 @@ print("Residual Analytic:", residual_result)
 from openpyxl.styles.differential import DifferentialStyle
 from openpyxl.styles.styleable import StyleArray
 from openpyxl.utils.cell import absolute_coordinate, quote_sheetname
+from decimal import Decimal
 
 SHEET_3A = "3a. Times M by Entity"
 TAB_2_SHEET = "3. Residual Analytic 6-30-2026"
@@ -2095,7 +2098,7 @@ TAB_2_SHEET = "3. Residual Analytic 6-30-2026"
 ANCHOR_CELL = "B12"
 BLOCK_HEIGHT = 5
 DATA_ROWS = 3
-MATERIALITY_CELL = "$C$7"
+MATERIALITY_CELL = "$C$6"  # FIXED: Pointing to C6 for Materiality
 
 ACCOUNT_COLUMN_NAME = "Account"
 TEST_COLUMN_NAME = "Test consolidated amount"
@@ -2612,11 +2615,10 @@ def populate_sheet_3a(template, updated_raw_tb_CY, residual_rows, spark_column_r
     if input_materiality_value in {None, Decimal("0")}:
         raise ValueError("MATERIALITY must be non-zero.")
 
-    # Write THRESHOLD_VALUE into C7 so every in-sheet formula that references
-    # $C$7 always resolves against the correct value, regardless of what was
-    # previously in the cell.
-    mat_coord = MATERIALITY_CELL.replace("$", "")  # -> "C7"
+    # FIXED: Write Materiality to C6 and Threshold to C7
+    mat_coord = MATERIALITY_CELL.replace("$", "")  # -> "C6"
     worksheet[mat_coord].value = float(input_materiality_value)
+    worksheet["C7"].value = float(THRESHOLD_VALUE)
 
     formula_materiality_value = s3a_get_sheet_materiality(worksheet=worksheet, fallback_value=input_materiality_value)
 
@@ -2717,7 +2719,6 @@ print("Blocks written:", sheet3a_result["blocks_written"])
 print("Tab 2 accounts found:", sheet3a_result["tab2_accounts_found"])
 print("Missing Tab 2 accounts:", sheet3a_result["missing_tab2_accounts"])
 print("Accounts written:", sheet3a_result["accounts"])
-
 
 # COMMAND ----------
 
@@ -2858,6 +2859,10 @@ def _filter_tab3b(residual_cy_py, threshold_value):
     results = []
 
     for rec in _get_records(residual_cy_py):
+        # FIXED: Skip accounts that are greyed out (manually overridden or tested elsewhere)
+        if rec.get("CY_Greyed"):
+            continue
+
         cy = _to_dec(rec.get("Untested_Balance_CY")) or Decimal("0")
         py = _to_dec(rec.get("Untested_Balance_PY")) or Decimal("0")
         diff = cy - py
@@ -2959,7 +2964,11 @@ def populate_sheet_3b(
 
     ws = template[SHEET_3B]
 
-    # 1. Filter qualifying accounts.
+    # FIXED: Write Materiality to C6 and THRESHOLD_VALUE to C7
+    ws["C6"].value = float(MATERIALITY)
+    ws["C7"].value = float(threshold_value)
+
+    # 1. Filter qualifying accounts (This will now correctly exclude the grey rows).
     tab3b_rows = _filter_tab3b(residual_cy_py, threshold_value)
     if not tab3b_rows:
         print("[3b] No Tab-3b accounts found - sheet not written.")
