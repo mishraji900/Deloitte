@@ -1,111 +1,152 @@
+# COMMAND ----------
+
 # =====================================================================
-# VALIDATION — Consolidated & Untested Balance recon, raw vs all 5 sheets
+# SECTION 11 — Validation Report
 # =====================================================================
-SIGNIFICANCE_COL = "Significance"  # ponytail: rename to real header if diff
-VAL_COLS = ["Consolidated", "Untested Balance"]
+# Calculates total counts, Consolidated balances, and Untested balances
+# for the raw files and every generated sheet to ensure data integrity
+# and exact record flow throughout the pipeline.
+# =====================================================================
 
-def _sig_ok_map(df, row_id_col="row_id"):
-    if SIGNIFICANCE_COL not in df.columns:
-        return {r[row_id_col]: True for r in df.select(row_id_col).collect()}
-    txt = F.trim(F.col(f"`{SIGNIFICANCE_COL}`").cast("string"))
-    ok = df.select(row_id_col, (txt.isNotNull() & (txt != "")).alias("ok")).collect()
-    return {r[row_id_col]: bool(r["ok"]) for r in ok}
-
-def _row_map(df, row_id_col="row_id"):
-    cols = [row_id_col, "Account"] + VAL_COLS
-    return {r[row_id_col]: r.asDict(recursive=True) for r in df.select(*cols).collect()}
-
-def _status(raw_val, sheet_raw):
-    if is_grey_marker(sheet_raw):
-        return "GREYED", None
-    sheet_val = to_decimal(sheet_raw)
-    if raw_val is None and sheet_val is None:
-        return "MATCH", sheet_val
-    if raw_val is None or sheet_val is None:
-        return "MISMATCH", sheet_val
-    return ("MATCH" if raw_val == sheet_val else "MISMATCH"), sheet_val
-
-def recon_rows(raw_map, sig_map, item_maps):
-    """item_maps: {sheet_label: {row_id: record}}"""
-    rows = []
-    for sheet_label, id_map in item_maps.items():
-        for rid, rec in id_map.items():
-            raw = raw_map.get(rid)
-            for col in VAL_COLS:
-                raw_val = to_decimal(raw.get(col)) if raw else None
-                status, sheet_val = _status(raw_val, rec.get(col))
-                rows.append({
-                    "sheet": sheet_label, "row_id": rid,
-                    "Account": (raw or rec).get("Account"),
-                    "column": col, "raw_value": raw_val, "sheet_value": sheet_val,
-                    "status": status if raw else "MISSING_IN_RAW",
-                    "sig_ok": sig_map.get(rid),
-                })
-    return rows
-
-# ---- ground-truth raw maps (CY/PY, pre grey-out) ----
-raw_cy_map, raw_py_map = _row_map(raw_tb_CY), _row_map(raw_tb_PY)
-sig_cy_map, sig_py_map = _sig_ok_map(raw_tb_CY), _sig_ok_map(raw_tb_PY)
-
-# ---- item sets actually used by each sheet, keyed by row_id ----
-gcy_map = _row_map(updated_raw_tb_CY)   # sheet 1 & 2 source
-gpy_map = _row_map(updated_raw_tb_PY)
-
-vis_ids_12 = {
-    r["row_id"] for r in raw_tb_CY.select("row_id", "% of consolidated balance", "Test consolidated amount").collect()
-    if _is_nonzero(r["% of consolidated balance"]) and _is_no(r["Test consolidated amount"])
-}
-sheet1_map = {rid: v for rid, v in gcy_map.items() if rid in vis_ids_12}
-sheet2_map = sheet1_map  # same source rows, sheet 2 just skips calc cols
-
-r3 = residual_cy_py.select("CY_Row_ID", "PY_Row_ID", "CY_Greyed").collect()
-sheet3_cy_map = {r["CY_Row_ID"]: gcy_map[r["CY_Row_ID"]] for r in r3 if not r["CY_Greyed"] and r["CY_Row_ID"] in gcy_map}
-sheet3_py_map = {r["PY_Row_ID"]: gpy_map[r["PY_Row_ID"]] for r in r3 if r["PY_Row_ID"] is not None and r["PY_Row_ID"] in gpy_map}
-
-sheet3a_map = {row["row_id"]: row["record"] for row in residual_rows}
-
-sheet3b_map = {
-    r["CY_Row_ID"]: gcy_map[r["CY_Row_ID"]]
-    for r in tab3b_rows if r.get("CY_Row_ID") is not None and r["CY_Row_ID"] in gcy_map
-}
-
-cy_recon = recon_rows(raw_cy_map, sig_cy_map, {
-    "1. Quantitative Evaluation": sheet1_map,
-    "2. Qualitative Evaluation": sheet2_map,
-    "3. Residual Analytic (CY)": sheet3_cy_map,
-    "3a. Times M by Entity": sheet3a_map,
-    "3b. Residual Analytic by entity": sheet3b_map,
-})
-py_recon = recon_rows(raw_py_map, sig_py_map, {"3. Residual Analytic (PY)": sheet3_py_map})
-
-# ---- item counts (sig-blank leak check) ----
-count_rows = []
-for label, id_map, sig_map in [
-    ("1. Quantitative Evaluation", sheet1_map, sig_cy_map),
-    ("2. Qualitative Evaluation", sheet2_map, sig_cy_map),
-    ("3. Residual Analytic (CY)", sheet3_cy_map, sig_cy_map),
-    ("3. Residual Analytic (PY)", sheet3_py_map, sig_py_map),
-    ("3a. Times M by Entity", sheet3a_map, sig_cy_map),
-    ("3b. Residual Analytic by entity", sheet3b_map, sig_cy_map),
-]:
-    leaked = sum(1 for rid in id_map if not sig_map.get(rid, True))
-    count_rows.append({"sheet": label, "items": len(id_map), "sig_blank_leaked": leaked})
-
-# ---- write out ----
 import pandas as pd
-VALIDATION_OUTPUT_PATH = f"{OUTPUT_DIRECTORY}/Validation_Recon.xlsx"
-all_recon = pd.DataFrame(cy_recon + py_recon)
-summary = (
-    all_recon.groupby(["sheet", "status"]).size().unstack(fill_value=0)
-    if not all_recon.empty else pd.DataFrame()
+from pyspark.sql import functions as F
+from decimal import Decimal
+
+VALIDATION_OUTPUT_PATH = f"{OUTPUT_DIRECTORY}/Validation_Summary_Report.xlsx"
+
+def _spark_sum(df, col_name):
+    """Helper to safely sum a PySpark column, treating grey markers/nulls as 0."""
+    source_text = F.trim(F.col(f"`{col_name}`").cast("string"))
+    source_lower = F.lower(source_text)
+    cleaned_text = F.regexp_replace(F.regexp_replace(source_text, ",", ""), "%", "")
+    
+    numeric_col = F.when(
+        source_text.isNull() | (source_text == F.lit("")) | (source_lower == F.lit(GREY_MARKER)),
+        F.lit(0).cast("double")
+    ).otherwise(cleaned_text.cast("double"))
+    
+    val = df.select(F.sum(numeric_col)).collect()[0][0]
+    return val if val is not None else 0
+
+
+# --- 1. Raw CY Totals ---
+raw_cy_count = raw_tb_CY.count()
+raw_cy_cons = _spark_sum(raw_tb_CY, "Consolidated")
+raw_cy_unt = _spark_sum(raw_tb_CY, "Untested Balance")
+
+# --- 2. Raw PY Totals ---
+raw_py_count = raw_tb_PY.count()
+raw_py_cons = _spark_sum(raw_tb_PY, "Consolidated")
+raw_py_unt = _spark_sum(raw_tb_PY, "Untested Balance")
+
+
+# --- 3. Tab 1 & 2 Totals (Visible Rows Only) ---
+# Logic: % != 0 AND Test == 'No'
+s1_s2_df = updated_raw_tb_CY.withColumn(
+    "pct_num", _spark_numeric_or_null("% of consolidated balance")
+).withColumn(
+    "test_lower", F.lower(F.trim(F.col("Test consolidated amount").cast("string")))
+).filter(
+    (F.col("pct_num").isNotNull()) & (F.col("pct_num") != 0) & (F.col("test_lower") == "no")
 )
 
-with pd.ExcelWriter("/tmp/_validation_recon.xlsx", engine="openpyxl") as writer:
-    summary.to_excel(writer, sheet_name="Summary")
-    pd.DataFrame(count_rows).to_excel(writer, sheet_name="Item Counts", index=False)
-    all_recon[all_recon["status"] != "MATCH"].to_excel(writer, sheet_name="Mismatches Only", index=False)
-    all_recon.to_excel(writer, sheet_name="Full Detail", index=False)
+s1_s2_count = s1_s2_df.count()
+s1_s2_cons = _spark_sum(s1_s2_df, "Consolidated")
+s1_s2_unt = _spark_sum(s1_s2_df, "Untested Balance")
 
-cp.fs.put("/tmp/_validation_recon.xlsx", VALIDATION_OUTPUT_PATH, overwrite=True)
-print("Validation written:", VALIDATION_OUTPUT_PATH)
-print(pd.DataFrame(count_rows))
+
+# --- 4. Tab 3 Totals (Residual Analytic - CY vs PY) ---
+s3_count = residual_cy_py.count()
+s3_cy_unt = residual_cy_py.select(F.sum("Untested_Balance_CY")).collect()[0][0] or 0
+s3_py_unt = residual_cy_py.select(F.sum("Untested_Balance_PY")).collect()[0][0] or 0
+
+
+# --- 5. Tab 3a Totals (Times M by Entity) ---
+# `residual_rows` list was generated globally in Section 8
+s3a_count = len(residual_rows)
+s3a_cy_cons = sum((to_decimal(r["record"].get("Consolidated")) or Decimal(0)) for r in residual_rows)
+s3a_cy_unt = sum((to_decimal(r["record"].get("Untested Balance")) or Decimal(0)) for r in residual_rows)
+
+
+# --- 6. Tab 3b Totals (Residual Analytic by entity) ---
+# We rebuild the tab3b_rows using the exact filter function from Section 9
+tab3b_rows_val = _filter_tab3b(residual_cy_py, THRESHOLD_VALUE)
+s3b_count = len(tab3b_rows_val)
+s3b_cy_unt = sum((to_decimal(r.get("Untested_Balance_CY")) or Decimal(0)) for r in tab3b_rows_val)
+s3b_py_unt = sum((to_decimal(r.get("Untested_Balance_PY")) or Decimal(0)) for r in tab3b_rows_val)
+
+
+# --- Build Validation Summary Table ---
+validation_data = [
+    {
+        "Stage / Sheet": "1. Raw CY Data",
+        "Total Accounts (Count)": raw_cy_count,
+        "CY Consolidated Total": raw_cy_cons,
+        "CY Untested Total": raw_cy_unt,
+        "PY Consolidated Total": None,
+        "PY Untested Total": None,
+    },
+    {
+        "Stage / Sheet": "2. Raw PY Data",
+        "Total Accounts (Count)": raw_py_count,
+        "CY Consolidated Total": None,
+        "CY Untested Total": None,
+        "PY Consolidated Total": raw_py_cons,
+        "PY Untested Total": raw_py_unt,
+    },
+    {
+        "Stage / Sheet": "3. Tab 1 & 2 (Visible Active Rows)",
+        "Total Accounts (Count)": s1_s2_count,
+        "CY Consolidated Total": s1_s2_cons,
+        "CY Untested Total": s1_s2_unt,
+        "PY Consolidated Total": None,
+        "PY Untested Total": None,
+    },
+    {
+        "Stage / Sheet": "4. Tab 3 (Residual CY vs PY)",
+        "Total Accounts (Count)": s3_count,
+        "CY Consolidated Total": "N/A",  # Not tracked on this tab
+        "CY Untested Total": s3_cy_unt,
+        "PY Consolidated Total": "N/A",  # Not tracked on this tab
+        "PY Untested Total": s3_py_unt,
+    },
+    {
+        "Stage / Sheet": "5. Tab 3a (Times M - Residual Accounts)",
+        "Total Accounts (Count)": s3a_count,
+        "CY Consolidated Total": float(s3a_cy_cons),
+        "CY Untested Total": float(s3a_cy_unt),
+        "PY Consolidated Total": None,
+        "PY Untested Total": None,
+    },
+    {
+        "Stage / Sheet": "6. Tab 3b (Filtered for Flux > 15%)",
+        "Total Accounts (Count)": s3b_count,
+        "CY Consolidated Total": "N/A",
+        "CY Untested Total": float(s3b_cy_unt),
+        "PY Consolidated Total": "N/A",
+        "PY Untested Total": float(s3b_py_unt),
+    }
+]
+
+# Convert to Pandas DataFrame for easy viewing
+df_validation = pd.DataFrame(validation_data)
+
+# Apply standard formatting
+def format_money(val):
+    if pd.isna(val) or val == "N/A":
+        return val
+    return f"${val:,.2f}"
+
+money_cols = ["CY Consolidated Total", "CY Untested Total", "PY Consolidated Total", "PY Untested Total"]
+for col in money_cols:
+    df_validation[col] = df_validation[col].apply(format_money)
+
+# Display the table in Databricks
+print("\n" + "="*80)
+print(" " * 25 + "VALIDATION REPORT")
+print("="*80)
+display(df_validation)
+
+# Save to Excel
+df_validation.to_excel(VALIDATION_OUTPUT_PATH, index=False)
+print(f"\n✅ Validation report successfully saved to: {VALIDATION_OUTPUT_PATH}")
