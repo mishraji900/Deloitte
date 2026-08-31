@@ -131,22 +131,26 @@ validation_data = [
 # Convert to Pandas DataFrame for easy viewing
 df_validation = pd.DataFrame(validation_data)
 
-# Apply standard formatting
+# Apply standard formatting for Databricks display
 def format_money(val):
     if pd.isna(val) or val == "N/A":
         return val
     return f"${val:,.2f}"
 
+df_display = df_validation.copy()
 money_cols = ["CY Consolidated Total", "CY Untested Total", "PY Consolidated Total", "PY Untested Total"]
 for col in money_cols:
-    df_validation[col] = df_validation[col].apply(format_money)
+    df_display[col] = df_display[col].apply(format_money)
 
 # Display the table in Databricks
 print("\n" + "="*80)
 print(" " * 25 + "VALIDATION REPORT")
 print("="*80)
-display(df_validation)
+display(df_display)
 
-# Save to Excel
-df_validation.to_excel(VALIDATION_OUTPUT_PATH, index=False)
+# Save to Excel using custom write_excel function
+write_excel(
+    data={"Validation Summary": df_validation}, 
+    path=VALIDATION_OUTPUT_PATH
+)
 print(f"\n✅ Validation report successfully saved to: {VALIDATION_OUTPUT_PATH}")
