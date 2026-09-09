@@ -22,7 +22,6 @@ TEMPLATE_PATH = (
     "Broadridge_-_Risk_Assessment.zip/Risk_Assessment_FY_26_Template_Copy1.xlsx"
 )
 
-# ponytail: was commented out in source — _make_output_path hard-needs this.
 OUTPUT_DIRECTORY = (
     "User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/Output"
 )
@@ -131,21 +130,18 @@ SHEET2_CONFIG = {
     "materiality"                  : 63_370_000,
     "perf_mat"                     : 50_696_000,
     "ctt"                          : 3_168_500,
-    # Table 1 — Sept 2025 vs June 2025
     "t1_label_current"             : "Sept 2025",
     "t1_label_prior"               : "June 2025",
     "t1_col_current"               : "09/30/2025",
     "t1_col_prior"                 : "06/30/2025",
     "t1_total_assets_current_m"    : 8945.3,
     "t1_total_assets_prior_m"      : 8545.0,
-    # Table 1.1 — Sept 2025 vs Sept 2024
     "t1_1_label_current"           : "Sept 2025",
     "t1_1_label_prior"             : "Sept 2024",
     "t1_1_col_current"             : "09/30/2025",
     "t1_1_col_prior"               : "09/30/2024",
     "t1_1_total_assets_current_m"  : 8945.3,
     "t1_1_total_assets_prior_m"    : 8545.0,
-    # Table 2 — Materiality Multiple (3 columns)
     "t2_col1"                      : "09/30/2025",
     "t2_col2"                      : "06/30/2025",
     "t2_col3"                      : "09/30/2024",
@@ -261,7 +257,6 @@ def _copy_sheet_from_template(wb, template_sheet_name: str, new_name: str):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _apply_border_to_merge(ws, row: int, col_start: int, col_end: int, border):
-    """Stamp border on every cell in a merged row range (anchor + non-anchors)."""
     for col in range(col_start, col_end + 1):
         ws.cell(row=row, column=col).border = border
 
@@ -296,7 +291,6 @@ def apply_white_background(ws, df: pd.DataFrame):
 
 
 def apply_white_background_s2(ws, n_rows: int = 250):
-    # Extended to col 30 so charts anchored at col I/P also get white fill
     for r in range(1, n_rows + 1):
         for c in range(1, 30):
             ws.cell(row=r, column=c).fill = WHITE_FILL
@@ -477,13 +471,10 @@ def write_materiality_box(ws, row: int, cfg: dict) -> int:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHEET 1 — TABLE 1: Type of Currencies
-# FIX: cur_val / pri_val now divided by 1e6 — table sits under a $M-scaled
-# Total Assets row (TABLE_CONFIG values are already in millions), so the
-# carrying-value side must be scaled too or the % row divides $ by $M.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_s1_table1(ws, row: int, group_totals: "OrderedDict[str, dict]",
-                    cfg: dict, acct_group_val: str) -> int:
+                    cfg: dict, acct_group_val: str) -> tuple:
     B, C, D, E, F = _START_COL, _START_COL+1, _START_COL+2, _START_COL+3, _START_COL+4
 
     col_cur = cfg["col_current"]
@@ -514,10 +505,11 @@ def write_s1_table1(ws, row: int, group_totals: "OrderedDict[str, dict]",
 
     grand_cur = 0.0
     grand_pri = 0.0
+    data_row_start = row   # NEW — first group-detail row, chart source start
 
     for group_name, totals in group_totals.items():
-        cur_val   = totals.get(col_cur, 0.0) / 1e6      # ← FIX: scale to $M
-        pri_val   = totals.get(col_pri, 0.0) / 1e6       # ← FIX: scale to $M
+        cur_val   = totals.get(col_cur, 0.0) / 1e6
+        pri_val   = totals.get(col_pri, 0.0) / 1e6
         fluct_abs = cur_val - pri_val
         fluct_pct = (fluct_abs / pri_val) if pri_val != 0 else 0.0
 
@@ -534,6 +526,8 @@ def write_s1_table1(ws, row: int, group_totals: "OrderedDict[str, dict]",
         wc(ws, row, F, fluct_pct,  font=NORMAL, border=THIN_ALL,
            fmt=PCT_FMT,    align=RIGHT)
         row += 1
+
+    data_row_end = row - 1   # NEW — last group-detail row, chart source end
 
     g_fluct_abs = grand_cur - grand_pri
     g_fluct_pct = (g_fluct_abs / grand_pri) if grand_pri != 0 else 0.0
@@ -567,13 +561,11 @@ def write_s1_table1(ws, row: int, group_totals: "OrderedDict[str, dict]",
     wc(ws, row, F, None, border=THIN_ALL)
 
     print(f"  ✅ Table 1 (S1) written ending at row {row}")
-    return row + 2
+    return row + 2, data_row_start, data_row_end   # NEW — 3-tuple
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHEET 1 — TABLE 2: Materiality Multiple
-# FIX: cur_val / pri_val numerator was never divided by 1e6 — only `mat`
-# (denominator) was, inflating every multiple ~1,000,000x.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def write_s1_table2(ws, row: int, group_totals: "OrderedDict[str, dict]",
@@ -594,8 +586,8 @@ def write_s1_table2(ws, row: int, group_totals: "OrderedDict[str, dict]",
     row += 1
 
     for group_name, totals in group_totals.items():
-        cur_val = (totals.get(cfg["col_current"], 0.0) / 1e6) / mat   # ← FIX
-        pri_val = (totals.get(cfg["col_prior"],   0.0) / 1e6) / mat   # ← FIX
+        cur_val = (totals.get(cfg["col_current"], 0.0) / 1e6) / mat
+        pri_val = (totals.get(cfg["col_prior"],   0.0) / 1e6) / mat
 
         for col_idx, val, fmt in [
             (B, group_name, None),
@@ -608,39 +600,6 @@ def write_s1_table2(ws, row: int, group_totals: "OrderedDict[str, dict]",
 
     print(f"  ✅ Table 2 (S1) written ending at row {row - 1}")
     return row + 1
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SHEET 1 — MAIN WRITER
-# ══════════════════════════════════════════════════════════════════════════════
-
-def write_sheet1_summary(ws, df: pd.DataFrame,
-                         acct_group_val: str) -> "OrderedDict[str, dict]":
-    apply_white_background(ws, df)
-    _enable_outline(ws)
-    write_sheet_header(ws, acct_group_val)
-    write_header_row(ws, df)
-
-    current_row  = _START_ROW
-    group_totals = OrderedDict()
-
-    for group_name, df_group in df.groupby(GROUP_COL, sort=False):
-        current_row, subtotals = _s1_write_group(
-            ws, df_group, current_row, group_name
-        )
-        group_totals[group_name] = subtotals
-
-    current_row = _s1_write_grand_total(ws, df, current_row, acct_group_val)
-    current_row = _s1_write_year_end_box(ws, current_row)
-    current_row = write_materiality_box(ws, current_row, TABLE_CONFIG)
-    current_row = write_s1_table1(ws, current_row, group_totals,
-                                  TABLE_CONFIG, acct_group_val)
-    current_row = write_s1_table2(ws, current_row, group_totals,
-                                  TABLE_CONFIG, acct_group_val)
-
-    print(f"  ✅ Summary sheet fully written — last row: {current_row}")
-    print(f"     Groups: {list(group_totals.keys())}")
-    return group_totals
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -687,7 +646,7 @@ def _bar_labels() -> DataLabelList:
     dl.showSerName      = False
     dl.showLegendKey    = False
     dl.position         = "outEnd"
-    dl.numFmt = NumFmt(formatCode="#,##0.0", sourceLinked=False)
+    dl.numFmt = NumFmt(formatCode="#,##0.00", sourceLinked=False)
     return dl
 
 
@@ -761,60 +720,152 @@ def write_pie_charts(
         print(f"  ✅ Fig {fig_num} Pie  '{title}' → '{anchor}'")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  BAR CHART — Type of Accounts vs Time
-#  Categories = account types (Table 1 / Table 1.1 row labels, col B).
-#  Series     = Sept 2025 (Table 1 col C) / June 2025 (Table 1 col D) /
-#               Sept 2024 (Table 1.1 col D — its "prior" column).
-#  Two tables share row bands (each has its own B..F block), so the fn
-#  takes both row ranges instead of assuming one.
-# ══════════════════════════════════════════════════════════════════════════════
-
-def write_type_accounts_time_comparison_bar(
-        ws, label_col: int,
-        t1_first: int, t1_last: int, col_cur: int, col_pri1: int,
-        cur_label: str, pri1_label: str,
-        t11_first: int, t11_last: int, col_pri2: int, pri2_label: str,
-        chart_title: str, anchor: str = None) -> None:
+def write_single_comparison_bar_chart(
+        ws, first_data_row: int, last_data_row: int, label_col: int,
+        cur_val_col: int, cur_label: str,
+        pri1_val_col: int, pri1_label: str,
+        pri2_val_col: int = None, pri2_label: str = None,
+        type_val_col: int = None, type_label: str = "Type of accounts",
+        chart_title: str = "Cash — Period Comparison",
+        anchor: str = None, chart_width: float = 28, chart_height: float = 14,
+) -> None:
     if anchor is None:
-        anchor = f"B{max(t1_last, t11_last) + 2}"
+        anchor = f"B{last_data_row + 2}"
 
-    chart = BarChart()
+    series_spec: list[tuple[int, str, str]] = []
+    if type_val_col is not None:
+        series_spec.append((type_val_col, type_label, BAR_COLORS[0]))
+    series_spec.append((cur_val_col,  cur_label,  BAR_COLORS[1]))
+    series_spec.append((pri1_val_col, pri1_label, BAR_COLORS[2]))
+    if pri2_val_col is not None:
+        series_spec.append((pri2_val_col, pri2_label, BAR_COLORS[3]))
+
+    chart                   = BarChart()
     chart.type              = "col"
     chart.grouping          = "clustered"
-    chart.title              = chart_title
-    chart.y_axis.numFmt      = "#,##0.0"
-    chart.x_axis.tickLblPos  = "low"
-    chart.width, chart.height = 28, 14
-    chart.legend              = _legend("b")
+    chart.title             = chart_title
+    chart.y_axis.numFmt     = "#,##0.00"
+    chart.y_axis.title      = None
+    chart.x_axis.title      = None
+    chart.x_axis.tickLblPos = "low"
+    chart.width             = chart_width
+    chart.height            = chart_height
+    chart.legend            = _legend("b")
 
-    cats = Reference(ws, min_col=label_col, min_row=t1_first, max_row=t1_last)
+    cats = Reference(ws, min_col=label_col, min_row=first_data_row, max_row=last_data_row)
 
-    specs = [
-        (Reference(ws, min_col=col_cur,  min_row=t1_first,  max_row=t1_last),  cur_label,  BAR_COLORS[1]),
-        (Reference(ws, min_col=col_pri1, min_row=t1_first,  max_row=t1_last),  pri1_label, BAR_COLORS[2]),
-        (Reference(ws, min_col=col_pri2, min_row=t11_first, max_row=t11_last), pri2_label, BAR_COLORS[3]),
-    ]
-    for idx, (data, label, color) in enumerate(specs):
+    for idx, (val_col, label, hex_color) in enumerate(series_spec):
+        data = Reference(ws, min_col=val_col, min_row=first_data_row, max_row=last_data_row)
         chart.add_data(data, titles_from_data=False)
-        s = chart.series[idx]
-        s.title = SeriesLabel(v=label)
-        s.dLbls = _bar_labels()
-        _color_bar_series(s, color)
-    chart.set_categories(cats)
+        series        = chart.series[idx]
+        series.title  = SeriesLabel(v=label)
+        series.dLbls  = _bar_labels()
+        _color_bar_series(series, hex_color)
 
+    chart.set_categories(cats)
     ws.add_chart(chart, anchor)
-    print(f"  ✅ Bar chart '{chart_title}' → '{anchor}'")
+
+    print(f"  ✅ Bar chart '{chart_title}' → '{anchor}' "
+          f"| {len(series_spec)} series "
+          f"| {last_data_row - first_data_row + 1} categories")
+
+
+def write_all_charts(
+        ws, first_data_row: int, last_data_row: int, label_col: int,
+        cur_val_col: int, cur_label: str,
+        pri1_val_col: int, pri1_label: str,
+        pri2_val_col: int = None, pri2_label: str = None,
+        type_val_col: int = None, type_label: str = "Type of accounts",
+        cur2_val_col: int = None, cur2_label: str = None,
+        cur_period: str = "9/30/2025", pri1_period: str = "6/30/2025",
+        pri2_period: str = "9/30/2024",
+        anchor_fig1: str = "B12", anchor_fig2: str = "L12",
+        anchor_fig3: str = "B42", anchor_fig4: str = "L42",
+        anchor_bar: str = None,
+        pie_width: float = 16, pie_height: float = 12,
+        bar_width: float = 28, bar_height: float = 14,
+) -> None:
+    print(f"\n  📊 Writing charts — {last_data_row - first_data_row + 1} categories ...")
+
+    write_pie_charts(
+        ws=ws, first_data_row=first_data_row, last_data_row=last_data_row,
+        label_col=label_col, cur_val_col=cur_val_col, cur_label=cur_label,
+        pri1_val_col=pri1_val_col, pri1_label=pri1_label,
+        cur2_val_col=cur2_val_col, cur2_label=cur2_label,
+        pri2_val_col=pri2_val_col, pri2_label=pri2_label,
+        anchor_fig1=anchor_fig1, anchor_fig2=anchor_fig2,
+        anchor_fig3=anchor_fig3, anchor_fig4=anchor_fig4,
+        chart_width=pie_width, chart_height=pie_height,
+    )
+
+    write_single_comparison_bar_chart(
+        ws=ws, first_data_row=first_data_row, last_data_row=last_data_row,
+        label_col=label_col, cur_val_col=cur_val_col, cur_label=cur_label,
+        pri1_val_col=pri1_val_col, pri1_label=pri1_label,
+        pri2_val_col=pri2_val_col, pri2_label=pri2_label,
+        type_val_col=type_val_col, type_label=type_label,
+        chart_title=(f"Cash {cur_period} VS {pri1_period}"
+                     + (f" VS {pri2_period}" if pri2_val_col else "")),
+        anchor=anchor_bar,   # below the 4 pies — caller passes fixed anchor
+        chart_width=bar_width, chart_height=bar_height,
+    )
+
+    print("  ✅ All charts written.\n")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHEET 1 — MAIN WRITER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_sheet1_summary(ws, df: pd.DataFrame,
+                         acct_group_val: str) -> "OrderedDict[str, dict]":
+    apply_white_background(ws, df)
+    _enable_outline(ws)
+    write_sheet_header(ws, acct_group_val)
+    write_header_row(ws, df)
+
+    current_row  = _START_ROW
+    group_totals = OrderedDict()
+
+    for group_name, df_group in df.groupby(GROUP_COL, sort=False):
+        current_row, subtotals = _s1_write_group(
+            ws, df_group, current_row, group_name
+        )
+        group_totals[group_name] = subtotals
+
+    current_row = _s1_write_grand_total(ws, df, current_row, acct_group_val)
+    current_row = _s1_write_year_end_box(ws, current_row)
+    current_row = write_materiality_box(ws, current_row, TABLE_CONFIG)
+    current_row, t1_first, t1_last = write_s1_table1(
+        ws, current_row, group_totals, TABLE_CONFIG, acct_group_val
+    )
+    current_row = write_s1_table2(ws, current_row, group_totals,
+                                  TABLE_CONFIG, acct_group_val)
+
+    # Charts — pies feed off Table1's cur/prior cols; bar sits below fig3/4
+    write_all_charts(
+        ws              = ws,
+        first_data_row  = t1_first,
+        last_data_row   = t1_last,
+        label_col       = _START_COL,
+        cur_val_col     = _START_COL + 1,   # Table1 col C
+        cur_label       = TABLE_CONFIG["label_current"],
+        pri1_val_col    = _START_COL + 2,   # Table1 col D
+        pri1_label      = TABLE_CONFIG["label_prior"],
+        cur_period      = TABLE_CONFIG["label_current"],
+        pri1_period     = TABLE_CONFIG["label_prior"],
+        anchor_fig1     = "B12", anchor_fig2 = "L12",
+        anchor_fig3     = "B42", anchor_fig4 = "L42",
+        anchor_bar      = "B70",   # skipped: row-height math, add if template changes
+    )
+
+    print(f"  ✅ Summary sheet fully written — last row: {current_row}")
+    print(f"     Groups: {list(group_totals.keys())}")
+    return group_totals
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHEET 2 — TABLE 1 / TABLE 1.1 (Type of Accounts)
-# RESTORED: this fn was called but never defined — both tables need it.
-# FIX: carrying-value cells now divided by 1e6 (sheet is labelled
-# "Figures in $ M"; group_totals come from raw TB_Final dollar sums).
-# Total Assets + % rows already present — nothing extra needed there.
-# Returns (next_row, group_row_start, group_row_end) so the bar chart
-# below can point at the right cell ranges.
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _s2_type_of_accounts_table(
@@ -849,8 +900,8 @@ def _s2_type_of_accounts_table(
     group_row_start = row
 
     for group_name, totals in group_totals.items():
-        cur_val   = totals.get(col_cur_key, 0.0) / 1e6     # ← FIX: $M scale
-        pri_val   = totals.get(col_pri_key, 0.0) / 1e6      # ← FIX: $M scale
+        cur_val   = totals.get(col_cur_key, 0.0) / 1e6
+        pri_val   = totals.get(col_pri_key, 0.0) / 1e6
         fluct_abs = cur_val - pri_val
         fluct_pct = (fluct_abs / pri_val) if pri_val else 0.0
         grand_cur += cur_val
@@ -896,8 +947,48 @@ def _s2_type_of_accounts_table(
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SHEET 2 — TABLE 2: Materiality Multiple  (3 date columns + Commentary)
-# FIX: numerator ($ sums) never divided by 1e6 — only denominator `mat` was.
+# SHEET 2 — BAR: Type of Accounts vs Time
+# ══════════════════════════════════════════════════════════════════════════════
+
+def write_type_accounts_time_comparison_bar(
+        ws, label_col: int,
+        t1_first: int, t1_last: int, col_cur: int, col_pri1: int,
+        cur_label: str, pri1_label: str,
+        t11_first: int, t11_last: int, col_pri2: int, pri2_label: str,
+        chart_title: str, anchor: str = None) -> None:
+    if anchor is None:
+        anchor = f"B{max(t1_last, t11_last) + 2}"
+
+    chart = BarChart()
+    chart.type               = "col"
+    chart.grouping           = "clustered"
+    chart.title               = chart_title
+    chart.y_axis.numFmt       = "#,##0.0"
+    chart.x_axis.tickLblPos   = "low"
+    chart.width, chart.height = 28, 14
+    chart.legend               = _legend("b")
+
+    cats = Reference(ws, min_col=label_col, min_row=t1_first, max_row=t1_last)
+
+    specs = [
+        (Reference(ws, min_col=col_cur,  min_row=t1_first,  max_row=t1_last),  cur_label,  BAR_COLORS[1]),
+        (Reference(ws, min_col=col_pri1, min_row=t1_first,  max_row=t1_last),  pri1_label, BAR_COLORS[2]),
+        (Reference(ws, min_col=col_pri2, min_row=t11_first, max_row=t11_last), pri2_label, BAR_COLORS[3]),
+    ]
+    for idx, (data, label, color) in enumerate(specs):
+        chart.add_data(data, titles_from_data=False)
+        s = chart.series[idx]
+        s.title = SeriesLabel(v=label)
+        s.dLbls = _bar_labels()
+        _color_bar_series(s, color)
+    chart.set_categories(cats)
+
+    ws.add_chart(chart, anchor)
+    print(f"  ✅ Bar chart '{chart_title}' → '{anchor}'")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SHEET 2 — TABLE 2: Materiality Multiple
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _s2_table2_materiality(ws, row: int,
@@ -921,9 +1012,9 @@ def _s2_table2_materiality(ws, row: int,
 
     data_row_start = row
 
-    grand_c1 = sum(t.get(col1, 0.0) for t in group_totals.values()) / 1e6 / mat   # ← FIX
-    grand_c2 = sum(t.get(col2, 0.0) for t in group_totals.values()) / 1e6 / mat   # ← FIX
-    grand_c3 = sum(t.get(col3, 0.0) for t in group_totals.values()) / 1e6 / mat   # ← FIX
+    grand_c1 = sum(t.get(col1, 0.0) for t in group_totals.values()) / 1e6 / mat
+    grand_c2 = sum(t.get(col2, 0.0) for t in group_totals.values()) / 1e6 / mat
+    grand_c3 = sum(t.get(col3, 0.0) for t in group_totals.values()) / 1e6 / mat
 
     for col_idx, val, fmt in [(B, f"Total {acct_group_val}", None), (C, grand_c1, MILLION_FMT),
                                (D, grand_c2, MILLION_FMT), (E, grand_c3, MILLION_FMT)]:
@@ -932,9 +1023,9 @@ def _s2_table2_materiality(ws, row: int,
     row += 1
 
     for group_name, totals in group_totals.items():
-        v1 = (totals.get(col1, 0.0) / 1e6) / mat   # ← FIX
-        v2 = (totals.get(col2, 0.0) / 1e6) / mat   # ← FIX
-        v3 = (totals.get(col3, 0.0) / 1e6) / mat   # ← FIX
+        v1 = (totals.get(col1, 0.0) / 1e6) / mat
+        v2 = (totals.get(col2, 0.0) / 1e6) / mat
+        v3 = (totals.get(col3, 0.0) / 1e6) / mat
 
         for col_idx, val, fmt in [(B, group_name, None), (C, v1, MILLION_FMT),
                                    (D, v2, MILLION_FMT), (E, v3, MILLION_FMT)]:
@@ -970,7 +1061,6 @@ def write_sheet2_analysis(ws,
     wc(ws, current_row, _START_COL, "Figures in $ M", font=ITALIC, align=LEFT)
     current_row += 2
 
-    # Table 1 — Sept 2025 vs June 2025
     current_row, t1_first, t1_last = _s2_type_of_accounts_table(
         ws                 = ws,
         row                = current_row,
@@ -985,7 +1075,6 @@ def write_sheet2_analysis(ws,
         acct_group_val     = acct_group_val,
     )
 
-    # Table 1.1 — Sept 2025 vs Sept 2024
     current_row, t11_first, t11_last = _s2_type_of_accounts_table(
         ws                 = ws,
         row                = current_row,
@@ -1000,7 +1089,6 @@ def write_sheet2_analysis(ws,
         acct_group_val     = acct_group_val,
     )
 
-    # Bar chart — Type of Accounts vs Time (Sept25 / June25 / Sept24)
     write_type_accounts_time_comparison_bar(
         ws=ws, label_col=_S2_B,
         t1_first=t1_first, t1_last=t1_last, col_cur=_S2_C, col_pri1=_S2_D,
@@ -1010,7 +1098,6 @@ def write_sheet2_analysis(ws,
         chart_title=f"{acct_group_val} — Carrying Value by Period",
     )
 
-    # Table 2 — Materiality Multiple (3 date columns)
     current_row = _s2_table2_materiality(
         ws, current_row, group_totals, cfg, acct_group_val
     )
