@@ -15,20 +15,23 @@ def write_type_accounts_time_comparison_bar(
     chart.type     = "col"
     chart.grouping = "clustered"
     chart.title    = chart_title
-    chart.width    = 30
+    chart.width    = 32   # Increased slightly to fit right-side legend
     chart.height   = 20
-    chart.legend   = _legend("b")
+    
+    # MOVE LEGEND TO THE RIGHT so it doesn't overlap long X-axis labels
+    chart.legend   = _legend("r")
 
-    # ------------------------------------------------------------------
-    # 2. Bar spacing 
-    # ------------------------------------------------------------------
     chart.gapWidth = 219
     chart.overlap  = -100
 
+    # Ensure no manual layout forces overlap
+    chart.plot_area.layout = None
+
     # ------------------------------------------------------------------
     # 3. Y-axis
+    # REMOVED title to prevent overlapping with tick numbers
     # ------------------------------------------------------------------
-    chart.y_axis.title          = "Carrying Value ($ M)"
+    chart.y_axis.title          = None 
     chart.y_axis.numFmt         = "#,##0.0"
     chart.y_axis.delete         = False
     chart.y_axis.majorGridlines = ChartLines()
@@ -39,8 +42,9 @@ def write_type_accounts_time_comparison_bar(
 
     # ------------------------------------------------------------------
     # 4. X-axis
+    # REMOVED title to prevent overlapping with the long category names
     # ------------------------------------------------------------------
-    chart.x_axis.title         = "Type of Accounts"
+    chart.x_axis.title         = None 
     chart.x_axis.delete        = False
     chart.x_axis.tickLblPos    = "low"
     chart.x_axis.noMultiLvlLbl = 0
