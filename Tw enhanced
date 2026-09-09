@@ -22,10 +22,6 @@ TEMPLATE_PATH = (
     "Broadridge_-_Risk_Assessment.zip/Risk_Assessment_FY_26_Template_Copy1.xlsx"
 )
 
-OUTPUT_DIRECTORY = (
-    "User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/Output"
-)
-
 # ══════════════════════════════════════════════════════════════════════════════
 # HEADER DATE  ← update each period
 # ══════════════════════════════════════════════════════════════════════════════
@@ -842,23 +838,6 @@ def write_sheet1_summary(ws, df: pd.DataFrame,
     current_row = write_s1_table2(ws, current_row, group_totals,
                                   TABLE_CONFIG, acct_group_val)
 
-    # Charts — pies feed off Table1's cur/prior cols; bar sits below fig3/4
-    write_all_charts(
-        ws              = ws,
-        first_data_row  = t1_first,
-        last_data_row   = t1_last,
-        label_col       = _START_COL,
-        cur_val_col     = _START_COL + 1,   # Table1 col C
-        cur_label       = TABLE_CONFIG["label_current"],
-        pri1_val_col    = _START_COL + 2,   # Table1 col D
-        pri1_label      = TABLE_CONFIG["label_prior"],
-        cur_period      = TABLE_CONFIG["label_current"],
-        pri1_period     = TABLE_CONFIG["label_prior"],
-        anchor_fig1     = "B12", anchor_fig2 = "L12",
-        anchor_fig3     = "B42", anchor_fig4 = "L42",
-        anchor_bar      = "B70",   # skipped: row-height math, add if template changes
-    )
-
     print(f"  ✅ Summary sheet fully written — last row: {current_row}")
     print(f"     Groups: {list(group_totals.keys())}")
     return group_totals
@@ -950,24 +929,93 @@ def _s2_type_of_accounts_table(
 # SHEET 2 — BAR: Type of Accounts vs Time
 # ══════════════════════════════════════════════════════════════════════════════
 
+from openpyxl.chart        import BarChart, Reference
+from openpyxl.chart.axis   import ChartLines
+from openpyxl.chart.layout import Layout, ManualLayout
+from openpyxl.chart.series import SeriesLabel
+
+
 def write_type_accounts_time_comparison_bar(
         ws, label_col: int,
         t1_first: int, t1_last: int, col_cur: int, col_pri1: int,
         cur_label: str, pri1_label: str,
         t11_first: int, t11_last: int, col_pri2: int, pri2_label: str,
         chart_title: str, anchor: str = None) -> None:
+
     if anchor is None:
         anchor = f"B{max(t1_last, t11_last) + 2}"
 
-    chart = BarChart()
-    chart.type               = "col"
-    chart.grouping           = "clustered"
-    chart.title               = chart_title
-    chart.y_axis.numFmt       = "#,##0.0"
-    chart.x_axis.tickLblPos   = "low"
-    chart.width, chart.height = 28, 14
-    chart.legend               = _legend("b")
+    # ------------------------------------------------------------------
+    # 1. Base chart object
+    # ------------------------------------------------------------------
+    chart          = BarChart()
+    chart.type     = "col"
+    chart.grouping = "clustered"
+    chart.title    = chart_title
+    chart.width    = 30
+    chart.height   = 20
+    chart.legend   = _legend("b")
 
+    # ------------------------------------------------------------------
+    # 2. Bar spacing (native openpyxl attributes)
+    # ------------------------------------------------------------------
+    chart.gapWidth = 219
+    chart.overlap  = -100
+
+    # ------------------------------------------------------------------
+    # 3. Plot-area manual layout — KEY FIX
+    #
+    #    The previous values were too tight, causing:
+    #      • Y-axis title  → overlapping tick values  (x too small)
+    #      • X-axis title  → overlapping legend        (h too large)
+    #
+    #    layoutTarget="inner" means x/y/w/h describe the INNER plot
+    #    rectangle only, so axis titles and legend live outside it.
+    #    Pushing the inner box inward gives each label its own space.
+    #
+    #    x = 0.18  →  18 % left margin  (Y-axis title + tick labels)
+    #    y = 0.08  →   8 % top  margin  (chart title)
+    #    w = 0.72  →  72 % plot width   (leaves 10 % right padding)
+    #    h = 0.60  →  60 % plot height  (40 % bottom = X-axis title
+    #                                    + category labels + legend)
+    # ------------------------------------------------------------------
+    chart.plot_area.layout = Layout(
+        manualLayout=ManualLayout(
+            layoutTarget = "inner",
+            xMode        = "factor",
+            yMode        = "factor",
+            wMode        = "factor",
+            hMode        = "factor",
+            x = 0.38,   # ← increased from 0.10 → fixes Y-axis title overlap
+            y = 0.12,   # ← slightly more top room for chart title
+            w = 0.72,   # ← slightly narrower to complement x increase
+            h = 0.60,   # ← reduced from 0.70 → fixes X-axis title / legend overlap
+        )
+    )
+
+    # ------------------------------------------------------------------
+    # 4. Y-axis
+    # ------------------------------------------------------------------
+    chart.y_axis.title          = "Carrying Value ($ M)"
+    chart.y_axis.numFmt         = "#,##0.0"
+    chart.y_axis.delete         = False
+    chart.y_axis.majorGridlines = ChartLines()
+    chart.y_axis.tickLblPos     = "nextTo"
+    chart.y_axis.scaling.min    = 0
+    chart.y_axis.scaling.max    = 350
+    chart.y_axis.majorUnit      = 50
+
+    # ------------------------------------------------------------------
+    # 5. X-axis
+    # ------------------------------------------------------------------
+    chart.x_axis.title         = "Type of Accounts"
+    chart.x_axis.delete        = False
+    chart.x_axis.tickLblPos    = "low"
+    chart.x_axis.noMultiLvlLbl = 0
+
+    # ------------------------------------------------------------------
+    # 6. Series
+    # ------------------------------------------------------------------
     cats = Reference(ws, min_col=label_col, min_row=t1_first, max_row=t1_last)
 
     specs = [
@@ -975,17 +1023,16 @@ def write_type_accounts_time_comparison_bar(
         (Reference(ws, min_col=col_pri1, min_row=t1_first,  max_row=t1_last),  pri1_label, BAR_COLORS[2]),
         (Reference(ws, min_col=col_pri2, min_row=t11_first, max_row=t11_last), pri2_label, BAR_COLORS[3]),
     ]
+
     for idx, (data, label, color) in enumerate(specs):
         chart.add_data(data, titles_from_data=False)
-        s = chart.series[idx]
+        s       = chart.series[idx]
         s.title = SeriesLabel(v=label)
         s.dLbls = _bar_labels()
         _color_bar_series(s, color)
+
     chart.set_categories(cats)
-
     ws.add_chart(chart, anchor)
-    print(f"  ✅ Bar chart '{chart_title}' → '{anchor}'")
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHEET 2 — TABLE 2: Materiality Multiple
@@ -1048,12 +1095,20 @@ def _s2_table2_materiality(ws, row: int,
 # SHEET 2 — MAIN WRITER
 # ══════════════════════════════════════════════════════════════════════════════
 
+_PIE_GRID = [
+    ("H",  0),   # slot 0 — Fig 1, top-left
+    ("S",  0),   # slot 1 — Fig 2, top-right
+    ("H", 26),   # slot 2 — Fig 3, bottom-left
+    ("H", 52),   # slot 3 — Fig 4, bottom-right
+]
+
+
 def write_sheet2_analysis(ws,
                           group_totals: "OrderedDict[str, dict]",
                           acct_group_val: str) -> None:
     cfg = SHEET2_CONFIG
 
-    apply_white_background_s2(ws, n_rows=250)
+    apply_white_background_s2(ws, n_rows=350)
     write_sheet_header(ws, acct_group_val)
 
     current_row = write_materiality_box(ws, 7, cfg)
@@ -1061,6 +1116,7 @@ def write_sheet2_analysis(ws,
     wc(ws, current_row, _START_COL, "Figures in $ M", font=ITALIC, align=LEFT)
     current_row += 2
 
+    # ── Table 1  (e.g. Sept 2025 vs June 2025) ───────────────────────────────
     current_row, t1_first, t1_last = _s2_type_of_accounts_table(
         ws                 = ws,
         row                = current_row,
@@ -1075,6 +1131,7 @@ def write_sheet2_analysis(ws,
         acct_group_val     = acct_group_val,
     )
 
+    # ── Table 1.1  (e.g. Sept 2025 vs Sept 2024) ─────────────────────────────
     current_row, t11_first, t11_last = _s2_type_of_accounts_table(
         ws                 = ws,
         row                = current_row,
@@ -1089,22 +1146,94 @@ def write_sheet2_analysis(ws,
         acct_group_val     = acct_group_val,
     )
 
-    write_type_accounts_time_comparison_bar(
-        ws=ws, label_col=_S2_B,
-        t1_first=t1_first, t1_last=t1_last, col_cur=_S2_C, col_pri1=_S2_D,
-        cur_label=cfg["t1_label_current"], pri1_label=cfg["t1_label_prior"],
-        t11_first=t11_first, t11_last=t11_last, col_pri2=_S2_D,
-        pri2_label=cfg["t1_1_label_prior"],
-        chart_title=f"{acct_group_val} — Carrying Value by Period",
-    )
-
+    # ── Table 2: Materiality Multiple ────────────────────────────────────────
     current_row = _s2_table2_materiality(
         ws, current_row, group_totals, cfg, acct_group_val
     )
 
-    print(f"  ✅ Analysis sheet fully written — last row: {current_row}")
-    print(f"     Groups in all tables: {list(group_totals.keys())}")
+    # ══════════════════════════════════════════════════════════════════════════
+    # PIE CHARTS  — deduplicated by col_key
+    #
+    # Candidates (in priority order):
+    #   T1  current  →  col _S2_C, rows t1_first  : t1_last
+    #   T1  prior    →  col _S2_D, rows t1_first  : t1_last
+    #   T1.1 current →  col _S2_C, rows t11_first : t11_last
+    #   T1.1 prior   →  col _S2_D, rows t11_first : t11_last
+    #
+    # If T1 and T1.1 share a col_key (e.g. both current = "09/30/2025"),
+    # the duplicate candidate is silently skipped → only 3 pies rendered
+    # instead of 4.
+    # ══════════════════════════════════════════════════════════════════════════
 
+    pie_candidates = [
+        (cfg["t1_col_current"],   cfg["t1_label_current"],   _S2_C, t1_first,  t1_last),
+        (cfg["t1_col_prior"],     cfg["t1_label_prior"],     _S2_D, t1_first,  t1_last),
+        (cfg["t1_1_col_current"], cfg["t1_1_label_current"], _S2_C, t11_first, t11_last),
+        (cfg["t1_1_col_prior"],   cfg["t1_1_label_prior"],   _S2_D, t11_first, t11_last),
+    ]
+
+    # ── Deduplicate by col_key, preserving order ──────────────────────────────
+    seen_keys  = set()
+    unique_pies = []                 # [(label, val_col, first_row, last_row), ...]
+    for col_key, label, val_col, first_row, last_row in pie_candidates:
+        if col_key not in seen_keys:
+            seen_keys.add(col_key)
+            unique_pies.append((label, val_col, first_row, last_row))
+
+    duplicates_removed = len(pie_candidates) - len(unique_pies)
+    print(f"\n  📊 Pie charts: {len(unique_pies)} unique "
+          f"({duplicates_removed} duplicate(s) suppressed)")
+
+    # ── Render unique pies into the 2-column grid ─────────────────────────────
+    pie_top_row = 2
+
+    for slot, (label, val_col, first_row, last_row) in enumerate(unique_pies):
+        col_letter, row_offset = _PIE_GRID[slot]
+        anchor = f"{col_letter}{pie_top_row + row_offset}"
+
+        chart = _build_pie(
+            ws             = ws,
+            fig_num        = slot + 1,
+            title          = f"{label} — Composition",
+            first_data_row = first_row,
+            last_data_row  = last_row,
+            label_col      = _S2_B,
+            val_col        = val_col,
+            chart_width    = 16,
+            chart_height   = 12,
+        )
+        ws.add_chart(chart, anchor)
+        print(f"  ✅ Fig {slot + 1} Pie  '{label}' → '{anchor}'  "
+              f"(rows {first_row}:{last_row}, col {val_col})")
+
+    # ── Bar anchor: clear both possible pie rows regardless of actual count ───
+    #   ≤ 2 pies → only top row used  → bar after row_offset 0  (+27)
+    #   3-4 pies → both rows used     → bar after row_offset 26 (+53)
+    pie_rows_used  = 2 if len(unique_pies) >= 3 else 1
+    bar_top_row    = pie_top_row + (pie_rows_used * 26) + 1
+
+    # ── Three-period bar chart ────────────────────────────────────────────────
+    write_type_accounts_time_comparison_bar(
+        ws          = ws,
+        label_col   = _S2_B,
+        t1_first    = t1_first,
+        t1_last     = t1_last,
+        col_cur     = _S2_C,
+        col_pri1    = _S2_D,
+        cur_label   = cfg["t1_label_current"],
+        pri1_label  = cfg["t1_label_prior"],
+        t11_first   = t11_first,
+        t11_last    = t11_last,
+        col_pri2    = _S2_D,
+        pri2_label  = cfg["t1_1_label_prior"],
+        chart_title = f"{acct_group_val} — Carrying Value by Period",
+        anchor      = f"H{bar_top_row}",
+    )
+
+    print(f"\n  ✅ Analysis sheet fully written — last table row : {current_row}")
+    print(f"     Pie top anchor : B{pie_top_row}  |  "
+          f"Bar anchor : B{bar_top_row}")
+    print(f"     Groups : {list(group_totals.keys())}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SHEET 3 — TICKMARKS  (stub)
