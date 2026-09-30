@@ -198,7 +198,7 @@ def sigma(key, codes, label):
     return Row("sigma", key, label, codes=codes)
 
 def calc(key, label, formula, bold=True):
-    """Value = formula over other row keys. Shows an 'Rx' symbol."""
+    """Value = Excel formula over other row keys. Shows an 'Rx' symbol."""
     return Row("calc", key, label, formula=formula, bold=bold)
 
 def total(key, label, formula):
@@ -219,7 +219,7 @@ class Table:
     note_only: bool = False       # True = title + empty note box, no rows
 
 
-# Formulas: use + and - with row keys, e.g. "cor + sga"  or  "rev - tot_opex".
+# Formulas: use + and - with row keys of rows ABOVE, e.g. "cor + sga" or "rev - tot_opex".
 # Sigma codes: join with +, e.g. "D+E".
 IS_TABLE = Table("Income Statement", has_qtd=True, rows=[
     sigma("rev",       "A",   "Revenues"),
@@ -374,7 +374,7 @@ class SideTable:
 
 @dataclass
 class CheckDigit:
-    """Row under the last table: value = formula, should be zero."""
+    """Row under the last table: value = Excel formula over row keys, should be zero."""
     label:   str
     formula: str
 
@@ -522,25 +522,24 @@ def load_lookups(current_df, prior_df):
     return {"ytd": ytd, "qtd": qtd, "prior": prior}
 
 
-def evaluate(formula, lookup, done):
-    """
-    'cor + sga - tax' -> number.
-    Each name is looked up in `done` (rows already calculated) first,
-    then in `lookup` (grouping codes). Unknown name counts as 0.
-    """
-    result = ZERO
-    for sign, name in re.findall(r"([+-]?)\s*(\w+)", formula):
-        value = done.get(name)
-        if value is None:
-            value = lookup.get(name, ZERO)
-        result += -value if sign == "-" else value
-    return result
+TERM = re.compile(r"([+-]?)\s*(\w+)")      # one "+ name" / "- name" piece of a formula
 
 
-def resolve(row, lookup, done):
-    if row.kind == "sigma":
-        return sum((lookup.get(c, ZERO) for c in row.codes.split("+")), ZERO)
-    return evaluate(row.formula, lookup, done)      # calc / total
+def sigma_value(row, lookup):
+    """Sum of the row's grouping codes."""
+    return sum((lookup.get(c, ZERO) for c in row.codes.split("+")), ZERO)
+
+
+def excel_formula(formula, col, rows, lookup):
+    """
+    'cor + sga - tax' -> '=F12+F13-F19'   (col = column letter, rows = {key: row number}).
+    A name that is not a row key is treated as a grouping code and inserted as a number.
+    """
+    parts = []
+    for sign, name in TERM.findall(formula):
+        ref = f"{col}{rows[name]}" if name in rows else str(lookup.get(name, ZERO))
+        parts.append(("-" if sign == "-" else "+") + ref)
+    return "=" + "".join(parts).lstrip("+")
 
 
 # ── 2B. Excel drawing helpers ─────────────────────────────────────────────────
@@ -721,10 +720,15 @@ def write_header(ws, r, C, labels, has_qtd, height, tags=True):
 
 
 def write_amounts(ws, r, C, bal_attr, rnd_attr, val, font, fmt):
-    """Raw-dollar cell + green rounded-in-millions cell."""
-    put(ws, r, getattr(C, bal_attr), money(val), font=font, align=ALIGN_RIGHT, fmt=fmt)
-    rounded = None if val is None else float(round(val / MILLION, ROUND_DIGITS))
-    put(ws, r, getattr(C, rnd_attr), rounded, font=font, fill=FILL_GREEN,
+    """Raw-dollar cell + green rounded-in-millions cell. val = number or '=formula'."""
+    bal_col, rnd_col = getattr(C, bal_attr), getattr(C, rnd_attr)
+    if isinstance(val, str):                                   # Excel formula
+        rounded = f"=ROUND({get_column_letter(bal_col)}{r}/{MILLION},{ROUND_DIGITS})"
+    else:
+        rounded = None if val is None else float(round(val / MILLION, ROUND_DIGITS))
+        val = money(val)
+    put(ws, r, bal_col, val, font=font, align=ALIGN_RIGHT, fmt=fmt)
+    put(ws, r, rnd_col, rounded, font=font, fill=FILL_GREEN,
         align=ALIGN_RIGHT, fmt=ROUNDED_FMT)
 
 
@@ -737,7 +741,7 @@ def write_data_row(ws, r, C, row, ytd, qtd, fmt):
     put(ws, r, C.symbol, symbol, font=FONT_SYM_RED if is_calc else FONT_SYM_BLUE)
     put(ws, r, C.code, row.codes or None, font=FONT_CODE)
     put(ws, r, C.ref, row.label, font=font, align=ALIGN_LEFT)
-    write_amounts(ws, r, C, "bal", "rnd", ytd, font, fmt)
+    write_amounts(ws, r, C, "bal", "rnd", ytd, font, fmt)      # ytd / qtd: number or '=formula'
     if qtd is not None:
         write_amounts(ws, r, C, "qbal", "qrnd", qtd, font, fmt)
 
@@ -753,8 +757,8 @@ def write_py_row(ws, r, C, row, fmt):
         border=("medium", RED))
 
 
-def write_table(ws, spec, table, row, look, done):
-    """Draw one table starting at `row`. Returns the next free row."""
+def write_table(ws, spec, table, row, look, rows):
+    """Draw one table starting at `row`. `rows` = {row key: Excel row number}. Returns the next free row."""
     C = MAIN_COLS
     last = C.qrnd if table.has_qtd else C.rnd
     ws.row_dimensions[row].height = H_BAND
@@ -785,11 +789,15 @@ def write_table(ws, spec, table, row, look, done):
         elif rw.kind == "py":
             write_py_row(ws, r, C, rw, spec.balance_fmt)
         else:                                             # sigma / calc / total
-            values = {}
-            for p in periods:
-                values[p] = resolve(rw, look[p], done[p])
-                done[p][rw.key] = values[p]
-            write_data_row(ws, r, C, rw, values["ytd"], values.get("qtd"),
+            rows[rw.key] = r
+            vals = {}
+            for p, attr in zip(periods, ("bal", "qbal")):
+                if rw.kind == "sigma":
+                    vals[p] = sigma_value(rw, look[p])         # number from the TB
+                else:                                          # Excel formula
+                    col = get_column_letter(getattr(C, attr))
+                    vals[p] = excel_formula(rw.formula, col, rows, look[p])
+            write_data_row(ws, r, C, rw, vals["ytd"], vals.get("qtd"),
                            spec.balance_fmt)
         r += 1
     return r
@@ -807,12 +815,12 @@ def write_side_table(ws, spec, look):
                    value, None, spec.balance_fmt)
 
 
-def write_check_digit(ws, r, spec, look, done):
+def write_check_digit(ws, r, spec, look, rows):
     C = MAIN_COLS
     ws.row_dimensions[r].height = H_ROW
     put(ws, r, C.ref, spec.check.label, font=FONT_CHECK, end_col=C.bal)
-    diff = evaluate(spec.check.formula, look["ytd"], done["ytd"])
-    put(ws, r, C.rnd, float(diff), align=ALIGN_RIGHT, fmt=CHECK_FMT)
+    formula = excel_formula(spec.check.formula, get_column_letter(C.bal), rows, look["ytd"])
+    put(ws, r, C.rnd, formula, align=ALIGN_RIGHT, fmt=CHECK_FMT)
 
 
 def build_tieout_sheet(wb, spec, look):
@@ -836,16 +844,16 @@ def build_tieout_sheet(wb, spec, look):
     for r in range(6, spec.first_table_row):
         ws.row_dimensions[r].height = H_SPACER
 
-    # tables. `done` remembers calculated rows so formulas can use them.
-    done = {"ytd": {}, "qtd": {}}
+    # tables. `rows` remembers where each row landed so formulas can point at it.
+    rows = {}
     row = spec.first_table_row
     for table in spec.tables:
-        end = write_table(ws, spec, table, row, look, done)
+        end = write_table(ws, spec, table, row, look, rows)
         row = end + TABLE_GAP_ROWS
 
     if spec.check:
         ws.row_dimensions[end + 1].height = H_SPACER
-        write_check_digit(ws, end + 2, spec, look, done)
+        write_check_digit(ws, end + 2, spec, look, rows)
     if spec.side:
         write_side_table(ws, spec, look)
 
@@ -865,10 +873,9 @@ def build_workbook():
 
 
 def selfcheck():
-    """Fails fast if formula parsing or tab naming breaks."""
-    d = {"a": Decimal(5), "b": Decimal(2)}
-    assert evaluate("a - b + c", {"c": Decimal(1)}, d) == Decimal(4)
-    assert evaluate("x", {}, {}) == ZERO
+    """Fails fast if formula building or tab naming breaks."""
+    assert excel_formula("a - b + c", "F", {"a": 11, "b": 12}, {"c": Decimal(3)}) == "=F11-F12+3"
+    assert excel_formula("a + b", "G", {"a": 5, "b": 6}, {}) == "=G5+G6"
     assert tb_sheet_name("As Of Period: 9-26 (3/31/2026)") == "Trial Balance 9-26"
     keys = [r.key for t in SHEET_3.tables for r in t.rows if r.key]
     assert len(keys) == len(set(keys)), "duplicate row keys in SHEET_3"
