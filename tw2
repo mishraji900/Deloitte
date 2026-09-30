@@ -1,2005 +1,881 @@
+"""
+TB TieOut workbook builder  (Databricks notebook / script)
+
+WHERE TO EDIT
+  PART 1  CONFIG  -> everything you will ever want to change. Edit here.
+  PART 2  ENGINE  -> drawing logic. Leave alone unless the layout itself changes.
+
+COMMON JOBS
+  New period        -> TB_SHEETS, CURRENT_TB, PRIOR_TB, PERIOD_* labels   (1A, 1C)
+  New account line  -> add one sigma(...) / calc(...) line in a table      (1F)
+  New tie-out tab   -> copy a TieOutSheet(...) in 1G, add to TIEOUT_SHEETS
+  Colours / formats -> 1D          Row / column positions -> 1E
+"""
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
-from typing import Any
 
 from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1 — Helpers (unchanged)
+# PART 1 — CONFIG
 # ══════════════════════════════════════════════════════════════════════════════
 
-def normalize_text(text):
-    if text is None:
-        return ""
-    return str(text).strip().lower()
+# ── 1A. Inputs and output ─────────────────────────────────────────────────────
+CURRENT_TB  = TB_03312026          # current period  -> YTD numbers
+PRIOR_TB    = TB_12312025          # prior period    -> QTD = CURRENT - PRIOR
+OUTPUT_FILE = f"{OUTPUT_DIRECTORY}/TB TieOut.xlsx"
 
-def records_from(dataframe):
-    if hasattr(dataframe, "toPandas"):
-        return dataframe.toPandas().to_dict(orient="records")
-    if hasattr(dataframe, "to_dict"):
-        return dataframe.to_dict(orient="records")
-    if isinstance(dataframe, list):
-        return dataframe
-    raise TypeError(f"Unsupported type for records_from: {type(dataframe)}")
+# One "Trial Balance" tab per line: (dataframe, text shown in the green banner).
+# Tab name is built from the text:  "As Of Period: 9-26 (...)" -> "Trial Balance 9-26"
+TB_SHEETS = [
+    (TB_03312026, "As Of Period: 9-26 (3/31/2026)"),
+    (TB_12312025, "As Of Period: 6-26 (12/31/2025)"),
+]
+TB_SHEET_PREFIX = "Trial Balance"
 
-def dataframe_columns(dataframe):
-    if hasattr(dataframe, "columns"):
-        return list(dataframe.columns)
-    records = records_from(dataframe)
-    return list(records[0].keys()) if records else []
+# ── 1B. Dataframe column names and markers ────────────────────────────────────
+ACCOUNT_COL      = "Account"
+ROW_ID_COL       = "row_id"
+LAST_ENTITY_COL  = "BR015"                         # entity columns stop here
+GROUP_CODE_COL   = "Grouping Code"                 # used by tie-out lookups
+TOTAL_COL        = "Total Consolidated Balances"   # used by tie-out lookups
+BS_MARKER        = "balance sheet"                 # row where Balance Sheet starts
+IS_MARKER        = "income statement"              # row where Income Statement starts
+TB_SECTION_BS    = "Balance Sheet"                 # section titles on TB tabs
+TB_SECTION_IS    = "Income Statement"
+
+
+@dataclass
+class PostCol:
+    """Columns that come after the entity columns."""
+    name:    str    # column name in the dataframe
+    header:  str    # header text in Excel
+    in_main: bool   # True = part of main table, False = separate side table
+    is_code: bool   # True = text column (red bold), False = money column
+
+
+POST_COLS = [   # order here = order in Excel
+    PostCol("Total Consolidated Balances",
+            "Total Consolidated Balances", True, False),
+    PostCol("D&T Check",
+            "D&T Check", True, False),
+    PostCol("Total Consolidated Balances (Rounded in millions)",
+            "Total Consolidated Balances\n(Rounded in millions)", False, False),
+    PostCol("Grouping Code",
+            "Grouping Code", False, True),
+]
+
+# ── 1C. Text ──────────────────────────────────────────────────────────────────
+# Trial Balance tabs. {as_of} is replaced with the text from TB_SHEETS.
+# (text, font size, bold, green border)   -> rows 1, 2, 3, 4
+TB_BANNERS = [
+    ("Broadridge Financial Solutions Inc", 12, True,  False),
+    ("Broadridge Trial Balance",           11, True,  False),
+    ("{as_of}",                            11, False, True),
+    ("Currency - USD",                     11, True,  False),
+]
+TB_NOTE_TEXT = "Note:  Fill The Notes As Required."
+
+# Tie-out tabs
+COMPANY            = "Broadridge Financial Solutions, Inc."
+TIEOUT_TITLE       = "Q3\u201926 10-Q Tie Out"
+PERIOD_LONG        = "3/31/2026"
+PERIOD_SHORT       = "3/31/26"
+PRIOR_PERIOD_SHORT = "12/31/25"
+
+# ── 1D. Look and feel ─────────────────────────────────────────────────────────
+FONT_NAME = "Calibri"
+
+WHITE, BLACK, RED = "FFFFFFFF", "FF000000", "FFFF0000"
+NAVY       = "FF1F3864"     # (kept for reference, not used today)
+LIGHT_BLUE = "FFBDD7EE"
+GREY       = "FFD9D9D9"
+BRIGHT_GREEN = "FF92D050"   # rounded cells
+GREEN      = "FF00B050"     # green outlines
+BLUE       = "FF0070C0"
+
+MONEY_FMT      = '#,##0.00;(#,##0.00);0.00'
+ACCOUNTING_FMT = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
+ROUNDED_FMT    = '#,##0.0;(#,##0.0);"-"'
+CHECK_FMT      = '#,##0;(#,##0)'
+
+MILLION      = Decimal("1000000")
+ROUND_DIGITS = 1                     # rounded columns show this many decimals
+
+# Row heights
+H_ROW, H_SMALL, H_SPACER, H_BAND, H_SUBHDR = 15, 14, 6, 18, 22
+H_TITLE_LINE = 16
+
+
+def make_font(color=BLACK, size=10, bold=False, italic=False, underline=None):
+    return Font(name=FONT_NAME, size=size, bold=bold, italic=italic,
+                color=color, underline=underline)
+
+
+def make_fill(color):
+    return PatternFill(fill_type="solid", fgColor=color)
+
+
+def make_align(h="center", v="center", wrap=False):
+    return Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+
+
+FONT_BODY       = make_font()
+FONT_BOLD       = make_font(bold=True)
+FONT_HDR        = make_font(bold=True)
+FONT_HDR_RED    = make_font(RED, bold=True)
+FONT_RED_BOLD   = make_font(RED, bold=True)
+FONT_SECTION    = make_font(size=11, bold=True, underline="single")
+FONT_ITALIC     = make_font(bold=True, italic=True)
+FONT_SYM_BLUE   = make_font(BLUE, size=12, bold=True)     # Σ
+FONT_SYM_RED    = make_font(RED, bold=True)               # Rx / PY
+FONT_CODE       = make_font(BLUE, bold=True)              # grouping code text
+FONT_PY_REF     = make_font(RED, size=9, bold=True)
+FONT_CHECK      = make_font(BLUE, italic=True)
+
+FILL_WHITE      = make_fill(WHITE)
+FILL_BLUE       = make_fill(LIGHT_BLUE)
+FILL_GREY       = make_fill(GREY)
+FILL_GREEN      = make_fill(BRIGHT_GREEN)
+
+ALIGN_CENTER      = make_align()
+ALIGN_CENTER_WRAP = make_align(wrap=True)
+ALIGN_LEFT        = make_align("left")
+ALIGN_RIGHT       = make_align("right")
+ALIGN_LEFT_TOP    = make_align("left", "top", wrap=True)
+ALIGN_LEFT_BOTTOM = make_align("left", "bottom")
+
+# ── 1E. Layout ────────────────────────────────────────────────────────────────
+# Trial Balance tabs
+COL_ACCOUNT        = 2      # column B
+TB_FIRST_TABLE_ROW = 12
+TB_NOTE_ROWS       = (6, 9)          # first, last row of merged note box
+TB_NOTE_COLS       = (2, 6)          # first, last column of note box
+TB_NOTE_TOP_HEIGHT = 40
+TB_HEADER_HEIGHT   = 55
+TB_COL_WIDTHS      = {"spacer": 2, "account": 55, "other": 18}
+TB_SIDE_GAP        = 2               # empty columns before the side table
+
+# Tie-out tabs
+TABLE_GAP_ROWS = 2                   # empty rows between tables
+
+
+@dataclass
+class Cols:
+    """Column numbers used by one table block."""
+    symbol: int; code: int; ref: int; bal: int; rnd: int
+    qbal: int = 0; qrnd: int = 0
+
+
+MAIN_COLS = Cols(symbol=2, code=3, ref=4, bal=6, rnd=7, qbal=8, qrnd=9)
+SIDE_COLS = Cols(symbol=9, code=10, ref=11, bal=13, rnd=14)
+
+# Amount columns in order: (Cols attribute, source tag under header, red header?)
+AMOUNT_COLUMNS = [
+    ("bal",  "Tab 1",         False),
+    ("rnd",  "Rx",            True),
+    ("qbal", "Tab 1 & Tab 2", False),
+    ("qrnd", "Rx",            True),
+]
+
+# ── 1F. Table building blocks (rarely edited) + the tables themselves ─────────
+@dataclass
+class Row:
+    kind:   str            # sigma | calc | total | subtitle | blank | sub_header | py
+    key:    str = ""       # unique id, other rows use it in formulas
+    label:  str = ""       # text in "References" column
+    codes:  str = ""       # sigma only: grouping codes to add, e.g. "D+E"
+    formula: str = ""      # calc/total only: e.g. "rev - tot_opex"
+    bold:   bool = False
+    py_ref: str = ""       # py only: text shown in the code column
+
+
+def sigma(key, codes, label):
+    """Value = sum of these grouping codes, straight from the trial balance."""
+    return Row("sigma", key, label, codes=codes)
+
+def calc(key, label, formula, bold=True):
+    """Value = formula over other row keys. Shows an 'Rx' symbol."""
+    return Row("calc", key, label, formula=formula, bold=bold)
+
+def total(key, label, formula):
+    """Same as calc but with no symbol (a visual 'Total' line)."""
+    return Row("total", key, label, formula=formula, bold=True)
+
+def py(label, ref):        return Row("py", label=label, py_ref=ref)   # manual entry
+def subtitle(label):       return Row("subtitle", label=label)         # grey band
+def blank():               return Row("blank")                          # small gap
+def sub_header():          return Row("sub_header")                     # repeat column headers
+
+
+@dataclass
+class Table:
+    title:     str
+    rows:      list = field(default_factory=list)
+    has_qtd:   bool = False       # True = YTD + QTD columns, False = YTD only
+    note_only: bool = False       # True = title + empty note box, no rows
+
+
+# Formulas: use + and - with row keys, e.g. "cor + sga"  or  "rev - tot_opex".
+# Sigma codes: join with +, e.g. "D+E".
+IS_TABLE = Table("Income Statement", has_qtd=True, rows=[
+    sigma("rev",       "A",   "Revenues"),
+    sigma("cor",       "B",   "Cost of Revenues"),
+    sigma("sga",       "C",   "Selling, General and Administrative Expenses"),
+    calc ("tot_opex",  "Total Operating Expenses", "cor + sga"),
+    calc ("op_inc",    "Operating Income", "rev - tot_opex", bold=False),
+    sigma("int_exp",   "D+E", "Interest expense, net"),
+    sigma("oth_nonop", "F+G", "Other non-operating income (expenses), net"),
+    calc ("ebit",      "Earnings Before Income Taxes",
+          "op_inc + int_exp + oth_nonop", bold=False),
+    sigma("tax",       "H",   "Provision for Income Taxes"),
+    calc ("net_earn",  "Net Earnings", "ebit - tax"),
+])
+
+FN1_TABLE = Table("FN 1 \u2013 Basis of Presentation", note_only=True)
+
+FN5_TABLE = Table("FN 5 \u2013 Interest Expense, net", has_qtd=True, rows=[
+    sigma("int_borrow", "D", "Interest expense on borrowings"),
+    sigma("int_income", "E", "Interest income"),
+    calc ("int_net",    "Interest Expense, net", "int_borrow + int_income"),
+])
+
+FN8_BALANCE_TABLE = Table(
+    "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs", rows=[
+    sigma("ac",  "AC", "Net Deferred Client Project Cost \u2013 Live"),
+    sigma("ad",  "AD", "Internal/External Deferred Client Project Cost"),
+    calc ("dcc", "Deferred Client Conversion & Start-up Cost", "ac + ad"),
+    sigma("ae",  "AE", "Cash Concession"),
+    total("fn8_total", "Total", "dcc + ae"),
+])
+
+FN8_AMORT_TABLE = Table(
+    "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs "
+    "and Deferred Sales Commissions Amortization", has_qtd=True, rows=[
+    sigma("aa", "AA", "COR \u2013 Amortization \u2013 Conversion"),
+    sigma("ab", "AB", "SG&A \u2013 Amortization \u2013 Other"),
+    calc ("amort_total", "Total Amortization [B]", "aa + ab"),
+])
+
+FN9_TABLE = Table("FN 9 \u2013 Other non-current assets", rows=[
+    subtitle("FN9 \u2013 Other non-current assets"),
+    sigma("fn9_i",   "I", "Long-term investments"),
+    sigma("fn9_m",   "M", "Digital asset"),
+    sigma("fn9_j",   "J", "ROU Assets"),
+    sigma("fn9_l",   "L", "Contract assets"),
+    sigma("fn9_k",   "K", "Deferred sales commissions costs"),
+    sigma("fn9_n",   "N", "Long-term broker fees"),
+    sigma("fn9_o",   "O", "Deferred Data Center Costs"),
+    sigma("fn9_oth", "P+BO+BP+BQ+BR+BS+BT+BU", "Other"),
+    calc ("fn9_tot", "Total other non-current assets",
+          "fn9_i + fn9_m + fn9_j + fn9_l + fn9_k + fn9_n + fn9_o + fn9_oth"),
+    blank(), sub_header(),
+    sigma("fn9_p",  "P",  "Warrant Assets [1]"),
+    sigma("fn9_bu", "BU", "LT Derivative Asset [2]"),
+])
+
+FN10_TABLE = Table("FN 10 \u2013 Payables and Accrued Expenses", rows=[
+    subtitle("FN 10 \u2013 Payables and Accrued Expenses"),
+    sigma("fn10_q", "Q", "Accounts payable"),
+    sigma("fn10_r", "R", "Employee Compensation and Benefits [B]"),
+    sigma("fn10_s", "S", "Accrued Dividend Payable"),
+    sigma("fn10_t", "T", "Accrued Broker Fees"),
+    sigma("fn10_u", "U", "Customer Deposits"),
+    sigma("fn10_v", "V", "Business process outsourcing administration fees"),
+    sigma("fn10_w", "W", "Operating lease liabilities"),
+    sigma("fn10_x", "X", "Accrued Taxes"),
+    sigma("fn10_y", "Y", "Other"),
+    total("fn10_tot", "Total payables and accrued expenses",
+          "fn10_q + fn10_r + fn10_s + fn10_t + fn10_u + fn10_v + fn10_w"
+          " + fn10_x + fn10_y"),
+    blank(), sub_header(),
+    sigma("fn10_af", "AF", "Accrued Liability-Severance Reserve [C]"),
+])
+
+FN12_TABLE = Table("FN 12 \u2013 Other Non-Current Liabilities", rows=[
+    sigma("fn12_ag",   "AG",    "Post Retirement Obligations"),
+    sigma("fn12_ah",   "AH",    "Operating Lease Liabilities"),
+    sigma("fn12_ak",   "AK",    "Software license liabilities"),
+    sigma("fn12_ai",   "AI",    "Non-current income taxes"),
+    sigma("fn12_aj",   "AJ",    "Acquisition related contingencies"),
+    sigma("fn12_alam", "AL+AM", "Other (a)"),
+    total("fn12_tot",  "Total",
+          "fn12_ag + fn12_ah + fn12_ak + fn12_ai + fn12_aj + fn12_alam"),
+    blank(),
+    py("Software license liabilities", "ANA-024  June 30, 2025"),
+    py("Other",                        "ANA-024  June 30, 2025"),
+    blank(), sub_header(),
+    sigma("fn12_al", "AL", "LT Derivative Liability"),
+    blank(), sub_header(),
+    sigma("fn12_an", "AN", "Total Rabbi Trust (A156) [2]"),
+    sigma("fn12_ao", "AO", "SORP/SERP [3]"),
+])
+
+MDA_TABLE = Table(
+    "Financial Condition, Liquidity and Capital Resources (MD&A)", rows=[
+    sigma("mda_bl", "BL", "Domestic cash"),
+    sigma("mda_bm", "BM", "Cash held by foreign subsidiaries"),
+    sigma("mda_bn", "BN", "Cash held by regulated entities"),
+    total("mda_tot", "Total cash and cash equivalents", "mda_bl + mda_bm + mda_bn"),
+])
+
+BS_TABLE = Table("Condensed Consolidated Balance Sheet", rows=[
+    subtitle("Current assets:"),
+    sigma("ap", "AP", "Cash and cash equivalents"),
+    blank(),
+    sigma("aq", "AQ", "Accounts receivable, net"),
+    sigma("ar", "AR", "Other current assets"),
+    total("tca", "Total current assets", "ap + aq + ar"),
+    blank(),
+    sigma("as_", "AS", "Property, plant and equipment, net"),
+    sigma("at", "AT", "Goodwill"),
+    sigma("au", "AU", "Intangible assets, net"),
+    sigma("av", "AV", "Deferred client conversion and start-up costs"),
+    sigma("aw", "AW", "Other non-current assets"),
+    total("ta", "Total assets", "tca + as_ + at + au + av + aw"),
+    blank(), blank(),
+    subtitle("Liabilities and Stockholders' Equity"),
+    subtitle("Current liabilities:"),
+    sigma("ax", "AX", "Current portion of current liability"),
+    sigma("ay", "AY", "Payables and accrued expenses"),
+    sigma("az", "AZ", "Contract Liabilities"),
+    total("tcl", "Total current liabilities", "ax + ay + az"),
+    blank(),
+    sigma("ba", "BA", "Long-term debt, excluding current portion"),
+    sigma("bb", "BB", "Deferred taxes"),
+    sigma("bc", "BC", "Contract Liabilities"),
+    sigma("bd", "BD", "Other non-current liabilities"),
+    total("tl", "Total Liabilities", "tcl + ba + bb + bc + bd"),
+    blank(), blank(), blank(),
+    sigma("be", "BE", "Common stock"),
+    sigma("bf", "BF", "Additional paid-in capital"),
+    sigma("bg", "BG", "Retained earnings"),
+    sigma("bh", "BH", "Treasury stock"),
+    sigma("bi_bj", "BI+BJ", "Accumulated other comprehensive income (loss)"),
+    total("tse", "Total stockholders' equity", "be + bf + bg + bh + bi_bj"),
+    blank(),
+    total("tlse", "Total liabilities and stockholders' equity", "tl + tse"),
+])
+
+# ── 1G. Tie-out tab definitions ───────────────────────────────────────────────
+@dataclass
+class SideTable:
+    """Small extra table drawn to the right of the main table."""
+    caption:   str
+    code:      str        # grouping code to look up
+    label:     str
+    source:    str        # "ytd" | "qtd" | "prior"  (which lookup to use)
+    start_row: int
+    labels:    dict
+
+
+@dataclass
+class CheckDigit:
+    """Row under the last table: value = formula, should be zero."""
+    label:   str
+    formula: str
+
+
+@dataclass
+class TieOutSheet:
+    name:           str
+    header_lines:   list          # (text, size, bold) for rows 1..3
+    intro_text:     str           # row 5
+    intro_fill:     PatternFill
+    first_table_row: int
+    tables:         list
+    labels:         dict          # column header texts
+    col_widths:     dict
+    balance_fmt:    str           # number format of raw-dollar column
+    header_height:  int
+    freeze:         str
+    sub_labels:     dict = None   # header texts for repeated sub-headers (None = same)
+    side:           SideTable = None
+    check:          CheckDigit = None
+
+
+TIEOUT_HEADER_LINES = [
+    (COMPANY,      11, True),
+    (TIEOUT_TITLE, 11, True),
+    (PERIOD_LONG,  10, False),
+]
+
+S3_LABELS = {
+    "code": "Grouping Code", "ref": "References",
+    "bal":  f"YTD {PERIOD_SHORT}\nBalances (in millions)",
+    "rnd":  f"YTD {PERIOD_SHORT}\nRounded (in millions)",
+    "qbal": f"QTD {PERIOD_SHORT}\nBalances (in millions)",
+    "qrnd": f"QTD {PERIOD_SHORT}\nRounded (in millions)",
+}
+S3_SUB_LABELS = {**S3_LABELS,
+    "code": "Grouping code", "ref": "Reference",
+    "rnd": "Rounded\n(In millions)", "qrnd": "QTD Rounded\n(In millions)",
+}
+S4_LABELS = {
+    "code": "Grouping Code", "ref": "References",
+    "bal":  f"{PERIOD_SHORT}\nBalances\n(in millions)",
+    "rnd":  "Rounded\n(In millions)",
+}
+S4_SIDE_LABELS = {
+    "code": "Grouping Code", "ref": "References",
+    "bal":  f"YTD {PRIOR_PERIOD_SHORT}\nBalances\n(In Millions)",
+    "rnd":  "Rounded\n(In Millions)",
+}
+
+SHEET_3 = TieOutSheet(
+    name="3) IS Tie Out",
+    header_lines=TIEOUT_HEADER_LINES,
+    intro_text="Introduction and Procedures",
+    intro_fill=FILL_GREY,
+    first_table_row=8,
+    tables=[IS_TABLE, FN1_TABLE, FN5_TABLE, FN8_BALANCE_TABLE, FN8_AMORT_TABLE,
+            FN9_TABLE, FN10_TABLE, FN12_TABLE, MDA_TABLE],
+    labels=S3_LABELS,
+    sub_labels=S3_SUB_LABELS,
+    col_widths={1: 2, 2: 6, 3: 18, 4: 48, 5: 3, 6: 20, 7: 16, 8: 20, 9: 16},
+    balance_fmt=MONEY_FMT,
+    header_height=30,
+    freeze="D11",
+)
+
+SHEET_4 = TieOutSheet(
+    name="4) Balance Sheet Tieout",
+    header_lines=TIEOUT_HEADER_LINES,
+    intro_text=("Note: This tab is prepared by D&T to tie out the balance sheet "
+                "within the Form 10-Q maintained at"),
+    intro_fill=FILL_WHITE,
+    first_table_row=7,
+    tables=[BS_TABLE],
+    labels=S4_LABELS,
+    col_widths={1: 2, 2: 6, 3: 10, 4: 46, 5: 2, 6: 20, 7: 14, 8: 3,
+                9: 6, 10: 10, 11: 36, 12: 2, 13: 18, 14: 14},
+    balance_fmt=ACCOUNTING_FMT,
+    header_height=28,
+    freeze="D10",
+    side=SideTable("[1] Allowance for doubtful accounts:", "BK",
+                   "Allowance for doubtful accounts", "prior", 10, S4_SIDE_LABELS),
+    check=CheckDigit("check digit should be zero", "ta - tlse"),
+)
+
+TIEOUT_SHEETS = [SHEET_3, SHEET_4]     # order = tab order after the TB tabs
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PART 2 — ENGINE  (no settings below this line)
+# ══════════════════════════════════════════════════════════════════════════════
+
+ZERO = Decimal(0)
+
+# ── 2A. Data helpers ──────────────────────────────────────────────────────────
+def norm(text):
+    return "" if text is None else str(text).strip().lower()
+
+
+def records_from(df):
+    """Spark / pandas / list -> list of dicts."""
+    if hasattr(df, "toPandas"):
+        return df.toPandas().to_dict(orient="records")
+    if hasattr(df, "to_dict"):
+        return df.to_dict(orient="records")
+    if isinstance(df, list):
+        return df
+    raise TypeError(f"Unsupported dataframe type: {type(df)}")
+
+
+def column_names(df):
+    if hasattr(df, "columns"):
+        return list(df.columns)
+    rows = records_from(df)
+    return list(rows[0]) if rows else []
+
 
 def to_decimal(value):
     if value is None:
         return None
     s = str(value).strip().replace(",", "")
-    if s in ("", "-", "—"):
+    if s in ("", "-", "\u2014"):
         return None
     try:
         return Decimal(s)
     except InvalidOperation:
         return None
 
-def make_font(color, name="Calibri", size=10, bold=False, underline=None):
-    return Font(name=name, size=size, bold=bold, color=color, underline=underline)
 
-def make_fill(color):
-    return PatternFill(fill_type="solid", fgColor=color)
-
-def make_border(color="FF000000", style="thin"):
-    side = Side(style=style, color=color)
-    return Border(left=side, right=side, top=side, bottom=side)
-
-def make_alignment(horizontal="center", vertical="center", wrap=False):
-    return Alignment(horizontal=horizontal, vertical=vertical, wrap_text=wrap)
-
-def find_entity_columns(columns, anchor, excludes=(), row_id_col="row_id"):
-    cols      = list(columns)
-    excl_keys = {normalize_text(e) for e in excludes} | {normalize_text(row_id_col)}
-    anchor_idx = next(
-        (i for i, c in enumerate(cols) if normalize_text(c) == normalize_text(anchor)),
-        None,
-    )
-    if anchor_idx is None:
-        raise KeyError(f"Anchor column not found: {anchor!r}")
-    result = [c for c in cols[anchor_idx + 1:] if normalize_text(c) not in excl_keys]
-    if not result:
-        raise ValueError(f"No entity columns found after {anchor!r}")
+def sum_by_code(df):
+    """{grouping code: total balance}"""
+    result = {}
+    for rec in records_from(df):
+        code = str(rec.get(GROUP_CODE_COL, "")).strip()
+        val = to_decimal(rec.get(TOTAL_COL))
+        if code and val is not None:
+            result[code] = result.get(code, ZERO) + val
     return result
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2 — Constants + SheetConfig
-# ══════════════════════════════════════════════════════════════════════════════
 
-WHITE      = "FFFFFFFF"
-BLACK      = "FF000000"
-NAVY       = "FF1F3864"
-LIGHT_BLUE = "FFBDD7EE"
-LIGHT_GREY = "FFD9D9D9"
-RED        = "FFFF0000"
-GREEN_BORD = "FF00B050"
-
-MONEY_FMT          = '#,##0.00;(#,##0.00);0.00'
-FONT_BODY_RED_BOLD = make_font(RED, size=10, bold=True)
-FONT_TITLE         = make_font(BLACK, size=12, bold=True)
-FONT_HDR_WHITE     = make_font(WHITE, size=10, bold=True)
-FONT_HDR_BLACK     = make_font(BLACK, size=10, bold=True)
-FONT_HDR_RED       = make_font(RED,   size=10, bold=True)
-FONT_BODY          = make_font(BLACK, size=10)
-FONT_NOTE          = make_font(BLACK, size=10)
-
-FILL_NAVY       = make_fill(NAVY)
-FILL_LIGHT_BLUE = make_fill(LIGHT_BLUE)
-FILL_LIGHT_GREY = make_fill(LIGHT_GREY)
-FILL_WHITE      = make_fill(WHITE)
-
-BORDER_STD   = make_border(BLACK, "thin")
-BORDER_HAIR  = make_border(BLACK, "thin")
-BORDER_NONE  = Border()
-BORDER_GREEN = Border(
-    left=Side(style="medium", color=GREEN_BORD),
-    right=Side(style="medium", color=GREEN_BORD),
-    top=Side(style="medium", color=GREEN_BORD),
-    bottom=Side(style="medium", color=GREEN_BORD),
-)
-
-ALIGN_CTR      = make_alignment("center", "center")
-ALIGN_CTR_WRAP = make_alignment("center", "center", wrap=True)
-ALIGN_LEFT     = make_alignment("left",   "center")
-ALIGN_LEFT_TOP = make_alignment("left",   "top",    wrap=True)
-ALIGN_LEFT_BOT = make_alignment("left",   "bottom")
-ALIGN_RIGHT    = make_alignment("right",  "center")
-
-ACCOUNT_COL     = "Account"
-ROW_ID_COL      = "row_id"
-LAST_ENTITY_COL = "BR015"
-
-ROW_TITLE_1     = 1
-ROW_TITLE_2     = 2
-ROW_AS_OF       = 3
-ROW_CURRENCY    = 4
-ROW_SPACER_1    = 5
-ROW_NOTE_START  = 6
-ROW_NOTE_END    = 9
-NOTE_COL_START  = 2
-NOTE_COL_END    = 6
-ROW_FIRST_TABLE = 12
-
-COL_SPACER     = 1
-COL_ACCOUNT    = 2
-SIDE_TABLE_GAP = 2
-
-# ── Shared banner text (same across all sheets) ───────────────────────────────
-BANNER_TITLE_1  = "Broadridge Financial Solutions Inc"
-BANNER_TITLE_2  = "Broadridge Trial Balance"          # same for every period
-BANNER_CURRENCY = "Currency - USD"
-
-POST_COL_META = [
-    ("Total Consolidated Balances",
-     "Total Consolidated Balances",                        True,  False),
-    ("D&T Check",
-     "D&T Check",                                          True,  False),
-    ("Total Consolidated Balances (Rounded in millions)",
-     "Total Consolidated Balances\n(Rounded in millions)", False, False),
-    ("Grouping Code",
-     "Grouping Code",                                      False, True),
-]
-_POST_NORMS = {normalize_text(m[0]): m for m in POST_COL_META}
-
-TEXT_POST_COLS     = {normalize_text("Grouping Code")}
-_SENTINEL_ACCOUNTS = {"balance sheet", "income statement"}
-
-# ── Minimal SheetConfig: only what actually changes per period ────────────────
-@dataclass
-class SheetConfig:
-    dataset:     Any   # Spark / Pandas DataFrame or list[dict]
-    as_of_text:  str   # e.g. "As Of Period: 9-26 (3/31/2026)"
-                       # sheet_name is auto-derived from this string
-
-    @property
-    def sheet_name(self) -> str:
-        """
-        Extracts the period code from as_of_text and builds the tab label.
-        "As Of Period: 9-26 (3/31/2026)"  →  "TB TieOut 9-26"
-        "As Of Period: 6-26 (12/31/2025)" →  "TB TieOut 6-26"
-        Falls back to the full as_of_text if no period code is found.
-        """
-        match = re.search(r":\s*([\w\-]+)", self.as_of_text)
-        period_code = match.group(1).strip() if match else self.as_of_text
-        return f"Trial Balance {period_code}"
+def load_lookups(current_df, prior_df):
+    """Read each dataframe once. ytd = current, prior = prior, qtd = current - prior."""
+    ytd, prior = sum_by_code(current_df), sum_by_code(prior_df)
+    qtd = {c: ytd.get(c, ZERO) - prior.get(c, ZERO) for c in ytd.keys() | prior.keys()}
+    return {"ytd": ytd, "qtd": qtd, "prior": prior}
 
 
-# ── ✏️  ONLY EDIT THIS LIST when adding / changing periods ───────────────────
-#    dataset     → your DataFrame variable
-#    as_of_text  → the string you want in the green-bordered Row 3 banner
-SHEET_CONFIGS = [
-    SheetConfig(
-        dataset    = TB_03312026,
-        as_of_text = "As Of Period: 9-26 (3/31/2026)",
-    ),
-    SheetConfig(
-        dataset    = TB_12312025,
-        as_of_text = "As Of Period: 6-26 (12/31/2025)",
-    ),
-]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3 — Column discovery (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _get_print_columns(spark_df):
-    all_cols   = dataframe_columns(spark_df)
-    post_names = {normalize_text(m[0]) for m in POST_COL_META}
-
-    entity_cols = find_entity_columns(
-        all_cols,
-        anchor=ACCOUNT_COL,
-        excludes=[m[0] for m in POST_COL_META] + [ROW_ID_COL],
-        row_id_col=ROW_ID_COL,
-    )
-    last_norm = normalize_text(LAST_ENTITY_COL)
-    if last_norm in {normalize_text(c) for c in entity_cols}:
-        last_idx    = next(i for i, c in enumerate(entity_cols)
-                           if normalize_text(c) == last_norm)
-        entity_cols = entity_cols[: last_idx + 1]
-
-    post_cols = [c for c in all_cols if normalize_text(c) in post_names]
-    post_cols = sorted(post_cols, key=lambda c: next(
-        i for i, m in enumerate(POST_COL_META)
-        if normalize_text(m[0]) == normalize_text(c)
-    ))
-    return entity_cols, post_cols, [ACCOUNT_COL] + entity_cols + post_cols
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4 — Data splitting (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _split_bs_is(spark_df):
-    all_records = sorted(
-        records_from(spark_df),
-        key=lambda r: int(r.get(ROW_ID_COL, 0)),
-    )
-    accounts = [normalize_text(str(r.get(ACCOUNT_COL, ""))) for r in all_records]
-
-    bs_start = next((i for i, a in enumerate(accounts) if a == "balance sheet"), None)
-    is_start = next((i for i, a in enumerate(accounts) if a == "income statement"), None)
-
-    if bs_start is None:
-        raise ValueError(
-            "'Balance Sheet' marker not found. "
-            "Ensure the dataset has a row where Account == 'Balance Sheet'."
-        )
-
-    bs_raw = (all_records[bs_start + 1: is_start]
-              if is_start is not None else all_records[bs_start + 1:])
-    is_raw = all_records[is_start + 1:] if is_start is not None else []
-
-    def _is_data_row(rec):
-        return normalize_text(str(rec.get(ACCOUNT_COL, ""))) not in _SENTINEL_ACCOUNTS
-
-    return [r for r in bs_raw if _is_data_row(r)], \
-           [r for r in is_raw  if _is_data_row(r)]
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5 — Banner + note helpers (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _xl(data_idx):
-    return data_idx + COL_ACCOUNT
-
-def _write_banner(ws, row, text, font, border=None, height=18):
-    ws.row_dimensions[row].height = height
-    c = ws.cell(row=row, column=COL_ACCOUNT, value=text)
-    c.font, c.fill, c.border, c.alignment = (
-        font, FILL_WHITE, border or BORDER_NONE, ALIGN_CTR
-    )
-    return c
-
-def _write_note_box(ws):
-    ws.row_dimensions[ROW_NOTE_START].height = 40
-    for r in range(ROW_NOTE_START + 1, ROW_NOTE_END + 1):
-        ws.row_dimensions[r].height = 15
-    ws.merge_cells(
-        start_row=ROW_NOTE_START, start_column=NOTE_COL_START,
-        end_row=ROW_NOTE_END,     end_column=NOTE_COL_END,
-    )
-    c = ws.cell(row=ROW_NOTE_START, column=NOTE_COL_START,
-                value="Note:  Fill The Notes As Required.")
-    c.font, c.fill, c.border, c.alignment = (
-        FONT_NOTE, FILL_LIGHT_GREY, BORDER_STD, ALIGN_LEFT_TOP
-    )
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 6 — Table writer (unchanged)
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _write_table(ws, section_label, records, print_cols, entity_cols, start_row):
-    main_cols = [c for c in print_cols
-                 if normalize_text(c) not in _POST_NORMS
-                 or _POST_NORMS[normalize_text(c)][2]]
-    side_cols = [c for c in print_cols
-                 if normalize_text(c) in _POST_NORMS
-                 and not _POST_NORMS[normalize_text(c)][2]]
-
-    header_row     = start_row
-    data_row_start = start_row + 1
-    n_main         = len(main_cols)
-
-    ws.row_dimensions[header_row].height = 55
-
-    ws.merge_cells(
-        start_row=header_row, start_column=COL_ACCOUNT,
-        end_row=header_row,   end_column=COL_ACCOUNT,
-    )
-    acct_cell = ws.cell(row=header_row, column=COL_ACCOUNT,
-                        value=section_label.upper())
-    acct_cell.font = Font(name="Calibri", size=11, bold=True,
-                          underline="single", color=BLACK)
-    acct_cell.fill, acct_cell.border, acct_cell.alignment = (
-        FILL_LIGHT_BLUE, BORDER_STD, ALIGN_LEFT_BOT
-    )
-
-    for i, col in enumerate(main_cols):
-        if i == 0:
-            continue
-        n_col = normalize_text(col)
-        c     = ws.cell(row=header_row, column=_xl(i))
-        label = _POST_NORMS[n_col][1] if n_col in _POST_NORMS else col
-        c.value, c.font, c.fill, c.border, c.alignment = (
-            label, FONT_HDR_BLACK, FILL_LIGHT_BLUE, BORDER_STD, ALIGN_CTR_WRAP
-        )
-
-    last_main_ws_col = _xl(n_main - 1)
-    ws.auto_filter.ref = (
-        f"{get_column_letter(_xl(0))}{header_row}:"
-        f"{get_column_letter(last_main_ws_col)}{header_row}"
-    )
-
-    side_start_col = last_main_ws_col + SIDE_TABLE_GAP + 1
-    for j, col in enumerate(side_cols):
-        n_col = normalize_text(col)
-        c     = ws.cell(row=header_row, column=side_start_col + j)
-        meta  = _POST_NORMS.get(n_col)
-        label = meta[1] if meta else col
-        fnt   = FONT_HDR_RED if (meta and meta[3]) else FONT_HDR_BLACK
-        c.value, c.font, c.fill, c.border, c.alignment = (
-            label, fnt, FILL_LIGHT_BLUE, BORDER_STD, ALIGN_CTR_WRAP
-        )
-
-    data_row = data_row_start
-    for rec in records:
-        ws.row_dimensions[data_row].height = 15
-
-        for i, col in enumerate(main_cols):
-            raw = rec.get(col)
-            c   = ws.cell(row=data_row, column=_xl(i))
-            if i == 0:
-                c.value, c.font, c.fill, c.border, c.alignment = (
-                    raw, FONT_BODY, FILL_WHITE, BORDER_HAIR, ALIGN_LEFT
-                )
-            else:
-                c.value, c.font, c.fill, c.border, c.alignment = (
-                    float(raw) if raw is not None else None,
-                    FONT_BODY, FILL_WHITE, BORDER_HAIR, ALIGN_RIGHT,
-                )
-                c.number_format = MONEY_FMT
-
-        for j, col in enumerate(side_cols):
-            raw   = rec.get(col)
-            c     = ws.cell(row=data_row, column=side_start_col + j)
-            n_col = normalize_text(col)
-            if n_col in TEXT_POST_COLS:
-                display = str(raw).strip() if raw is not None else ""
-                c.value, c.font, c.fill, c.border, c.alignment = (
-                    display if display else None,
-                    FONT_BODY_RED_BOLD, FILL_WHITE, BORDER_HAIR, ALIGN_CTR,
-                )
-            else:
-                c.value, c.font, c.fill, c.border, c.alignment = (
-                    float(raw) if raw is not None else None,
-                    FONT_BODY, FILL_WHITE, BORDER_HAIR, ALIGN_RIGHT,
-                )
-                c.number_format = MONEY_FMT
-
-        data_row += 1
-
-    return data_row + 2
-
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7 — Per-sheet builder  ← reads shared constants + only as_of_text
-# ══════════════════════════════════════════════════════════════════════════════
-
-def build_tb_tieout(ws, cfg: SheetConfig):
-    """Populate one worksheet. Only cfg.as_of_text varies between sheets."""
-    ws.sheet_view.showGridLines = False
-
-    entity_cols, post_cols, print_cols = _get_print_columns(cfg.dataset)
-    n_cols = len(print_cols)
-
-    ws.column_dimensions[get_column_letter(COL_SPACER)].width  = 2
-    ws.column_dimensions[get_column_letter(COL_ACCOUNT)].width = 55
-    for i in range(1, n_cols):
-        ws.column_dimensions[get_column_letter(_xl(i))].width = 18
-
-    ws.freeze_panes = ws.cell(row=ROW_FIRST_TABLE, column=_xl(1))
-
-    # Rows 1–4: all constants except row 3 (as_of_text comes from cfg)
-    _write_banner(ws, ROW_TITLE_1,  BANNER_TITLE_1,
-                  FONT_TITLE, height=18)
-    _write_banner(ws, ROW_TITLE_2,  BANNER_TITLE_2,
-                  make_font(BLACK, size=11, bold=True), height=18)
-    _write_banner(ws, ROW_AS_OF,    cfg.as_of_text,          # ← only dynamic field
-                  make_font(BLACK, size=11), border=BORDER_GREEN, height=18)
-    _write_banner(ws, ROW_CURRENCY, BANNER_CURRENCY,
-                  make_font(BLACK, size=11, bold=True), height=18)
-
-    ws.row_dimensions[ROW_SPACER_1].height = 6
-    _write_note_box(ws)
-
-    bs_records, is_records = _split_bs_is(cfg.dataset)
-
-    next_row = _write_table(
-        ws, "Balance Sheet", bs_records,
-        print_cols, entity_cols, start_row=ROW_FIRST_TABLE,
-    )
-    if is_records:
-        _write_table(
-            ws, "Income Statement", is_records,
-            print_cols, entity_cols, start_row=next_row,
-        )
-# ══════════════════════════════════════════════════════════════════════════════
-# SECTION 9 — Sheet 3: 10-Q Tie Out Q3
-# ══════════════════════════════════════════════════════════════════════════════
-
-from dataclasses import dataclass, field
-from decimal import Decimal
-
-# ── Sheet-3 column layout ─────────────────────────────────────────────────────
-S3_COL_SYMBOL   = 2   # B  →  Σ / Rx / PY symbol
-S3_COL_CODE     = 3   # C  →  Grouping Code value
-S3_COL_REF      = 4   # D  →  Reference / label  (wide)
-S3_COL_YTD_BAL  = 6   # F  →  YTD Balance (raw $)
-S3_COL_YTD_RND  = 7   # G  →  YTD Rounded – green fill
-S3_COL_QTD_BAL  = 8   # H  →  QTD Balance (raw $)  — 4-col tables only
-S3_COL_QTD_RND  = 9   # I  →  QTD Rounded – green fill  — 4-col tables only
-S3_COL_LAST_4   = 9   # last used column for 4-col tables
-S3_COL_LAST_2   = 7   # last used column for 2-col tables
-
-# ── Sheet-3 colours & styles ──────────────────────────────────────────────────
-GREEN_FILL   = make_fill("FF92D050")   # bright green for Rx / rounded cells
-GREY_TITLE   = make_fill("FFD9D9D9")   # table title band
-ITALIC_BOLD  = Font(name="Calibri", size=10, bold=True, italic=True, color=BLACK)
-FONT_RED_BOLD_ITALIC = Font(name="Calibri", size=10,
-                             bold=True, italic=True, color=RED)
-FONT_BLUE_BOLD       = Font(name="Calibri", size=10, bold=True, color="FF0070C0")
-FONT_SYM_BLUE        = Font(name="Calibri", size=12, bold=True, color="FF0070C0")
-FONT_SYM_RED         = Font(name="Calibri", size=10, bold=True, color=RED)
-
-BORDER_PY = Border(                    # dashed green box for PY manual cells
-    left=Side(style="thin", color=GREEN_BORD),
-    right=Side(style="thin", color=GREEN_BORD),
-    top=Side(style="thin", color=GREEN_BORD),
-    bottom=Side(style="thin", color=GREEN_BORD),
-)
-BORDER_RED_MED = Border(               # red medium box for PY highlight
-    left=Side(style="medium", color=RED),
-    right=Side(style="medium", color=RED),
-    top=Side(style="medium", color=RED),
-    bottom=Side(style="medium", color=RED),
-)
-
-ROUNDED_FMT = '#,##0.0;(#,##0.0);"-"'
-MILLION     = Decimal("1000000")
-
-# ── Row-type constants ────────────────────────────────────────────────────────
-SIGMA    = "sigma"     # sourced directly from TB lookup
-RX       = "rx"        # calculated from other rows
-PY       = "py"        # prior-year manual entry  →  red-bordered cell
-SUBTITLE = "subtitle"  # grey label band inside a table
-BLANK    = "blank"     # empty spacer row
-TOTAL    = "total"     # bold Rx row with no symbol (visual "Total" line)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-A  Data structures
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class RowDef:
+def evaluate(formula, lookup, done):
     """
-    row_key   – unique id; Rx rows reference others by this key.
-    row_type  – SIGMA | RX | PY | SUBTITLE | BLANK | TOTAL
-    codes     – grouping codes to sum for SIGMA rows (e.g. ["D","E"])
-    label     – text shown in the References column
-    rx_terms  – [(row_key_or_single_code, sign)] for RX / TOTAL rows
-    bold      – bold the label text
-    py_ref    – annotation shown in Grouping Code col for PY rows
+    'cor + sga - tax' -> number.
+    Each name is looked up in `done` (rows already calculated) first,
+    then in `lookup` (grouping codes). Unknown name counts as 0.
     """
-    row_key:  str
-    row_type: str
-    codes:    list[str]            = field(default_factory=list)
-    label:    str                  = ""
-    rx_terms: list[tuple[str,int]] = field(default_factory=list)
-    bold:     bool                 = False
-    py_ref:   str                  = ""
+    result = ZERO
+    for sign, name in re.findall(r"([+-]?)\s*(\w+)", formula):
+        value = done.get(name)
+        if value is None:
+            value = lookup.get(name, ZERO)
+        result += -value if sign == "-" else value
+    return result
 
 
-@dataclass
-class TableDef:
+def resolve(row, lookup, done):
+    if row.kind == "sigma":
+        return sum((lookup.get(c, ZERO) for c in row.codes.split("+")), ZERO)
+    return evaluate(row.formula, lookup, done)      # calc / total
+
+
+# ── 2B. Excel drawing helpers ─────────────────────────────────────────────────
+def outline(ws, r1, c1, r2, c2, style="thin", color=BLACK):
+    """Draw a box around a range (works for merged ranges too)."""
+    edge, none = Side(style=style, color=color), Side(style=None)
+    for r in range(r1, r2 + 1):
+        for c in range(c1, c2 + 1):
+            ws.cell(row=r, column=c).border = Border(
+                left=edge if c == c1 else none, right=edge if c == c2 else none,
+                top=edge if r == r1 else none,  bottom=edge if r == r2 else none)
+
+
+def put(ws, row, col, value=None, *, font=FONT_BODY, fill=FILL_WHITE,
+        align=ALIGN_CENTER, fmt=None, end_row=None, end_col=None,
+        border=("thin", BLACK)):
     """
-    title       – centred header band text
-    col_variant – "4col" (YTD+QTD) or "2col" (YTD only)
-    rows        – ordered list of RowDef
+    Write ONE styled cell. Every cell in the workbook goes through here.
+    end_row / end_col -> merge the block. border=(style, color) or None.
     """
-    title:       str
-    col_variant: str          # "4col" | "2col"
-    rows:        list[RowDef]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-B  Table definitions  (edit labels / formulas here)
-# ══════════════════════════════════════════════════════════════════════════════
-
-TABLE_DEFS: list[TableDef] = [
-
-    # ── Income Statement ──────────────────────────────────────────────────────
-    TableDef("Income Statement", "4col", [
-        RowDef("rev",      SIGMA, ["A"],           "Revenues"),
-        RowDef("cor",      SIGMA, ["B"],           "Cost of Revenues"),
-        RowDef("sga",      SIGMA, ["C"],           "Selling, General and Administrative Expenses"),
-        RowDef("tot_opex", RX,   [],               "Total Operating Expenses",rx_terms=[("cor",+1),("sga",+1)]),
-        RowDef("op_inc",   RX,   [],               "Operating Income",rx_terms=[("rev",+1),("tot_opex",-1)]),
-        RowDef("int_exp",  SIGMA, ["D","E"],       "Interest expense, net"),
-        RowDef("oth_nonop",SIGMA,["F","G"],        "Other non-operating income (expenses), net"),
-        RowDef("ebit",     RX,   [],               "Earnings Before Income Taxes",rx_terms=[("op_inc",+1),("int_exp",+1),("oth_nonop",+1)]),
-        RowDef("tax",      SIGMA, ["H"],           "Provision for Income Taxes"),
-        RowDef("net_earn", RX,   [],               "Net Earnings",rx_terms=[("ebit",+1),("tax",-1)]),
-    ]),
-
-    # ── FN 1 – note box only (no data rows) ───────────────────────────────────
-    TableDef("FN 1 \u2013 Basis of Presentation", "note", []),
-
-    # ── FN 5 – Interest Expense, net ──────────────────────────────────────────
-    TableDef("FN 5 \u2013 Interest Expense, net", "4col", [
-        RowDef("int_borrow", SIGMA, ["D"], "Interest expense on borrowings"),
-        RowDef("int_income", SIGMA, ["E"], "Interest income"),
-        RowDef("int_net",    RX,    [],    "Interest Expense, net",rx_terms=[("int_borrow",+1),("int_income",+1)], bold=True),
-    ]),
-
-    # ── FN 8 – Deferred Client Conversion (balance table) ─────────────────────
-    TableDef(
-        "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs",
-        "2col", [
-        RowDef("ac",    SIGMA, ["AC"],"Net Deferred Client Project Cost \u2013 Live"),
-        RowDef("ad",    SIGMA, ["AD"],"Internal/External Deferred Client Project Cost"),
-        RowDef("dcc",   RX,    [],    "Deferred Client Conversion & Start-up Cost",rx_terms=[("ac",+1),("ad",+1)], bold=True),
-        RowDef("ae",    SIGMA, ["AE"],"Cash Concession"),
-        RowDef("fn8_total", TOTAL, [],"Total",rx_terms=[("dcc",+1),("ae",+1)], bold=True),
-    ]),
-
-    # ── FN 8 – Amortization table ─────────────────────────────────────────────
-    TableDef(
-        "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs "
-        "and Deferred Sales Commissions Amortization",
-        "4col", [
-        RowDef("aa", SIGMA, ["AA"], "COR \u2013 Amortization \u2013 Conversion"),
-        RowDef("ab", SIGMA, ["AB"], "SG&A \u2013 Amortization \u2013 Other"),
-        RowDef("amort_total", RX, [],"Total Amortization [B]",rx_terms=[("aa",+1),("ab",+1)], bold=True),
-    ]),
-
-    # ── FN 9 – Other non-current assets ───────────────────────────────────────
-    TableDef("FN 9 \u2013 Other non-current assets", "2col", [
-        RowDef("_sub9",  SUBTITLE, [], "FN9 \u2013 Other non-current assets"),
-        RowDef("fn9_i",  SIGMA, ["I"],  "Long-term investments"),
-        RowDef("fn9_m",  SIGMA, ["M"],  "Digital asset"),
-        RowDef("fn9_j",  SIGMA, ["J"],  "ROU Assets"),
-        RowDef("fn9_l",  SIGMA, ["L"],  "Contract assets"),
-        RowDef("fn9_k",  SIGMA, ["K"],  "Deferred sales commissions costs"),
-        RowDef("fn9_n",  SIGMA, ["N"],  "Long-term broker fees"),
-        RowDef("fn9_o",  SIGMA, ["O"],  "Deferred Data Center Costs"),
-        RowDef("fn9_oth",SIGMA,["P","BO","BP","BQ","BR","BS","BT","BU"], "Other"),
-        RowDef("fn9_tot",RX, [],        "Total other non-current assets",
-               rx_terms=[
-                   ("fn9_i",+1),("fn9_m",+1),("fn9_j",+1),("fn9_l",+1),
-                   ("fn9_k",+1),("fn9_n",+1),("fn9_o",+1),("fn9_oth",+1),
-               ], bold=True),
-        RowDef("_blank9", BLANK, [], ""),
-        # sub-table (separate header repeated in image)
-        RowDef("fn9_p",  SIGMA, ["P"],  "Warrant Assets [1]"),
-        RowDef("fn9_bu", SIGMA, ["BU"], "LT Derivative Asset [2]"),
-    ]),
-
-    # ── FN 10 – Payables and Accrued Expenses ─────────────────────────────────
-    TableDef("FN 10 \u2013 Payables and Accrued Expenses", "2col", [
-        RowDef("_sub10",  SUBTITLE, [], "FN 10 \u2013 Payables and Accrued Expenses"),
-        RowDef("fn10_q",  SIGMA, ["Q"], "Accounts payable"),
-        RowDef("fn10_r",  SIGMA, ["R"], "Employee Compensation and Benefits [B]"),
-        RowDef("fn10_s",  SIGMA, ["S"], "Accrued Dividend Payable"),
-        RowDef("fn10_t",  SIGMA, ["T"], "Accrued Broker Fees"),
-        RowDef("fn10_u",  SIGMA, ["U"], "Customer Deposits"),
-        RowDef("fn10_v",  SIGMA, ["V"], "Business process outsourcing administration fees"),
-        RowDef("fn10_w",  SIGMA, ["W"], "Operating lease liabilities"),
-        RowDef("fn10_x",  SIGMA, ["X"], "Accrued Taxes"),
-        RowDef("fn10_y",  SIGMA, ["Y"], "Other"),
-        RowDef("fn10_tot",TOTAL, [],    "Total payables and accrued expenses",
-               rx_terms=[
-                   ("fn10_q",+1),("fn10_r",+1),("fn10_s",+1),("fn10_t",+1),
-                   ("fn10_u",+1),("fn10_v",+1),("fn10_w",+1),("fn10_x",+1),
-                   ("fn10_y",+1),
-               ], bold=True),
-        RowDef("_blank10", BLANK, [], ""),
-        # sub-table
-        RowDef("fn10_af", SIGMA, ["AF"], "Accrued Liability-Severance Reserve [C]"),
-    ]),
-
-    # ── FN 12 – Other Non-Current Liabilities ─────────────────────────────────
-    TableDef("FN 12 \u2013 Other Non-Current Liabilities", "2col", [
-        RowDef("fn12_ag", SIGMA, ["AG"], "Post Retirement Obligations"),
-        RowDef("fn12_ah", SIGMA, ["AH"], "Operating Lease Liabilities"),
-        RowDef("fn12_ak", SIGMA, ["AK"], "Software license liabilities"),
-        RowDef("fn12_ai", SIGMA, ["AI"], "Non-current income taxes"),
-        RowDef("fn12_aj", SIGMA, ["AJ"], "Acquisition related contingencies"),
-        RowDef("fn12_alam",SIGMA,["AL","AM"], "Other (a)"),
-        RowDef("fn12_tot",TOTAL, [],     "Total",
-               rx_terms=[
-                   ("fn12_ag",+1),("fn12_ah",+1),("fn12_ak",+1),
-                   ("fn12_ai",+1),("fn12_aj",+1),("fn12_alam",+1),
-               ], bold=True),
-        RowDef("_blank12a",BLANK, [], ""),
-        # PY rows – manual entry, red-bordered cell
-        RowDef("py12_1", PY, [], "Software license liabilities",py_ref="ANA-024  June 30, 2025"),
-        RowDef("py12_2", PY, [], "Other",py_ref="ANA-024  June 30, 2025"),
-        RowDef("_blank12b",BLANK, [], ""),
-        # sub-tables
-        RowDef("fn12_al",  SIGMA, ["AL"], "LT Derivative Liability"),
-        RowDef("_blank12c",BLANK, [], ""),
-        RowDef("fn12_an",  SIGMA, ["AN"], "Total Rabbi Trust (A156) [2]"),
-        RowDef("fn12_ao",  SIGMA, ["AO"], "SORP/SERP [3]"),
-    ]),
-
-    # ── MD&A – Financial Condition ────────────────────────────────────────────
-    TableDef(
-        "Financial Condition, Liquidity and Capital Resources (MD\u0026A)",
-        "2col", [
-        RowDef("mda_bl", SIGMA, ["BL"], "Domestic cash"),
-        RowDef("mda_bm", SIGMA, ["BM"], "Cash held by foreign subsidiaries"),
-        RowDef("mda_bn", SIGMA, ["BN"], "Cash held by regulated entities"),
-        RowDef("mda_tot",TOTAL, [],     "Total cash and cash equivalents",
-               rx_terms=[("mda_bl",+1),("mda_bm",+1),("mda_bn",+1)],
-               bold=True),
-    ]),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-C  Lookup builder
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _build_lookups(ytd_df, qtd_prev_df) -> tuple[dict, dict]:
-    """
-    Returns:
-        ytd_lookup  – {grp_code: Decimal}  from TB_03312026
-        qtd_lookup  – {grp_code: Decimal}  TB_03312026 minus TB_12312025
-    """
-    GRP  = "Grouping Code"
-    TCOL = "Total Consolidated Balances"
-
-    def _sum_by_code(df) -> dict:
-        result: dict[str, Decimal] = {}
-        for rec in records_from(df):
-            code = str(rec.get(GRP, "")).strip()
-            val  = to_decimal(rec.get(TCOL))
-            if not code or val is None:
-                continue
-            result[code] = result.get(code, Decimal(0)) + val
-        return result
-
-    ytd_raw  = _sum_by_code(ytd_df)
-    prev_raw = _sum_by_code(qtd_prev_df)
-
-    all_codes = set(ytd_raw) | set(prev_raw)
-    qtd_lookup = {
-        c: ytd_raw.get(c, Decimal(0)) - prev_raw.get(c, Decimal(0))
-        for c in all_codes
-    }
-    return ytd_raw, qtd_lookup
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-D  Value resolver
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _resolve(
-    row: RowDef,
-    lookup: dict,
-    computed: dict,
-) -> Decimal | None:
-    """
-    SIGMA → sum codes from lookup.
-    RX / TOTAL → sum rx_terms; each term is a row_key in `computed`
-                 or a single grouping code in `lookup`.
-    PY / SUBTITLE / BLANK → None (no auto value).
-    """
-    if row.row_type == SIGMA:
-        total = Decimal(0)
-        for code in row.codes:
-            total += lookup.get(code, Decimal(0))
-        return total
-
-    if row.row_type in (RX, TOTAL):
-        total = Decimal(0)
-        for key, sign in row.rx_terms:
-            if key in computed:
-                v = computed[key]
-            elif key in lookup:
-                v = lookup[key]
-            else:
-                v = Decimal(0)
-            total += Decimal(sign) * (v if v is not None else Decimal(0))
-        return total
-
-    return None
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-E  Cell-writing helpers for Sheet 3
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _s3_apply(c, value=None, font=None, fill=None,
-              border=None, align=None, num_fmt=None):
-    if value  is not None: c.value         = value
-    if font   is not None: c.font          = font
-    if fill   is not None: c.fill          = fill
-    if border is not None: c.border        = border
-    if align  is not None: c.alignment     = align
-    if num_fmt is not None: c.number_format = num_fmt
-def _apply_range_border(
-    ws,
-    start_row: int, start_col: int,
-    end_row:   int, end_col:   int,
-    style: str = "thin",
-    color: str = BLACK,
-):
-    """
-    Apply a full outer-box border to every cell in a merged (or plain) range.
-
-    openpyxl only stores borders on the physical anchor cell of a merge.
-    For a range wider than one column we must also write the RIGHT side on
-    the last-column cells, the BOTTOM side on the last-row cells, etc.
-    This helper visits every cell and assigns only the sides that belong on
-    that particular edge, leaving interior sides as None so they don't
-    bleed through.
-    """
-    edge  = Side(style=style, color=color)
-    blank = Side(style=None)
-
-    for r in range(start_row, end_row + 1):
-        for c in range(start_col, end_col + 1):
-            left   = edge  if c == start_col else blank
-            right  = edge  if c == end_col   else blank
-            top    = edge  if r == start_row else blank
-            bottom = edge  if r == end_row   else blank
-
-            # ws.cell() returns the anchor cell even for MergedCell coords
-            cell        = ws.cell(row=r, column=c)
-            cell.border = Border(
-                left=left, right=right, top=top, bottom=bottom
-            )
-
-
-def _apply_range_border_custom(
-    ws,
-    start_row: int, start_col: int,
-    end_row:   int, end_col:   int,
-    border: Border,
-):
-    """
-    Stamp an already-built Border object on every cell in the range,
-    overwriting whatever was there.  Use this when you need a non-uniform
-    border (e.g. medium red box for PY cells).
-    """
-    for r in range(start_row, end_row + 1):
-        for c in range(start_col, end_col + 1):
-            ws.cell(row=r, column=c).border = border
-
-def _write_s3_title_banner(ws, row: int, text: str, last_col: int):
-    """Merged grey title band spanning S3_COL_SYMBOL → last_col."""
-    ws.row_dimensions[row].height = 18
-
-    ws.merge_cells(
-        start_row=row, start_column=S3_COL_SYMBOL,
-        end_row=row,   end_column=last_col,
-    )
-    c = ws.cell(row=row, column=S3_COL_SYMBOL, value=text)
-    c.font      = make_font(BLACK, size=10, bold=True)
-    c.fill      = GREY_TITLE
-    c.alignment = ALIGN_CTR
-
-    # FIX Issue 2: stamp border on every cell in the merged range
-    _apply_range_border(ws, row, S3_COL_SYMBOL, row, last_col)
-
-
-def _write_s3_col_headers(ws, row: int, col_variant: str):
-    """
-    Header row: 'Grouping Code' spans B+C (merged), then References, then
-    value columns.  Each cell gets a complete outer border via the range helper.
-    """
-    ws.row_dimensions[row].height = 30
-
-    def _hdr(start_c, end_c, text, red=False):
-        """Write a header cell, merge if start_c != end_c, apply full border."""
-        if start_c != end_c:
-            ws.merge_cells(
-                start_row=row, start_column=start_c,
-                end_row=row,   end_column=end_c,
-            )
-        c = ws.cell(row=row, column=start_c, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = ALIGN_CTR_WRAP
-        # FIX Issue 2: border covers the whole merged span
-        _apply_range_border(ws, row, start_c, row, end_c)
-
-    # FIX Issue 1: "Grouping Code" merges columns B (S3_COL_SYMBOL=2)
-    #              and C (S3_COL_CODE=3)
-    _hdr(S3_COL_SYMBOL, S3_COL_CODE, "Grouping Code")
-    _hdr(S3_COL_REF,    S3_COL_REF,  "References")
-    _hdr(S3_COL_YTD_BAL, S3_COL_YTD_BAL,
-         "YTD 3/31/26\nBalances (in millions)")
-    _hdr(S3_COL_YTD_RND, S3_COL_YTD_RND,
-         "YTD 3/31/26\nRounded (in millions)", red=True)
-
-    if col_variant == "4col":
-        _hdr(S3_COL_QTD_BAL, S3_COL_QTD_BAL,
-             "QTD 3/31/26\nBalances (in millions)")
-        _hdr(S3_COL_QTD_RND, S3_COL_QTD_RND,
-             "QTD 3/31/26\nRounded (in millions)", red=True)
-
-
-def _write_s3_source_tags(ws, row: int, col_variant: str):
-    """'Tab 1' / 'Rx' source-tag row with proper single-cell borders."""
-    ws.row_dimensions[row].height = 14
-
-    def _tag(col, text, red=False):
-        c = ws.cell(row=row, column=col, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = ALIGN_CTR
-        _apply_range_border(ws, row, col, row, col)   # single cell — still use helper
-
-    _tag(S3_COL_YTD_BAL, "Tab 1")
-    _tag(S3_COL_YTD_RND, "Rx", red=True)
-    if col_variant == "4col":
-        _tag(S3_COL_QTD_BAL, "Tab 1 & Tab 2")
-        _tag(S3_COL_QTD_RND, "Rx", red=True)
-
-
-def _write_s3_data_row(
-    ws, row_num: int, row_def: RowDef,
-    ytd_val, qtd_val,
-    col_variant: str,
-):
-    ws.row_dimensions[row_num].height = 15
-    is_rx    = row_def.row_type in (RX, TOTAL)
-    lbl_font = (make_font(BLACK, size=10, bold=True)
-                if row_def.bold else FONT_BODY)
-
-    # ── B: symbol ─────────────────────────────────────────────────────────────
-    sym = {SIGMA: "\u03A3", RX: "Rx", TOTAL: ""}.get(row_def.row_type, "")
-    c_sym = ws.cell(row=row_num, column=S3_COL_SYMBOL, value=sym)
-    c_sym.font      = FONT_SYM_RED if is_rx else FONT_SYM_BLUE
-    c_sym.fill      = FILL_WHITE
-    c_sym.alignment = ALIGN_CTR
-    _apply_range_border(ws, row_num, S3_COL_SYMBOL, row_num, S3_COL_SYMBOL,
-                        style="thin")
-
-    # ── C: grouping code ──────────────────────────────────────────────────────
-    code_display = "+".join(row_def.codes) if row_def.codes else ""
-    c_code = ws.cell(row=row_num, column=S3_COL_CODE, value=code_display)
-    c_code.font      = FONT_BLUE_BOLD if code_display else FONT_BODY
-    c_code.fill      = FILL_WHITE
-    c_code.alignment = ALIGN_CTR
-    _apply_range_border(ws, row_num, S3_COL_CODE, row_num, S3_COL_CODE,
-                        style="thin")
-
-    # ── D: label ──────────────────────────────────────────────────────────────
-    c_lbl = ws.cell(row=row_num, column=S3_COL_REF, value=row_def.label)
-    c_lbl.font      = lbl_font
-    c_lbl.fill      = FILL_WHITE
-    c_lbl.alignment = ALIGN_LEFT
-    _apply_range_border(ws, row_num, S3_COL_REF, row_num, S3_COL_REF,
-                        style="thin")
-
-    # ── value helper ──────────────────────────────────────────────────────────
-    def _val_cell(col, val, rounded=False):
-        c = ws.cell(row=row_num, column=col)
-        if val is not None:
-            c.value = float(round(val / MILLION, 1)) if rounded else float(val)
-        c.font         = lbl_font
-        c.fill         = GREEN_FILL if rounded else FILL_WHITE
-        c.alignment    = ALIGN_RIGHT
-        c.number_format = ROUNDED_FMT if rounded else MONEY_FMT
-        _apply_range_border(ws, row_num, col, row_num, col, style="thin")
-
-    _val_cell(S3_COL_YTD_BAL, ytd_val, rounded=False)
-    _val_cell(S3_COL_YTD_RND, ytd_val, rounded=True)
-
-    if col_variant == "4col":
-        _val_cell(S3_COL_QTD_BAL, qtd_val, rounded=False)
-        _val_cell(S3_COL_QTD_RND, qtd_val, rounded=True)
-
-
-
-def _write_s3_py_row(ws, row_num: int, row_def: RowDef, col_variant: str):
-    """PY row: dashed label border + red-medium box on value cells."""
-    ws.row_dimensions[row_num].height = 15
-
-    # B: PY symbol
-    c_sym = ws.cell(row=row_num, column=S3_COL_SYMBOL, value="PY")
-    c_sym.font      = FONT_SYM_RED
-    c_sym.fill      = FILL_WHITE
-    c_sym.alignment = ALIGN_CTR
-    _apply_range_border(ws, row_num, S3_COL_SYMBOL, row_num, S3_COL_SYMBOL,
-                        style="thin")
-
-    # C: py_ref text in red
-    c_code = ws.cell(row=row_num, column=S3_COL_CODE, value=row_def.py_ref)
-    c_code.font      = make_font(RED, size=9, bold=True)
-    c_code.fill      = FILL_WHITE
-    c_code.alignment = ALIGN_CTR_WRAP
-    _apply_range_border(ws, row_num, S3_COL_CODE, row_num, S3_COL_CODE,
-                        style="thin")
-
-    # D: label with dashed green border (manual-entry signal)
-    c_lbl = ws.cell(row=row_num, column=S3_COL_REF, value=row_def.label)
-    c_lbl.font      = FONT_BODY
-    c_lbl.fill      = FILL_WHITE
-    c_lbl.border    = BORDER_PY    # dashed green — intentionally different style
-    c_lbl.alignment = ALIGN_LEFT
-
-    # F: YTD Balance — empty red-medium box = "fill this in manually"
-    c_ytd = ws.cell(row=row_num, column=S3_COL_YTD_BAL)
-    c_ytd.fill          = FILL_WHITE
-    c_ytd.alignment     = ALIGN_RIGHT
-    c_ytd.number_format = MONEY_FMT
-    _apply_range_border_custom(ws, row_num, S3_COL_YTD_BAL,
-                                row_num, S3_COL_YTD_BAL, BORDER_RED_MED)
-
-    # G: YTD Rounded — green fill + red-medium box
-    c_rnd = ws.cell(row=row_num, column=S3_COL_YTD_RND)
-    c_rnd.fill          = GREEN_FILL
-    c_rnd.alignment     = ALIGN_RIGHT
-    c_rnd.number_format = ROUNDED_FMT
-    _apply_range_border_custom(ws, row_num, S3_COL_YTD_RND,
-                                row_num, S3_COL_YTD_RND, BORDER_RED_MED)
-
-
-def _write_note_only_table(ws, row: int, text: str, last_col: int) -> int:
-    """FN 1 – title banner + empty merged note box."""
-    _write_s3_title_banner(ws, row, text, last_col)
-
-    note_start = row + 1
-    note_end   = row + 3
-    for r in range(note_start, note_end + 1):
-        ws.row_dimensions[r].height = 14
-
-    ws.merge_cells(
-        start_row=note_start, start_column=S3_COL_SYMBOL,
-        end_row=note_end,     end_column=last_col,
-    )
-    c = ws.cell(row=note_start, column=S3_COL_SYMBOL)
-    c.fill      = FILL_WHITE
-    c.alignment = ALIGN_LEFT_TOP
-
-    # FIX Issue 2: border on every cell of the note box merge
-    _apply_range_border(ws, note_start, S3_COL_SYMBOL, note_end, last_col)
-
-    return note_end + 2
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-F  Per-table writer
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _write_s3_table(
-    ws, table: TableDef, start_row: int,
-    ytd_lookup: dict, qtd_lookup: dict,
-) -> int:
-    last_col = S3_COL_LAST_4 if table.col_variant == "4col" else S3_COL_LAST_2
-
-    # note-only table (FN 1)
-    if table.col_variant == "note":
-        return _write_note_only_table(ws, start_row, table.title, S3_COL_LAST_2)
-
-    # title band
-    _write_s3_title_banner(ws, start_row, table.title, last_col)
-
-    # column header + source-tag rows
-    _write_s3_col_headers(ws, start_row + 1, table.col_variant)
-    _write_s3_source_tags(ws, start_row + 2, table.col_variant)
+    end_row, end_col = end_row or row, end_col or col
+    if (end_row, end_col) != (row, col):
+        ws.merge_cells(start_row=row, start_column=col,
+                       end_row=end_row, end_column=end_col)
+    cell = ws.cell(row=row, column=col, value=value)
+    cell.font, cell.fill, cell.alignment = font, fill, align
+    if fmt:
+        cell.number_format = fmt
+    if border:
+        outline(ws, row, col, end_row, end_col, *border)
+    return cell
+
+
+def money(raw):
+    return None if raw is None else float(raw)
+
+
+# ── 2C. Trial Balance tabs ────────────────────────────────────────────────────
+def tb_sheet_name(as_of_text):
+    """'As Of Period: 9-26 (3/31/2026)' -> 'Trial Balance 9-26'"""
+    m = re.search(r":\s*([\w\-]+)", as_of_text)
+    return f"{TB_SHEET_PREFIX} {m.group(1).strip() if m else as_of_text}"
+
+
+def get_columns(df):
+    """Returns (entity column names, main post columns, side post columns)."""
+    cols = column_names(df)
+    names = [norm(c) for c in cols]
+    if norm(ACCOUNT_COL) not in names:
+        raise KeyError(f"Column not found: {ACCOUNT_COL!r}")
+
+    skip = {norm(p.name) for p in POST_COLS} | {norm(ROW_ID_COL)}
+    entity = [c for c in cols[names.index(norm(ACCOUNT_COL)) + 1:]
+              if norm(c) not in skip]
+    if not entity:
+        raise ValueError(f"No entity columns found after {ACCOUNT_COL!r}")
+    entity_names = [norm(c) for c in entity]
+    if norm(LAST_ENTITY_COL) in entity_names:
+        entity = entity[: entity_names.index(norm(LAST_ENTITY_COL)) + 1]
+
+    actual = {norm(c): c for c in cols}
+    post = [(actual[norm(p.name)], p) for p in POST_COLS if norm(p.name) in actual]
+    return (entity,
+            [x for x in post if x[1].in_main],
+            [x for x in post if not x[1].in_main])
+
+
+def split_bs_is(df):
+    """Split rows into (balance sheet rows, income statement rows)."""
+    rows = sorted(records_from(df), key=lambda r: int(r.get(ROW_ID_COL, 0)))
+    names = [norm(r.get(ACCOUNT_COL)) for r in rows]
+    if BS_MARKER not in names:
+        raise ValueError(f"Marker row not found: Account == {BS_MARKER!r}")
+
+    bs_at = names.index(BS_MARKER)
+    is_at = names.index(IS_MARKER) if IS_MARKER in names else None
+    bs = rows[bs_at + 1: is_at if is_at is not None else len(rows)]
+    is_ = rows[is_at + 1:] if is_at is not None else []
+
+    keep = lambda r: norm(r.get(ACCOUNT_COL)) not in (BS_MARKER, IS_MARKER)
+    return list(filter(keep, bs)), list(filter(keep, is_))
+
+
+def write_tb_table(ws, title, records, entity, main_posts, side_posts, start):
+    """One table (Balance Sheet or Income Statement). Returns next free row."""
+    ws.row_dimensions[start].height = TB_HEADER_HEIGHT
+
+    # main table: account + entity columns + main post columns
+    main = [(c, c) for c in entity] + [(c, p.header) for c, p in main_posts]
+    put(ws, start, COL_ACCOUNT, title.upper(), font=FONT_SECTION,
+        fill=FILL_BLUE, align=ALIGN_LEFT_BOTTOM)
+    for i, (_, header) in enumerate(main, start=1):
+        put(ws, start, COL_ACCOUNT + i, header, font=FONT_HDR,
+            fill=FILL_BLUE, align=ALIGN_CENTER_WRAP)
+
+    last_col = COL_ACCOUNT + len(main)
+    ws.auto_filter.ref = (f"{get_column_letter(COL_ACCOUNT)}{start}:"
+                          f"{get_column_letter(last_col)}{start}")
+
+    # side table: to the right, after a gap
+    side_start = last_col + TB_SIDE_GAP + 1
+    for j, (_, p) in enumerate(side_posts):
+        put(ws, start, side_start + j, p.header,
+            font=FONT_HDR_RED if p.is_code else FONT_HDR,
+            fill=FILL_BLUE, align=ALIGN_CENTER_WRAP)
 
     # data rows
-    cur_row  = start_row + 3
-    computed: dict[str, Decimal | None] = {}   # row_key → resolved value
-
-    for row_def in table.rows:
-
-        if row_def.row_type == BLANK:
-            ws.row_dimensions[cur_row].height = 6
-            cur_row += 1
-            continue
-
-        if row_def.row_type == SUBTITLE:
-            ws.row_dimensions[cur_row].height = 14
-            c = ws.cell(row=cur_row, column=S3_COL_REF, value=row_def.label)
-            _s3_apply(c, font=ITALIC_BOLD, fill=FILL_LIGHT_GREY,
-                      border=BORDER_HAIR, align=ALIGN_LEFT)
-            cur_row += 1
-            continue
-
-        if row_def.row_type == PY:
-            _write_s3_py_row(ws, cur_row, row_def, table.col_variant)
-            cur_row += 1
-            continue
-
-        # resolve numeric values
-        ytd_val = _resolve(row_def, ytd_lookup, computed)
-        qtd_val = _resolve(row_def, qtd_lookup, computed) \
-                  if table.col_variant == "4col" else None
-
-        computed[row_def.row_key] = ytd_val   # store for downstream Rx rows
-
-        _write_s3_data_row(
-            ws, cur_row, row_def, ytd_val, qtd_val, table.col_variant
-        )
-        cur_row += 1
-
-    return cur_row + 2   # two-row gap between tables
+    r = start + 1
+    for rec in records:
+        ws.row_dimensions[r].height = H_ROW
+        put(ws, r, COL_ACCOUNT, rec.get(ACCOUNT_COL), align=ALIGN_LEFT)
+        for i, (key, _) in enumerate(main, start=1):
+            put(ws, r, COL_ACCOUNT + i, money(rec.get(key)),
+                align=ALIGN_RIGHT, fmt=MONEY_FMT)
+        for j, (key, p) in enumerate(side_posts):
+            raw = rec.get(key)
+            if p.is_code:
+                put(ws, r, side_start + j, (str(raw).strip() if raw is not None else "") or None,
+                    font=FONT_RED_BOLD)
+            else:
+                put(ws, r, side_start + j, money(raw), align=ALIGN_RIGHT, fmt=MONEY_FMT)
+        r += 1
+    return r + 2
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-G  Sheet-3 top-level builder
-# ══════════════════════════════════════════════════════════════════════════════
-
-S3_SHEET_NAME = "3) IS Tie Out"
-
-def build_sheet3(wb: Workbook, ytd_df, prev_df):
-    """
-    Creates / overwrites the '3) 10-Q Tie Out Q3' sheet.
-
-    Parameters
-    ----------
-    wb       – openpyxl Workbook (already contains sheets 1 & 2)
-    ytd_df   – TB_03312026
-    prev_df  – TB_12312025  (used for QTD = YTD − prior)
-    """
-    # ── create or replace sheet ───────────────────────────────────────────────
-    if S3_SHEET_NAME in wb.sheetnames:
-        del wb[S3_SHEET_NAME]
-    ws = wb.create_sheet(title=S3_SHEET_NAME)
+def build_tb_sheet(ws, df, as_of_text):
     ws.sheet_view.showGridLines = False
-
-    # ── column widths ─────────────────────────────────────────────────────────
-    col_widths = {
-        1: 2,    # A  spacer
-        2: 6,    # B  symbol (Σ / Rx / PY)
-        3: 18,   # C  grouping code
-        4: 48,   # D  references  (wide)
-        5: 3,    # E  thin gap
-        6: 20,   # F  YTD balance
-        7: 16,   # G  YTD rounded   ← green
-        8: 20,   # H  QTD balance
-        9: 16,   # I  QTD rounded   ← green
-    }
-    for col_idx, width in col_widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
-
-    # ── page header rows 1-3 ─────────────────────────────────────────────────
-    headers = [
-        ("Broadridge Financial Solutions, Inc.", 11, True),
-        ("Q3\u201926 10-Q Tie Out",              11, True),
-        ("3/31/2026",                            10, False),
-    ]
-    for r, (text, sz, bold) in enumerate(headers, start=1):
-        ws.row_dimensions[r].height = 16
-        c = ws.cell(row=r, column=S3_COL_SYMBOL, value=text)
-        _s3_apply(c,
-                  font=make_font(BLACK, size=sz, bold=bold),
-                  fill=FILL_WHITE,
-                  border=BORDER_NONE,
-                  align=ALIGN_LEFT)
-
-    # ── row 4: thin spacer ────────────────────────────────────────────────────
-    ws.row_dimensions[4].height = 6
-
-    # ── row 5: "Introduction and Procedures" band ─────────────────────────────
-    # FIX: end_column uses S3_COL_LAST_2 (col 7) not S3_COL_LAST_4 (col 9)
-    #      so columns 8-9 are never merged and stay as normal cells.
-    ws.row_dimensions[5].height = 16
-    ws.merge_cells(
-        start_row=5, start_column=S3_COL_SYMBOL,
-        end_row=5,   end_column=S3_COL_LAST_2,      # ← FIX 1: was S3_COL_LAST_4
-    )
-    c = ws.cell(row=5, column=S3_COL_SYMBOL,
-                value="Introduction and Procedures")
-    _s3_apply(c,
-              font=make_font(BLACK, size=10, bold=False),
-              fill=FILL_LIGHT_GREY,
-              border=BORDER_STD,
-              align=ALIGN_LEFT)
-
-    # ── rows 6-7: spacers before first table ──────────────────────────────────
-    ws.row_dimensions[6].height = 6
-    ws.row_dimensions[7].height = 6
-
-    # ── build lookups ────────────────────────────────────────────────────────
-    ytd_lookup, qtd_lookup = _build_lookups(ytd_df, prev_df)
-
-    # ── render every TableDef in order ───────────────────────────────────────
-    cur_row = 8
-    for table in TABLE_DEFS:
-        cur_row = _write_s3_table(
-            ws, table, cur_row, ytd_lookup, qtd_lookup
-        )
-
-    # ── freeze panes ─────────────────────────────────────────────────────────
-    # FIX 2: use a plain string coordinate — never ws.cell() on a merged range.
-    # Row 11 = first data row (row 8 title + row 9 header + row 10 tag + row 11 data).
-    # Column D (S3_COL_REF = 4) keeps the label column visible while scrolling right.
-    ws.freeze_panes = f"{get_column_letter(S3_COL_REF)}11"   # ← FIX 2
-
-    return ws
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-H  Sub-table writer  (FN9 / FN10 / FN12 internal mini-tables)
-#      Replaces the simple SUBTITLE row with a full re-header band
-# ══════════════════════════════════════════════════════════════════════════════
-
-@dataclass
-class SubTableDef:
-    """
-    A mini repeating header block inside a parent table section.
-    rows       – RowDef list belonging to this sub-block
-    col_variant– inherited from parent table
-    """
-    rows:        list[RowDef]
-    col_variant: str
-
-
-def _write_sub_header(ws, row: int, col_variant: str):
-    """
-    Mini re-header block: two rows consumed.
-    Row 0 = column labels  (Grouping Code spans B+C)
-    Row 1 = source tags    (Tab 1 / Rx)
-    """
-    hdr_row = row
-    tag_row = row + 1
-    ws.row_dimensions[hdr_row].height = 22
-    ws.row_dimensions[tag_row].height = 14
-
-    def _hdr(start_c, end_c, text, red=False):
-        if start_c != end_c:
-            ws.merge_cells(
-                start_row=hdr_row, start_column=start_c,
-                end_row=hdr_row,   end_column=end_c,
-            )
-        c = ws.cell(row=hdr_row, column=start_c, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = ALIGN_CTR_WRAP
-        _apply_range_border(ws, hdr_row, start_c, hdr_row, end_c)
-
-    def _tag(col, text, red=False):
-        c = ws.cell(row=tag_row, column=col, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = ALIGN_CTR
-        _apply_range_border(ws, tag_row, col, tag_row, col)
-
-    # FIX Issue 1: "Grouping code" spans B+C in sub-headers too
-    _hdr(S3_COL_SYMBOL, S3_COL_CODE, "Grouping code")
-    _hdr(S3_COL_REF,    S3_COL_REF,  "Reference")
-    _hdr(S3_COL_YTD_BAL, S3_COL_YTD_BAL,
-         "YTD 3/31/26\nBalances (in millions)")
-    _hdr(S3_COL_YTD_RND, S3_COL_YTD_RND,
-         "Rounded\n(In millions)", red=True)
-
-    _tag(S3_COL_YTD_BAL, "Tab 1")
-    _tag(S3_COL_YTD_RND, "Rx", red=True)
-
-    if col_variant == "4col":
-        _hdr(S3_COL_QTD_BAL, S3_COL_QTD_BAL,
-             "QTD 3/31/26\nBalances (in millions)")
-        _hdr(S3_COL_QTD_RND, S3_COL_QTD_RND,
-             "QTD Rounded\n(In millions)", red=True)
-        _tag(S3_COL_QTD_BAL, "Tab 1 & Tab 2")
-        _tag(S3_COL_QTD_RND, "Rx", red=True)
-
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-I  Updated TABLE_DEFS  — replaces the version in 9-B
-#      Key change: SUBTITLE rows that need their own column headers are now
-#      modelled as SUB_HDR type; the renderer handles them automatically.
-# ══════════════════════════════════════════════════════════════════════════════
-
-SUB_HDR = "sub_hdr"   # triggers _write_sub_header() — two rows consumed
-
-TABLE_DEFS: list[TableDef] = [   # noqa: F811  (intentional override)
-
-    # ── Income Statement ──────────────────────────────────────────────────────
-    TableDef("Income Statement", "4col", [
-        RowDef("rev",      SIGMA, ["A"],
-               "Revenues"),
-        RowDef("cor",      SIGMA, ["B"],
-               "Cost of Revenues"),
-        RowDef("sga",      SIGMA, ["C"],
-               "Selling, General and Administrative Expenses"),
-        RowDef("tot_opex", RX, [],
-               "Total Operating Expenses",
-               rx_terms=[("cor",+1),("sga",+1)], bold=True),
-        RowDef("op_inc",   RX, [],
-               "Operating Income",
-               rx_terms=[("rev",+1),("tot_opex",-1)]),
-        RowDef("int_exp",  SIGMA, ["D","E"],
-               "Interest expense, net"),
-        RowDef("oth_nonop",SIGMA, ["F","G"],
-               "Other non-operating income (expenses), net"),
-        RowDef("ebit",     RX, [],
-               "Earnings Before Income Taxes",
-               rx_terms=[("op_inc",+1),("int_exp",+1),("oth_nonop",+1)]),
-        RowDef("tax",      SIGMA, ["H"],
-               "Provision for Income Taxes"),
-        RowDef("net_earn", RX, [],
-               "Net Earnings",
-               rx_terms=[("ebit",+1),("tax",-1)], bold=True),
-    ]),
-
-    # ── FN 1 – note box only ──────────────────────────────────────────────────
-    TableDef("FN 1 \u2013 Basis of Presentation", "note", []),
-
-    # ── FN 5 – Interest Expense, net ──────────────────────────────────────────
-    TableDef("FN 5 \u2013 Interest Expense, net", "4col", [
-        RowDef("int_borrow", SIGMA, ["D"],
-               "Interest expense on borrowings"),
-        RowDef("int_income", SIGMA, ["E"],
-               "Interest income"),
-        RowDef("int_net",    RX, [],
-               "Interest Expense, net",
-               rx_terms=[("int_borrow",+1),("int_income",+1)], bold=True),
-    ]),
-
-    # ── FN 8 – Balance table (2-col) ──────────────────────────────────────────
-    TableDef(
-        "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs",
-        "2col", [
-        RowDef("ac",       SIGMA, ["AC"],
-               "Net Deferred Client Project Cost \u2013 Live"),
-        RowDef("ad",       SIGMA, ["AD"],
-               "Internal/External Deferred Client Project Cost"),
-        RowDef("dcc",      RX, [],
-               "Deferred Client Conversion & Start-up Cost",
-               rx_terms=[("ac",+1),("ad",+1)], bold=True),
-        RowDef("ae",       SIGMA, ["AE"],
-               "Cash Concession"),
-        RowDef("fn8_total",TOTAL, [],
-               "Total",
-               rx_terms=[("dcc",+1),("ae",+1)], bold=True),
-    ]),
-
-    # ── FN 8 – Amortization table (4-col) ─────────────────────────────────────
-    TableDef(
-        "FN 8 \u2013 Deferred Client Conversion and Start-Up Costs "
-        "and Deferred Sales Commissions Amortization",
-        "4col", [
-        RowDef("aa",         SIGMA, ["AA"],
-               "COR \u2013 Amortization \u2013 Conversion"),
-        RowDef("ab",         SIGMA, ["AB"],
-               "SG\u0026A \u2013 Amortization \u2013 Other"),
-        RowDef("amort_total",RX, [],
-               "Total Amortization [B]",
-               rx_terms=[("aa",+1),("ab",+1)], bold=True),
-    ]),
-
-    # ── FN 9 – Other non-current assets (2-col) ───────────────────────────────
-    TableDef("FN 9 \u2013 Other non-current assets", "2col", [
-        # subtitle band (italic grey label — no re-header needed)
-        RowDef("_sub9",    SUBTITLE, [],
-               "FN9 \u2013 Other non-current assets"),
-        RowDef("fn9_i",    SIGMA, ["I"],   "Long-term investments"),
-        RowDef("fn9_m",    SIGMA, ["M"],   "Digital asset"),
-        RowDef("fn9_j",    SIGMA, ["J"],   "ROU Assets"),
-        RowDef("fn9_l",    SIGMA, ["L"],   "Contract assets"),
-        RowDef("fn9_k",    SIGMA, ["K"],   "Deferred sales commissions costs"),
-        RowDef("fn9_n",    SIGMA, ["N"],   "Long-term broker fees"),
-        RowDef("fn9_o",    SIGMA, ["O"],   "Deferred Data Center Costs"),
-        RowDef("fn9_oth",  SIGMA,
-               ["P","BO","BP","BQ","BR","BS","BT","BU"], "Other"),
-        RowDef("fn9_tot",  RX, [],
-               "Total other non-current assets",
-               rx_terms=[
-                   ("fn9_i",+1),("fn9_m",+1),("fn9_j",+1),("fn9_l",+1),
-                   ("fn9_k",+1),("fn9_n",+1),("fn9_o",+1),("fn9_oth",+1),
-               ], bold=True),
-        # blank spacer then sub-table with its own re-header
-        RowDef("_blank9",  BLANK,   [], ""),
-        RowDef("_shdr9",   SUB_HDR, [], ""),   # ← re-header for sub-block
-        RowDef("fn9_p",    SIGMA, ["P"],  "Warrant Assets [1]"),
-        RowDef("fn9_bu",   SIGMA, ["BU"], "LT Derivative Asset [2]"),
-    ]),
-
-    # ── FN 10 – Payables and Accrued Expenses (2-col) ─────────────────────────
-    TableDef("FN 10 \u2013 Payables and Accrued Expenses", "2col", [
-        RowDef("_sub10",   SUBTITLE, [],
-               "FN 10 \u2013 Payables and Accrued Expenses"),
-        RowDef("fn10_q",   SIGMA, ["Q"],  "Accounts payable"),
-        RowDef("fn10_r",   SIGMA, ["R"],
-               "Employee Compensation and Benefits [B]"),
-        RowDef("fn10_s",   SIGMA, ["S"],  "Accrued Dividend Payable"),
-        RowDef("fn10_t",   SIGMA, ["T"],  "Accrued Broker Fees"),
-        RowDef("fn10_u",   SIGMA, ["U"],  "Customer Deposits"),
-        RowDef("fn10_v",   SIGMA, ["V"],
-               "Business process outsourcing administration fees"),
-        RowDef("fn10_w",   SIGMA, ["W"],  "Operating lease liabilities"),
-        RowDef("fn10_x",   SIGMA, ["X"],  "Accrued Taxes"),
-        RowDef("fn10_y",   SIGMA, ["Y"],  "Other"),
-        RowDef("fn10_tot", TOTAL, [],
-               "Total payables and accrued expenses",
-               rx_terms=[
-                   ("fn10_q",+1),("fn10_r",+1),("fn10_s",+1),("fn10_t",+1),
-                   ("fn10_u",+1),("fn10_v",+1),("fn10_w",+1),("fn10_x",+1),
-                   ("fn10_y",+1),
-               ], bold=True),
-        # sub-block: Severance Reserve
-        RowDef("_blank10", BLANK,   [], ""),
-        RowDef("_shdr10",  SUB_HDR, [], ""),   # ← re-header
-        RowDef("fn10_af",  SIGMA, ["AF"],
-               "Accrued Liability-Severance Reserve [C]"),
-    ]),
-
-    # ── FN 12 – Other Non-Current Liabilities (2-col) ─────────────────────────
-    TableDef("FN 12 \u2013 Other Non-Current Liabilities", "2col", [
-        RowDef("fn12_ag",  SIGMA, ["AG"], "Post Retirement Obligations"),
-        RowDef("fn12_ah",  SIGMA, ["AH"], "Operating Lease Liabilities"),
-        RowDef("fn12_ak",  SIGMA, ["AK"], "Software license liabilities"),
-        RowDef("fn12_ai",  SIGMA, ["AI"], "Non-current income taxes"),
-        RowDef("fn12_aj",  SIGMA, ["AJ"], "Acquisition related contingencies"),
-        RowDef("fn12_alam",SIGMA, ["AL","AM"], "Other (a)"),
-        RowDef("fn12_tot", TOTAL, [],
-               "Total",
-               rx_terms=[
-                   ("fn12_ag",+1),("fn12_ah",+1),("fn12_ak",+1),
-                   ("fn12_ai",+1),("fn12_aj",+1),("fn12_alam",+1),
-               ], bold=True),
-        # PY manual-entry rows (dashed green label, red-bordered value cells)
-        RowDef("_blank12a",BLANK,  [], ""),
-        RowDef("py12_1",   PY,    [],
-               "Software license liabilities",
-               py_ref="ANA-024  June 30, 2025"),
-        RowDef("py12_2",   PY,    [],
-               "Other",
-               py_ref="ANA-024  June 30, 2025"),
-        # sub-block: LT Derivative Liability
-        RowDef("_blank12b",BLANK,   [], ""),
-        RowDef("_shdr12a", SUB_HDR, [], ""),
-        RowDef("fn12_al",  SIGMA, ["AL"], "LT Derivative Liability"),
-        # sub-block: Rabbi Trust / SORP
-        RowDef("_blank12c",BLANK,   [], ""),
-        RowDef("_shdr12b", SUB_HDR, [], ""),
-        RowDef("fn12_an",  SIGMA, ["AN"], "Total Rabbi Trust (A156) [2]"),
-        RowDef("fn12_ao",  SIGMA, ["AO"], "SORP/SERP [3]"),
-    ]),
-
-    # ── MD&A – Financial Condition (2-col) ────────────────────────────────────
-    TableDef(
-        "Financial Condition, Liquidity and Capital Resources (MD\u0026A)",
-        "2col", [
-        RowDef("mda_bl",  SIGMA, ["BL"], "Domestic cash"),
-        RowDef("mda_bm",  SIGMA, ["BM"],
-               "Cash held by foreign subsidiaries"),
-        RowDef("mda_bn",  SIGMA, ["BN"],
-               "Cash held by regulated entities"),
-        RowDef("mda_tot", TOTAL, [],
-               "Total cash and cash equivalents",
-               rx_terms=[("mda_bl",+1),("mda_bm",+1),("mda_bn",+1)],
-               bold=True),
-    ]),
-]
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 9-J  Updated _write_s3_table  — handles SUB_HDR rows
-#      Replaces the version defined in 9-F above
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _write_s3_table(                              # noqa: F811
-    ws, table: TableDef, start_row: int,
-    ytd_lookup: dict, qtd_lookup: dict,
-) -> int:
-    last_col = S3_COL_LAST_4 if table.col_variant == "4col" else S3_COL_LAST_2
-
-    # ── note-only table (FN 1) ────────────────────────────────────────────────
-    if table.col_variant == "note":
-        return _write_note_only_table(ws, start_row, table.title, S3_COL_LAST_2)
-
-    # ── title band ────────────────────────────────────────────────────────────
-    _write_s3_title_banner(ws, start_row, table.title, last_col)
-
-    # ── column header + source-tag rows ──────────────────────────────────────
-    _write_s3_col_headers(ws, start_row + 1, table.col_variant)
-    _write_s3_source_tags(ws, start_row + 2, table.col_variant)
-
-    cur_row  = start_row + 3
-    computed: dict[str, Decimal | None] = {}
-
-    for row_def in table.rows:
-
-        # ── blank spacer ──────────────────────────────────────────────────────
-        if row_def.row_type == BLANK:
-            ws.row_dimensions[cur_row].height = 6
-            cur_row += 1
-            continue
-
-        # ── italic subtitle band ──────────────────────────────────────────────
-        if row_def.row_type == SUBTITLE:
-            ws.row_dimensions[cur_row].height = 14
-            c = ws.cell(row=cur_row, column=S3_COL_REF, value=row_def.label)
-            _s3_apply(c, font=ITALIC_BOLD, fill=FILL_LIGHT_GREY,
-                      border=BORDER_HAIR, align=ALIGN_LEFT)
-            cur_row += 1
-            continue
-
-        # ── sub-table re-header (two rows: header + source tag) ───────────────
-        if row_def.row_type == SUB_HDR:
-            _write_sub_header(ws, cur_row, table.col_variant)
-            cur_row += 2   # consumes two rows
-            continue
-
-        # ── PY manual-entry row ───────────────────────────────────────────────
-        if row_def.row_type == PY:
-            _write_s3_py_row(ws, cur_row, row_def, table.col_variant)
-            cur_row += 1
-            continue
-
-        # ── SIGMA / RX / TOTAL data row ───────────────────────────────────────
-        ytd_val = _resolve(row_def, ytd_lookup, computed)
-        qtd_val = (_resolve(row_def, qtd_lookup, computed)
-                   if table.col_variant == "4col" else None)
-
-        computed[row_def.row_key] = ytd_val
-
-        _write_s3_data_row(
-            ws, cur_row, row_def, ytd_val, qtd_val, table.col_variant
-        )
-        cur_row += 1
-
-    return cur_row + 2   # two-row gap after every table
-# filename: section10_build_sheet4.py
-# Code Generated by Sidekick is for learning and experimentation purposes only.
-
-# ==============================================================================
-# SECTION 10 — Sheet 4: Balance Sheet Tieout
-# ==============================================================================
-#
-# Layout mirrors Sheet 3 but with important differences:
-#   • 2-col only  (3/31/26 Balances  |  Rounded)  — no QTD columns
-#   • Column header labels differ  ("3/31/26 Balances (in millions)" / "Rounded (in millions)")
-#   • Note-box text references the balance sheet within the Form 10-Q
-#   • A side mini-table ([1] Allowance for doubtful accounts, code BK)
-#     is written to the right of the main table at row 11 (same row as the
-#     first data line), using the TB_12312025 YTD balance.
-#   • A "check digit should be zero" row appears below the last data row.
-#   • Source lookup uses TB_03312026 (point-in-time balance sheet)
-# ==============================================================================
-
-# ------------------------------------------------------------------------------
-# 10-A  Column constants (reuse Sheet-3 2-col set; col E is a thin spacer)
-# ------------------------------------------------------------------------------
-S4_COL_SYMBOL   = 2   # B  – Σ / Rx symbol
-S4_COL_CODE     = 3   # C  – Grouping Code
-S4_COL_REF      = 4   # D  – References  (wide label)
-S4_COL_BAL      = 6   # F  – 3/31/26 Balances (raw $)
-S4_COL_RND      = 7   # G  – Rounded (In millions)  – green fill
-S4_COL_LAST     = 7   # last column of main table
-
-# Side-table starts at column I (9)
-S4_SIDE_START   = 9   # I  – side-table symbol col
-S4_SIDE_CODE    = 10  # J  – side-table code col
-S4_SIDE_REF     = 11  # K  – side-table reference label
-S4_SIDE_BAL     = 13  # M  – side-table YTD 12/31/25 balance
-S4_SIDE_RND     = 14  # N  – side-table rounded  – green fill
-S4_SIDE_LAST    = 14
-
-# ------------------------------------------------------------------------------
-# 10-B  Balance-Sheet row definitions
-#        All rows use the "2col" variant → only YTD (= balance at 3/31/26).
-# ------------------------------------------------------------------------------
-
-BS4_TABLE = TableDef(
-    "Condensed Consolidated Balance Sheet",
-    "2col",
-    [
-        # ── Current assets ────────────────────────────────────────────────────
-        RowDef("_sub_ca",   SUBTITLE, [],       "Current assets:"),
-        RowDef("bs4_ap",    SIGMA,    ["AP"],   "Cash and cash equivalents"),
-        RowDef("_blank1",   BLANK,    [],       ""),
-        RowDef("bs4_aq",    SIGMA,    ["AQ"],   "Accounts receivable, net"),
-        RowDef("bs4_ar",    SIGMA,    ["AR"],   "Other current assets"),
-        RowDef("bs4_tca",   TOTAL,    [],       "Total current assets",
-               rx_terms=[("bs4_ap",+1),("bs4_aq",+1),("bs4_ar",+1)],
-               bold=True),
-        RowDef("_blank2",   BLANK,    [],       ""),
-
-        # ── Non-current assets ────────────────────────────────────────────────
-        RowDef("bs4_as",    SIGMA,    ["AS"],   "Property, plant and equipment, net"),
-        RowDef("bs4_at",    SIGMA,    ["AT"],   "Goodwill"),
-        RowDef("bs4_au",    SIGMA,    ["AU"],   "Intangible assets, net"),
-        RowDef("bs4_av",    SIGMA,    ["AV"],   "Deferred client conversion and start-up costs"),
-        RowDef("bs4_aw",    SIGMA,    ["AW"],   "Other non-current assets"),
-        RowDef("bs4_ta",    TOTAL,    [],       "Total assets",
-               rx_terms=[
-                   ("bs4_tca",+1),("bs4_as",+1),("bs4_at",+1),
-                   ("bs4_au",+1),("bs4_av",+1),("bs4_aw",+1),
-               ], bold=True),
-        RowDef("_blank3",   BLANK,    [],       ""),
-        RowDef("_blank4",   BLANK,    [],       ""),
-
-        # ── Liabilities and Stockholders' Equity ──────────────────────────────
-        RowDef("_sub_lse",  SUBTITLE, [],       "Liabilities and Stockholders' Equity"),
-        RowDef("_sub_cl",   SUBTITLE, [],       "Current liabilities:"),
-        RowDef("bs4_ax",    SIGMA,    ["AX"],   "Current portion of current liability"),
-        RowDef("bs4_ay",    SIGMA,    ["AY"],   "Payables and accrued expenses"),
-        RowDef("bs4_az",    SIGMA,    ["AZ"],   "Contract Liabilities"),
-        RowDef("bs4_tcl",   TOTAL,    [],       "Total current liabilities",
-               rx_terms=[("bs4_ax",+1),("bs4_ay",+1),("bs4_az",+1)],
-               bold=True),
-        RowDef("_blank5",   BLANK,    [],       ""),
-
-        # ── Non-current liabilities ───────────────────────────────────────────
-        RowDef("bs4_ba",    SIGMA,    ["BA"],   "Long-term debt, excluding current portion"),
-        RowDef("bs4_bb",    SIGMA,    ["BB"],   "Deferred taxes"),
-        RowDef("bs4_bc",    SIGMA,    ["BC"],   "Contract Liabilities"),
-        RowDef("bs4_bd",    SIGMA,    ["BD"],   "Other non-current liabilities"),
-        RowDef("bs4_tl",    TOTAL,    [],       "Total Liabilities",
-               rx_terms=[
-                   ("bs4_tcl",+1),("bs4_ba",+1),("bs4_bb",+1),
-                   ("bs4_bc",+1),("bs4_bd",+1),
-               ], bold=True),
-        RowDef("_blank6",   BLANK,    [],       ""),
-        RowDef("_blank7",   BLANK,    [],       ""),
-        RowDef("_blank8",   BLANK,    [],       ""),
-
-        # ── Stockholders' Equity ──────────────────────────────────────────────
-        RowDef("bs4_be",    SIGMA,    ["BE"],   "Common stock"),
-        RowDef("bs4_bf",    SIGMA,    ["BF"],   "Additional paid-in capital"),
-        RowDef("bs4_bg",    SIGMA,    ["BG"],   "Retained earnings"),
-        RowDef("bs4_bh",    SIGMA,    ["BH"],   "Treasury stock"),
-        RowDef("bs4_bibj",  SIGMA,    ["BI","BJ"],
-                                                "Accumulated other comprehensive income (loss)"),
-        RowDef("bs4_tse",   TOTAL,    [],       "Total stockholders' equity",
-               rx_terms=[
-                   ("bs4_be",+1),("bs4_bf",+1),("bs4_bg",+1),
-                   ("bs4_bh",+1),("bs4_bibj",+1),
-               ], bold=True),
-        RowDef("_blank9",   BLANK,    [],       ""),
-
-        # ── Total liabilities and stockholders' equity ────────────────────────
-        RowDef("bs4_tlse",  TOTAL,    [],       "Total liabilities and stockholders' equity",
-               rx_terms=[("bs4_tl",+1),("bs4_tse",+1)],
-               bold=True),
-    ],
-)
-
-
-# ------------------------------------------------------------------------------
-# 10-C  Sheet-4 column-header writer  (different labels vs. Sheet 3)
-# ------------------------------------------------------------------------------
-
-def _write_s4_col_headers(ws, row: int) -> None:
-    """Write the two-column header row for Sheet 4."""
-    ws.row_dimensions[row].height = 28
-
-    def _hdr(col, text, red=False):
-        c = ws.cell(row=row, column=col, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = Alignment(horizontal="center", vertical="center",
-                                wrap_text=True)
-        _apply_range_border(ws, row, col, row, col)
-
-    # Merged "Grouping Code" spanning symbol + code cols
-    ws.merge_cells(start_row=row, start_column=S4_COL_SYMBOL,
-                   end_row=row,   end_column=S4_COL_CODE)
-    _hdr(S4_COL_SYMBOL, "Grouping Code")
-
-    _hdr(S4_COL_REF, "References")
-    _hdr(S4_COL_BAL, "3/31/26\nBalances\n(in millions)")
-    _hdr(S4_COL_RND, "Rounded\n(In millions)", red=True)
-
-
-def _write_s4_source_tags(ws, row: int) -> None:
-    """Write 'Tab 1' / 'Rx' source-tag cells for Sheet 4."""
-    ws.row_dimensions[row].height = 14
-
-    def _tag(col, text, red=False):
-        c = ws.cell(row=row, column=col, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = ALIGN_CTR
-        _apply_range_border(ws, row, col, row, col)
-
-    _tag(S4_COL_BAL, "Tab 1")
-    _tag(S4_COL_RND, "Rx", red=True)
-
-
-# ------------------------------------------------------------------------------
-# 10-D  Data-row writer for Sheet 4  (2-col only, reuses Sheet-3 style logic)
-# ------------------------------------------------------------------------------
-
-def _write_s4_data_row(
-    ws, row_num: int, row_def: RowDef, val: Decimal | None
-) -> None:
-    """Write one SIGMA / RX / TOTAL row onto Sheet 4."""
-    ws.row_dimensions[row_num].height = 15
-    is_rx    = row_def.row_type in (RX, TOTAL)
-    lbl_font = (make_font(BLACK, size=10, bold=True)
-                if row_def.bold else FONT_BODY)
-
-    # B  – symbol
-    sym = {SIGMA: "Σ", RX: "Rx", TOTAL: ""}.get(row_def.row_type, "")
-    c_sym = ws.cell(row=row_num, column=S4_COL_SYMBOL, value=sym)
-    c_sym.font      = FONT_SYM_RED if is_rx else FONT_SYM_BLUE
-    c_sym.fill      = FILL_WHITE
-    c_sym.alignment = ALIGN_CTR
-    _apply_range_border(ws, row_num, S4_COL_SYMBOL, row_num, S4_COL_SYMBOL,
-                        style="thin")
-
-    # C  – grouping code
-    code_display = "+".join(row_def.codes) if row_def.codes else ""
-    c_code = ws.cell(row=row_num, column=S4_COL_CODE, value=code_display)
-    c_code.font      = FONT_BLUE_BOLD if code_display else FONT_BODY
-    c_code.fill      = FILL_WHITE
-    c_code.alignment = ALIGN_CTR
-    _apply_range_border(ws, row_num, S4_COL_CODE, row_num, S4_COL_CODE,
-                        style="thin")
-
-    # D  – label
-    c_ref = ws.cell(row=row_num, column=S4_COL_REF, value=row_def.label)
-    c_ref.font      = lbl_font
-    c_ref.fill      = FILL_WHITE
-    c_ref.alignment = ALIGN_LEFT
-    _apply_range_border(ws, row_num, S4_COL_REF, row_num, S4_COL_REF,
-                        style="thin")
-
-    # E  – thin spacer (no value, no border)
-    ws.cell(row=row_num, column=5).fill = FILL_WHITE
-
-    # F  – raw balance  (dollar format)
-    if val is not None:
-        c_bal = ws.cell(row=row_num, column=S4_COL_BAL,
-                        value=float(val))
-        c_bal.number_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
-    else:
-        c_bal = ws.cell(row=row_num, column=S4_COL_BAL, value=None)
-    c_bal.font      = FONT_BODY
-    c_bal.fill      = FILL_WHITE
-    c_bal.alignment = ALIGN_RIGHT
-    _apply_range_border(ws, row_num, S4_COL_BAL, row_num, S4_COL_BAL,
-                        style="thin")
-
-    # G  – rounded value (millions, 1 dp)  – green fill
-    if val is not None:
-        rounded = float(val / MILLION)
-        c_rnd = ws.cell(row=row_num, column=S4_COL_RND, value=rounded)
-        c_rnd.number_format = ROUNDED_FMT
-    else:
-        c_rnd = ws.cell(row=row_num, column=S4_COL_RND, value=None)
-    c_rnd.font      = make_font(BLACK, size=10, bold=is_rx)
-    c_rnd.fill      = GREEN_FILL
-    c_rnd.alignment = ALIGN_RIGHT
-    _apply_range_border(ws, row_num, S4_COL_RND, row_num, S4_COL_RND,
-                        style="thin")
-
-
-# ------------------------------------------------------------------------------
-# 10-E  Side mini-table: [1] Allowance for doubtful accounts  (code BK)
-#        Positioned starting at row 11 (aligns with the first AP data row),
-#        columns I–N.  Uses the TB_12312025 (prior period) ytd balance for BK.
-# ------------------------------------------------------------------------------
-
-def _write_s4_side_table(ws, bk_val: Decimal | None, start_row: int) -> None:
-    
-    # Row caption "[1] Allowance for doubtful accounts:"
-    caption_row = start_row
-    ws.row_dimensions[caption_row].height = 14
-    c_cap = ws.cell(row=caption_row, column=S4_SIDE_START,
-                    value="[1] Allowance for doubtful accounts:")
-    c_cap.font      = make_font(BLACK, size=10, bold=True)
-    c_cap.fill      = FILL_WHITE
-    c_cap.alignment = ALIGN_LEFT
-    ws.merge_cells(start_row=caption_row, start_column=S4_SIDE_START,
-                   end_row=caption_row,   end_column=S4_SIDE_LAST)
-
-    # Header row
-    hdr_row = start_row + 1
-    ws.row_dimensions[hdr_row].height = 28
-
-    def _hdr(col, text, red=False, merge_end=None):
-        r, c_ = hdr_row, col
-        c = ws.cell(row=r, column=c_, value=text)
-        c.font      = FONT_HDR_RED if red else FONT_HDR_BLACK
-        c.fill      = FILL_LIGHT_GREY
-        c.alignment = Alignment(horizontal="center", vertical="center",
-                                wrap_text=True)
-        end_col = merge_end if merge_end else col
-        if merge_end and merge_end != col:
-            ws.merge_cells(start_row=r, start_column=col,
-                           end_row=r,   end_column=merge_end)
-        _apply_range_border(ws, r, col, r, end_col)
-
-    _hdr(S4_SIDE_START, "Grouping Code", merge_end=S4_SIDE_CODE)
-    _hdr(S4_SIDE_REF,   "References")
-    _hdr(S4_SIDE_BAL,   "YTD 12/31/25\nBalances\n(In Millions)")
-    _hdr(S4_SIDE_RND,   "Rounded\n(In Millions)", red=True)
-
-    # Data row
-    data_row = start_row + 2
-    ws.row_dimensions[data_row].height = 15
-
-    # Grouping Code "BK" — merged symbol+code cols
-    ws.merge_cells(start_row=data_row, start_column=S4_SIDE_START,
-                   end_row=data_row,   end_column=S4_SIDE_CODE)
-    c_bk = ws.cell(row=data_row, column=S4_SIDE_START, value="BK")
-    c_bk.font      = FONT_BLUE_BOLD
-    c_bk.fill      = FILL_WHITE
-    c_bk.alignment = ALIGN_CTR
-    _apply_range_border(ws, data_row, S4_SIDE_START, data_row, S4_SIDE_CODE)
-
-    # Reference label
-    c_ref = ws.cell(row=data_row, column=S4_SIDE_REF,
-                    value="Allowance for doubtful accounts")
-    c_ref.font      = FONT_BODY
-    c_ref.fill      = FILL_WHITE
-    c_ref.alignment = ALIGN_LEFT
-    _apply_range_border(ws, data_row, S4_SIDE_REF, data_row, S4_SIDE_REF)
-
-    # Raw balance
-    if bk_val is not None:
-        c_bal = ws.cell(row=data_row, column=S4_SIDE_BAL,
-                        value=float(bk_val))
-        c_bal.number_format = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
-    else:
-        c_bal = ws.cell(row=data_row, column=S4_SIDE_BAL, value=None)
-    c_bal.font      = FONT_BODY
-    c_bal.fill      = FILL_WHITE
-    c_bal.alignment = ALIGN_RIGHT
-    _apply_range_border(ws, data_row, S4_SIDE_BAL, data_row, S4_SIDE_BAL)
-
-    # Rounded (green fill)
-    if bk_val is not None:
-        rounded = float(bk_val / MILLION)
-        c_rnd = ws.cell(row=data_row, column=S4_SIDE_RND, value=rounded)
-        c_rnd.number_format = ROUNDED_FMT
-    else:
-        c_rnd = ws.cell(row=data_row, column=S4_SIDE_RND, value=None)
-    c_rnd.font      = FONT_BODY
-    c_rnd.fill      = GREEN_FILL
-    c_rnd.alignment = ALIGN_RIGHT
-    _apply_range_border(ws, data_row, S4_SIDE_RND, data_row, S4_SIDE_RND)
-
-
-# ------------------------------------------------------------------------------
-# 10-F  Check-digit row writer
-#        "check digit should be zero" = TLSE_rounded_raw − TLSE_rounded_in_millions
-#        Per the image it appears 2 rows below the TLSE data line, in col F only.
-# ------------------------------------------------------------------------------
-
-def _write_s4_check_digit(
-    ws,
-    row_num: int,
-    ta_val:   Decimal | None,   # Total assets  (raw $)
-    tlse_val: Decimal | None,   # Total liabilities and stockholders' equity (raw $)
-) -> None:
-    """
-    Row layout (mirrors the screenshot):
-
-      col D–F  (merged)  │ italic blue  "check digit should be zero"
-      col G              │ whole-dollar diff = Total assets − Total L&SE
-                         │ positive→ plain number, negative→ (parentheses)
-                         │ NO green fill on this row — white background
-
-    The value is intentionally left in raw dollars (not millions) so that a
-    non-zero result shows the exact dollar discrepancy between TB assets and
-    TB liabilities+equity, making it easy to investigate.
-    """
-    ws.row_dimensions[row_num].height = 15
-
-    # ── Label: cols D–F merged, italic blue centred ──────────────────────────
-    ws.merge_cells(
-        start_row=row_num, start_column=S4_COL_REF,
-        end_row=row_num,   end_column=S4_COL_BAL,
-    )
-    c_lbl = ws.cell(
-        row=row_num, column=S4_COL_REF,
-        value="check digit should be zero",
-    )
-    c_lbl.font      = Font(name="Calibri", size=10, italic=True,
-                           color="FF0070C0")   # blue italic — matches screenshot
-    c_lbl.fill      = FILL_WHITE
-    c_lbl.alignment = ALIGN_CTR
-    # thin outer border on the merged label cell
-    _apply_range_border(ws, row_num, S4_COL_REF, row_num, S4_COL_BAL,
-                        style="thin")
-
-    # ── Value: col G  (white fill — NOT green on check-digit row) ────────────
-    if ta_val is not None and tlse_val is not None:
-        # raw dollar difference — keeps full precision
-        check = float(ta_val - tlse_val)
-    else:
-        check = None
-
-    c_chk = ws.cell(row=row_num, column=S4_COL_RND, value=check)
-    c_chk.font          = Font(name="Calibri", size=10, bold=False,
-                               color="FF000000")
-    c_chk.fill          = FILL_WHITE                 # white, not green
-    c_chk.alignment     = ALIGN_RIGHT
-    c_chk.number_format = '#,##0;(#,##0)'            # whole number, negatives in ()
-    _apply_range_border(ws, row_num, S4_COL_RND, row_num, S4_COL_RND,
-                        style="thin")
-
-
-# ------------------------------------------------------------------------------
-# 10-G  Main Sheet-4 builder
-# ------------------------------------------------------------------------------
-
-S4_SHEET_NAME = "4) Balance Sheet Tieout"
-
-def build_sheet4(wb: Workbook, ytd_df, prev_df) -> None:
-    """
-    Creates / overwrites the '4) Balance Sheet Tieout' worksheet.
-
-    Parameters
-    ----------
-    wb       – openpyxl Workbook
-    ytd_df   – TB_03312026  (3/31/2026 balances — balance-sheet point-in-time)
-    prev_df  – TB_12312025  (used ONLY to fetch BK = allowance for doubtful accts)
-    """
-    # -- create or replace sheet -----------------------------------------------
-    if S4_SHEET_NAME in wb.sheetnames:
-        del wb[S4_SHEET_NAME]
-    ws = wb.create_sheet(title=S4_SHEET_NAME)
+    entity, main_posts, side_posts = get_columns(df)
+    n_cols = 1 + len(entity) + len(main_posts) + len(side_posts)
+
+    # column widths
+    ws.column_dimensions["A"].width = TB_COL_WIDTHS["spacer"]
+    ws.column_dimensions[get_column_letter(COL_ACCOUNT)].width = TB_COL_WIDTHS["account"]
+    for c in range(COL_ACCOUNT + 1, n_cols + 2):
+        ws.column_dimensions[get_column_letter(c)].width = TB_COL_WIDTHS["other"]
+    ws.freeze_panes = f"{get_column_letter(COL_ACCOUNT + 1)}{TB_FIRST_TABLE_ROW}"
+
+    # banner rows
+    for r, (text, size, bold, green) in enumerate(TB_BANNERS, start=1):
+        ws.row_dimensions[r].height = H_BAND
+        put(ws, r, COL_ACCOUNT, text.format(as_of=as_of_text),
+            font=make_font(size=size, bold=bold),
+            border=("medium", GREEN) if green else None)
+    ws.row_dimensions[len(TB_BANNERS) + 1].height = H_SPACER
+
+    # note box
+    (r1, r2), (c1, c2) = TB_NOTE_ROWS, TB_NOTE_COLS
+    ws.row_dimensions[r1].height = TB_NOTE_TOP_HEIGHT
+    for r in range(r1 + 1, r2 + 1):
+        ws.row_dimensions[r].height = H_ROW
+    put(ws, r1, c1, TB_NOTE_TEXT, fill=FILL_GREY, align=ALIGN_LEFT_TOP,
+        end_row=r2, end_col=c2)
+
+    # tables
+    bs_rows, is_rows = split_bs_is(df)
+    nxt = write_tb_table(ws, TB_SECTION_BS, bs_rows, entity, main_posts,
+                         side_posts, TB_FIRST_TABLE_ROW)
+    if is_rows:
+        write_tb_table(ws, TB_SECTION_IS, is_rows, entity, main_posts,
+                       side_posts, nxt)
+
+
+# ── 2D. Tie-out tabs ──────────────────────────────────────────────────────────
+def write_header(ws, r, C, labels, has_qtd, height, tags=True):
+    """Column header row (+ 'Tab 1' / 'Rx' tag row under it). Uses rows r, r+1."""
+    ws.row_dimensions[r].height = height
+    ws.row_dimensions[r + 1].height = H_SMALL
+    put(ws, r, C.symbol, labels["code"], font=FONT_HDR, fill=FILL_GREY,
+        align=ALIGN_CENTER_WRAP, end_col=C.code)
+    put(ws, r, C.ref, labels["ref"], font=FONT_HDR, fill=FILL_GREY,
+        align=ALIGN_CENTER_WRAP)
+    for attr, tag, red in AMOUNT_COLUMNS[: 4 if has_qtd else 2]:
+        font = FONT_HDR_RED if red else FONT_HDR
+        put(ws, r, getattr(C, attr), labels[attr], font=font, fill=FILL_GREY,
+            align=ALIGN_CENTER_WRAP)
+        if tags:
+            put(ws, r + 1, getattr(C, attr), tag, font=font, fill=FILL_GREY)
+
+
+def write_amounts(ws, r, C, bal_attr, rnd_attr, val, font, fmt):
+    """Raw-dollar cell + green rounded-in-millions cell."""
+    put(ws, r, getattr(C, bal_attr), money(val), font=font, align=ALIGN_RIGHT, fmt=fmt)
+    rounded = None if val is None else float(round(val / MILLION, ROUND_DIGITS))
+    put(ws, r, getattr(C, rnd_attr), rounded, font=font, fill=FILL_GREEN,
+        align=ALIGN_RIGHT, fmt=ROUNDED_FMT)
+
+
+def write_data_row(ws, r, C, row, ytd, qtd, fmt):
+    ws.row_dimensions[r].height = H_ROW
+    is_calc = row.kind in ("calc", "total")
+    font = FONT_BOLD if row.bold else FONT_BODY
+    symbol = {"sigma": "\u03A3", "calc": "Rx"}.get(row.kind)
+
+    put(ws, r, C.symbol, symbol, font=FONT_SYM_RED if is_calc else FONT_SYM_BLUE)
+    put(ws, r, C.code, row.codes or None, font=FONT_CODE)
+    put(ws, r, C.ref, row.label, font=font, align=ALIGN_LEFT)
+    write_amounts(ws, r, C, "bal", "rnd", ytd, font, fmt)
+    if qtd is not None:
+        write_amounts(ws, r, C, "qbal", "qrnd", qtd, font, fmt)
+
+
+def write_py_row(ws, r, C, row, fmt):
+    """Prior-year row: user types the numbers into the red boxes."""
+    ws.row_dimensions[r].height = H_ROW
+    put(ws, r, C.symbol, "PY", font=FONT_SYM_RED)
+    put(ws, r, C.code, row.py_ref, font=FONT_PY_REF, align=ALIGN_CENTER_WRAP)
+    put(ws, r, C.ref, row.label, align=ALIGN_LEFT, border=("thin", GREEN))
+    put(ws, r, C.bal, align=ALIGN_RIGHT, fmt=fmt, border=("medium", RED))
+    put(ws, r, C.rnd, fill=FILL_GREEN, align=ALIGN_RIGHT, fmt=ROUNDED_FMT,
+        border=("medium", RED))
+
+
+def write_table(ws, spec, table, row, look, done):
+    """Draw one table starting at `row`. Returns the next free row."""
+    C = MAIN_COLS
+    last = C.qrnd if table.has_qtd else C.rnd
+    ws.row_dimensions[row].height = H_BAND
+    put(ws, row, C.symbol, table.title, font=FONT_BOLD, fill=FILL_GREY, end_col=last)
+
+    if table.note_only:                                   # empty box to type in
+        for r in range(row + 1, row + 4):
+            ws.row_dimensions[r].height = H_SMALL
+        put(ws, row + 1, C.symbol, align=ALIGN_LEFT_TOP, end_row=row + 3, end_col=C.rnd)
+        return row + 4
+
+    write_header(ws, row + 1, C, spec.labels, table.has_qtd, spec.header_height)
+    periods = ("ytd", "qtd") if table.has_qtd else ("ytd",)
+    r = row + 3
+
+    for rw in table.rows:
+        if rw.kind == "blank":
+            ws.row_dimensions[r].height = H_SPACER
+        elif rw.kind == "subtitle":
+            ws.row_dimensions[r].height = H_SMALL
+            for col in range(C.symbol, last + 1):
+                put(ws, r, col, rw.label if col == C.ref else None,
+                    font=FONT_ITALIC, fill=FILL_GREY, align=ALIGN_LEFT)
+        elif rw.kind == "sub_header":
+            write_header(ws, r, C, spec.sub_labels or spec.labels,
+                         table.has_qtd, H_SUBHDR)
+            r += 1                                        # header uses two rows
+        elif rw.kind == "py":
+            write_py_row(ws, r, C, rw, spec.balance_fmt)
+        else:                                             # sigma / calc / total
+            values = {}
+            for p in periods:
+                values[p] = resolve(rw, look[p], done[p])
+                done[p][rw.key] = values[p]
+            write_data_row(ws, r, C, rw, values["ytd"], values.get("qtd"),
+                           spec.balance_fmt)
+        r += 1
+    return r
+
+
+def write_side_table(ws, spec, look):
+    side = spec.side
+    S, r = SIDE_COLS, side.start_row
+    ws.row_dimensions[r].height = H_SMALL
+    put(ws, r, S.symbol, side.caption, font=FONT_BOLD, align=ALIGN_LEFT,
+        end_col=S.rnd, border=None)
+    write_header(ws, r + 1, S, side.labels, False, spec.header_height, tags=False)
+    value = look[side.source].get(side.code, ZERO)
+    write_data_row(ws, r + 2, S, sigma("side", side.code, side.label),
+                   value, None, spec.balance_fmt)
+
+
+def write_check_digit(ws, r, spec, look, done):
+    C = MAIN_COLS
+    ws.row_dimensions[r].height = H_ROW
+    put(ws, r, C.ref, spec.check.label, font=FONT_CHECK, end_col=C.bal)
+    diff = evaluate(spec.check.formula, look["ytd"], done["ytd"])
+    put(ws, r, C.rnd, float(diff), align=ALIGN_RIGHT, fmt=CHECK_FMT)
+
+
+def build_tieout_sheet(wb, spec, look):
+    if spec.name in wb.sheetnames:
+        del wb[spec.name]
+    ws = wb.create_sheet(spec.name)
     ws.sheet_view.showGridLines = False
+    for col, width in spec.col_widths.items():
+        ws.column_dimensions[get_column_letter(col)].width = width
+    ws.freeze_panes = spec.freeze
 
-    # -- column widths ---------------------------------------------------------
-    col_widths = {
-        1:  2,   # A  spacer
-        2:  6,   # B  symbol
-        3:  10,  # C  grouping code
-        4:  46,  # D  references  (wide)
-        5:  2,   # E  thin gap
-        6:  20,  # F  3/31/26 balance
-        7:  14,  # G  rounded  – green
-        8:  3,   # H  gap before side table
-        9:  6,   # I  side symbol
-        10: 10,  # J  side code
-        11: 36,  # K  side reference label
-        12: 2,   # L  thin gap
-        13: 18,  # M  side YTD balance
-        14: 14,  # N  side rounded – green
-    }
-    for col_idx, width in col_widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+    # rows 1-3 title lines, row 4 spacer, row 5 intro band, then spacers
+    for r, (text, size, bold) in enumerate(spec.header_lines, start=1):
+        ws.row_dimensions[r].height = H_TITLE_LINE
+        put(ws, r, MAIN_COLS.symbol, text, font=make_font(size=size, bold=bold),
+            align=ALIGN_LEFT, border=None)
+    ws.row_dimensions[4].height = H_SPACER
+    ws.row_dimensions[5].height = H_TITLE_LINE
+    put(ws, 5, MAIN_COLS.symbol, spec.intro_text, fill=spec.intro_fill,
+        align=ALIGN_LEFT, end_col=MAIN_COLS.rnd)
+    for r in range(6, spec.first_table_row):
+        ws.row_dimensions[r].height = H_SPACER
 
-    # -- page header rows 1–3 -------------------------------------------------
-    headers = [
-        ("Broadridge Financial Solutions, Inc.", 11, True),
-        ("Q3\u201926 10-Q Tie Out",              11, True),
-        ("3/31/2026",                            10, False),
-    ]
-    for r, (text, sz, bold) in enumerate(headers, start=1):
-        ws.row_dimensions[r].height = 16
-        c = ws.cell(row=r, column=S4_COL_SYMBOL, value=text)
-        _s3_apply(c,
-                  font=make_font(BLACK, size=sz, bold=bold),
-                  fill=FILL_WHITE,
-                  border=BORDER_NONE,
-                  align=ALIGN_LEFT)
+    # tables. `done` remembers calculated rows so formulas can use them.
+    done = {"ytd": {}, "qtd": {}}
+    row = spec.first_table_row
+    for table in spec.tables:
+        end = write_table(ws, spec, table, row, look, done)
+        row = end + TABLE_GAP_ROWS
 
-    # -- row 4: thin spacer ---------------------------------------------------
-    ws.row_dimensions[4].height = 6
-
-    # -- row 5: note box  (single row, cols B–G) ------------------------------
-    ws.row_dimensions[5].height = 16
-    note_text = (
-        "Note: This tab is prepared by D&T to tie out the balance sheet "
-        "within the Form 10-Q maintained at"
-    )
-    ws.merge_cells(start_row=5, start_column=S4_COL_SYMBOL,
-                   end_row=5,   end_column=S4_COL_LAST)
-    c_note = ws.cell(row=5, column=S4_COL_SYMBOL, value=note_text)
-    _s3_apply(c_note,
-              font=make_font(BLACK, size=10, bold=False),
-              fill=FILL_WHITE,
-              border=BORDER_STD,
-              align=ALIGN_LEFT)
-
-    # -- rows 6–6: spacer before table ----------------------------------------
-    ws.row_dimensions[6].height = 6
-
-    # -- row 7: table title band ----------------------------------------------
-    TABLE_FIRST_ROW = 7
-    _write_s3_title_banner(ws, TABLE_FIRST_ROW,
-                           BS4_TABLE.title, S4_COL_LAST)
-
-    # -- row 8: column headers ------------------------------------------------
-    _write_s4_col_headers(ws, TABLE_FIRST_ROW + 1)
-
-    # -- row 9: source tags ---------------------------------------------------
-    _write_s4_source_tags(ws, TABLE_FIRST_ROW + 2)
-
-    # -- build lookups  (Sheet 4 uses YTD 3/31/26 for main table) -------------
-    ytd_lookup, _qtd_unused = _build_lookups(ytd_df, prev_df)
-    prev_lookup, _          = _build_lookups(prev_df, prev_df)   # prev only for BK
-
-    # -- data rows start at row 10 --------------------------------------------
-    cur_row  = TABLE_FIRST_ROW + 3          # row 10
-    computed: dict[str, Decimal | None] = {}
-
-    # track the absolute Excel row where the first non-blank data row lands
-    # (used to anchor the side table at the same vertical position)
-    first_data_excel_row: int | None = None
-
-    for row_def in BS4_TABLE.rows:
-
-        # blank spacer
-        if row_def.row_type == BLANK:
-            ws.row_dimensions[cur_row].height = 6
-            cur_row += 1
-            continue
-
-        # italic subtitle band
-        if row_def.row_type == SUBTITLE:
-            ws.row_dimensions[cur_row].height = 14
-            c = ws.cell(row=cur_row, column=S4_COL_REF, value=row_def.label)
-            _s3_apply(c,
-                      font=ITALIC_BOLD,
-                      fill=FILL_LIGHT_GREY,
-                      border=BORDER_HAIR,
-                      align=ALIGN_LEFT)
-            # extend the subtitle band across all main-table cols
-            for col in range(S4_COL_SYMBOL, S4_COL_LAST + 1):
-                if col != S4_COL_REF:
-                    cc = ws.cell(row=cur_row, column=col)
-                    cc.fill   = FILL_LIGHT_GREY
-                    cc.border = BORDER_HAIR
-            cur_row += 1
-            continue
-
-        # resolve value
-        val = _resolve(row_def, ytd_lookup, computed)
-        computed[row_def.row_key] = val
-
-        # record the first real data row (for side-table anchor)
-        if first_data_excel_row is None:
-            first_data_excel_row = cur_row
-
-        _write_s4_data_row(ws, cur_row, row_def, val)
-        cur_row += 1
-
-    # -- "Total liabilities and stockholders' equity" is the last TOTAL row ---
-    ta_val   = computed.get("bs4_ta")     # Total assets
-    tlse_val = computed.get("bs4_tlse")   # Total liabilities and stockholders' equity
-
-    cur_row += 1                          # row 47 → blank spacer
-    ws.row_dimensions[cur_row].height = 6
-    cur_row += 1                          # row 49 → check-digit row
-    _write_s4_check_digit(ws, cur_row, ta_val, tlse_val)
-
-    # -- side mini-table  ([1] Allowance for doubtful accounts) ---------------
-    # Anchor it at the row where "Cash and cash equivalents" (AP) appears.
-    # From the image that is row 11 (title at 10, side-hdr at 11, data at 12).
-    # We derive it from first_data_excel_row (the first AP data row).
-    if first_data_excel_row is not None:
-        side_start = first_data_excel_row - 1   # one row above first data → caption
-    else:
-        side_start = TABLE_FIRST_ROW + 3
-
-    # BK is sourced from TB_12312025 (prior year / prior period balance)
-    bk_val = prev_lookup.get("BK", Decimal(0))
-    _write_s4_side_table(ws, bk_val, side_start)
-
-    # -- freeze panes below header section ------------------------------------
-    ws.freeze_panes = ws.cell(row=TABLE_FIRST_ROW + 3, column=S4_COL_REF)
+    if spec.check:
+        ws.row_dimensions[end + 1].height = H_SPACER
+        write_check_digit(ws, end + 2, spec, look, done)
+    if spec.side:
+        write_side_table(ws, spec, look)
 
 
-# ==============================================================================
-# SECTION 8 (UPDATED) — Orchestrator  — add Sheet 4 call
-# ==============================================================================
-
-def build_workbook(configs: list[SheetConfig]) -> Workbook:
+# ── 2E. Orchestrator ──────────────────────────────────────────────────────────
+def build_workbook():
     wb = Workbook()
+    for i, (df, as_of_text) in enumerate(TB_SHEETS):
+        ws = wb.active if i == 0 else wb.create_sheet()
+        ws.title = tb_sheet_name(as_of_text)
+        build_tb_sheet(ws, df, as_of_text)
 
-    for idx, cfg in enumerate(configs):
-        ws       = wb.active if idx == 0 else wb.create_sheet()
-        ws.title = cfg.sheet_name
-        build_tb_tieout(ws, cfg)
-
-    build_sheet3(wb, TB_03312026, TB_12312025)
-    build_sheet4(wb, TB_03312026, TB_12312025)   # ← NEW
-
+    look = load_lookups(CURRENT_TB, PRIOR_TB)      # dataframes read once here
+    for spec in TIEOUT_SHEETS:
+        build_tieout_sheet(wb, spec, look)
     return wb
-# ==============================================================================
+
+
+def selfcheck():
+    """Fails fast if formula parsing or tab naming breaks."""
+    d = {"a": Decimal(5), "b": Decimal(2)}
+    assert evaluate("a - b + c", {"c": Decimal(1)}, d) == Decimal(4)
+    assert evaluate("x", {}, {}) == ZERO
+    assert tb_sheet_name("As Of Period: 9-26 (3/31/2026)") == "Trial Balance 9-26"
+    keys = [r.key for t in SHEET_3.tables for r in t.rows if r.key]
+    assert len(keys) == len(set(keys)), "duplicate row keys in SHEET_3"
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
-workbook = build_workbook(SHEET_CONFIGS)
+selfcheck()
+workbook = build_workbook()
 
-cp.openpyxl.write(
-    workbook,
-    str(f"{OUTPUT_DIRECTORY}/TB TieOut.xlsx"),
-    register=True,
-)
-
-
+cp.openpyxl.write(workbook, OUTPUT_FILE, register=True)
