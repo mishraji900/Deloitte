@@ -1,317 +1,106 @@
-// filename : UploadScreen.jsx
-import React, { useState } from 'react';
+# ============ VALIDATION: RAW vs FINAL PARQUET ============
+import pandas as pd
+from openpyxl import Workbook
 
-export default function UploadScreen({ onContinue }) {
-  const [selectedFiles, setSelectedFiles] = useState([]);
-  const [status, setStatus] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [dragging, setDragging] = useState(false);
+# ---------- CONFIG (only edit here) ----------
+BASE       = "06/30/2026"                      # left-join base = key into SOURCES + final col name
+FINAL_DF   = read(Path(OUTPUT_DIRECTORY) / "TB_Final.parquet")
+VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
+KEY, TOL   = "Account", 0.01
 
-  async function handleSelectFiles() {
-    const files = await window.api.selectFiles();
+def _keep_col(df, col, drop=("",)):             # BALANCE SHEET style: rename -> Account, drop blank/null
+    df = df.filter(~(F.col(col).isin(*drop) | F.col(col).isNull()))
+    return df.withColumnRenamed(col, KEY).withColumn(KEY, F.upper(F.col(KEY)))
 
-    if (files && files.length) {
-      addFiles(files);
-    }
-  }
+def prep_cy0630(df):                            # same logic as pipeline cell
+    df = (df.withColumnRenamed("Account", "Description")
+            .withColumnRenamed("Linked TB Account #", "Acct"))
+    df = df.filter(F.col("Acct").isNotNull() & (F.col("Acct") != ""))
+    return df.withColumn(KEY, F.upper(F.concat_ws(": ", "Acct", "Description")))
 
-  function addFiles(newFiles) {
-    setSelectedFiles(prev => {
-      const merged = [...prev, ...newFiles];
-
-      // remove duplicates
-      return [...new Set(merged)];
-    });
-
-    setStatus('');
-  }
-
-  function handleDragOver(e) {
-    e.preventDefault();
-    setDragging(true);
-  }
-
-  function handleDragLeave(e) {
-    e.preventDefault();
-    setDragging(false);
-  }
-
-  function handleDrop(e) {
-    e.preventDefault();
-    setDragging(false);
-
-    const files = [...e.dataTransfer.files];
-
-    if (!files.length) return;
-
-    const allowed = ['.xls', '.xlsx', '.xlsm'];
-
-    const invalidFiles = files.filter(
-      file =>
-        !allowed.some(ext =>
-          file.name.toLowerCase().endsWith(ext)
-        )
-    );
-
-    const filePaths = files
-      .filter(file =>
-        allowed.some(ext =>
-          file.name.toLowerCase().endsWith(ext)
-        )
-      )
-      .map(file => file.path);
-
-    if (!filePaths.length) {
-      setStatus(
-        'Please drop only Excel files (.xls, .xlsx, .xlsm)'
-      );
-      return;
-    }
-
-    if (invalidFiles.length > 0) {
-      setStatus(
-        `${invalidFiles.length} non-Excel file(s) were ignored.`
-      );
-    }
-
-    addFiles(filePaths);
-  }
-
-  function getFileBadge(filepath) {
-    const name = filepath.toLowerCase();
-
-    if (name.includes('plan operations')) {
-      return {
-        label: 'Plan Ops',
-        cls: 'badge-plan'
-      };
-    }
-
-    if (name.includes('net trust assets')) {
-      return {
-        label: 'Net Trust',
-        cls: 'badge-trust'
-      };
-    }
-
-    return {
-      label: 'File',
-      cls: 'badge-neutral'
-    };
-  }
-
-  function getFileName(filepath) {
-    return filepath.split(/[\\/]/).pop();
-  }
-
-  function removeFile(filepath) {
-    setSelectedFiles(prev =>
-      prev.filter(f => f !== filepath)
-    );
-  }
-
-  const planCount = selectedFiles.filter(f =>
-    f.toLowerCase().includes('plan operations')
-  ).length;
-
-  const trustCount = selectedFiles.filter(f =>
-    f.toLowerCase().includes('net trust assets')
-  ).length;
-
-  async function handleContinue() {
-    setBusy(true);
-    setStatus('Converting files...');
-
-    try {
-      const result = await window.api.convertFiles(
-        selectedFiles
-      );
-
-      setStatus('Identifying files...');
-
-      const planFile = result.files.find(f =>
-        f.original
-          .toLowerCase()
-          .includes('plan operations')
-      );
-
-      const trustFile = result.files.find(f =>
-        f.original
-          .toLowerCase()
-          .includes('net trust assets')
-      );
-
-      if (!planFile || !trustFile) {
-        setStatus(
-          'Error: could not identify both required files.'
-        );
-        setBusy(false);
-        return;
-      }
-
-      if (
-        planFile.status === 'error' ||
-        trustFile.status === 'error'
-      ) {
-        setStatus(
-          'Conversion error: ' +
-            (planFile.error ||
-              trustFile.error ||
-              'unknown')
-        );
-
-        setBusy(false);
-        return;
-      }
-
-      onContinue({
-        planFile: planFile.converted,
-        trustFile: trustFile.converted
-      });
-    } catch (err) {
-      setStatus('Error: ' + err.message);
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="page">
-      <div className="steps">
-        <div className="step active">
-          <div className="step-num">1</div>
-          <span>Select Files</span>
-        </div>
-
-        <div className="step-line" />
-
-        <div className="step">
-          <div className="step-num">2</div>
-          <span>Map Sheets</span>
-        </div>
-
-        <div className="step-line" />
-
-        <div className="step">
-          <div className="step-num">3</div>
-          <span>Validate</span>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-icon">📂</div>
-
-        <h1>Select your files</h1>
-
-        <p className="hint">
-          Choose 2 Excel files — one containing
-          "plan operations" and one containing
-          "net trust assets" in the filename.
-        </p>
-
-        <div className="format-tags">
-          <span className="tag">.xlsx</span>
-          <span className="tag">.xls</span>
-          <span className="tag">.xlsm</span>
-        </div>
-
-        {selectedFiles.length > 0 && (
-          <ul className="file-list">
-            {selectedFiles.map((f, i) => {
-              const badge = getFileBadge(f);
-
-              return (
-                <li
-                  key={i}
-                  className="file-item"
-                >
-                  <span className="file-item-icon">
-                    📄
-                  </span>
-
-                  <span className="file-item-name">
-                    {getFileName(f)}
-                  </span>
-
-                  <span
-                    className={`file-item-badge ${badge.cls}`}
-                  >
-                    {badge.label}
-                  </span>
-
-                  <button
-                    className="remove-file-btn"
-                    onClick={() =>
-                      removeFile(f)
-                    }
-                  >
-                    ✕
-                  </button>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-
-        <div
-          className={`dropzone ${
-            dragging ? 'dragging' : ''
-          }`}
-          onDragOver={handleDragOver}
-          onDragLeave={handleDragLeave}
-          onDrop={handleDrop}
-        >
-          <div className="dropzone-icon">
-            ⬆
-          </div>
-
-          <p>
-            Drag & Drop Excel files here
-          </p>
-
-          <span>
-            Accepted: .xls, .xlsx, .xlsm
-          </span>
-        </div>
-
-        {(planCount !== 1 ||
-          trustCount !== 1) && (
-          <div className="status">
-            Please select exactly one
-            Plan Operations file and one
-            Net Trust Assets file.
-          </div>
-        )}
-
-        {status && (
-          <div className="status">
-            {status}
-          </div>
-        )}
-
-        <div className="btn-row">
-          <button
-            className="btn btn-ghost"
-            onClick={handleSelectFiles}
-            disabled={busy}
-          >
-            Add Files
-          </button>
-
-          <button
-            className="btn btn-primary"
-            onClick={handleContinue}
-            disabled={
-              busy ||
-              planCount !== 1 ||
-              trustCount !== 1
-            }
-          >
-            {busy
-              ? 'Processing...'
-              : 'Convert & Continue →'}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
+SOURCES = {   # label must equal the period column name in final parquet
+    "06/30/2026": dict(path=excel_path_CY_0630,
+                       sheet=["Balance Sheet TB Links", "Income Statement TB Links"], header=1,
+                       cols=Columns_CY_0630, prep=prep_cy0630),
+    "09/30/2025": dict(path=excel_path_CY_0930, sheet=["3) 9.30.2025"], header=8,
+                       cols=Columns_CY_0930, prep=lambda d: _keep_col(d, "BALANCE SHEET")),
+    "06/30/2025": dict(path=excel_path_PY_0630, sheet=["4) 6.30.2025"], header=7,
+                       cols=Columns_PY_0630, prep=lambda d: _keep_col(d, "BALANCE SHEET")),
+    "09/30/2024": dict(path=excel_path_PY_0930, sheet=["TB Report - LE Close USD (Histo"], header=9,
+                       cols=Columns_PY_0930,
+                       prep=lambda d: _keep_col(d, "__UNNAMED__0", ("", "BALANCE SHEET"))),
 }
+# ---------------------------------------------
+
+def _tot(cols):
+    return sum((F.coalesce(F.col(c).cast("double"), F.lit(0.0)) for c in cols), F.lit(0.0))
+
+def _scalar(df, expr):
+    return float(df.agg(F.coalesce(F.sum(expr), F.lit(0.0))).first()[0])
+
+# 1) raw -> kept -> per-key aggregate
+info, aggs = {}, {}
+for lbl, s in SOURCES.items():
+    raw  = read_excel(s["path"], sheet_name=s["sheet"], header=s["header"],
+                      naming_convention="neutral", trim=True)
+    kept = s["prep"](raw).select(KEY, _tot(s["cols"]).alias("v"))
+    agg  = kept.groupBy(KEY).agg(F.sum("v").alias("v"), F.count("*").alias("n")).cache()
+    aggs[lbl] = agg
+    raw_rows, raw_total = raw.count(), _scalar(raw.select(_tot(s["cols"]).alias("v")), "v")
+    kept_rows, kept_total = kept.count(), _scalar(kept, "v")
+    info[lbl] = dict(raw_rows=raw_rows, raw_total=raw_total,
+                     filtered_out_rows=raw_rows - kept_rows,
+                     filtered_out_total=raw_total - kept_total,
+                     kept_rows=kept_rows, kept_total=kept_total,
+                     distinct_keys=agg.count(), dup_keys=agg.filter("n > 1").count())
+
+# 2) included / excluded vs base (left-join semantics) + compare to final parquet
+base = aggs[BASE]
+final_rows = FINAL_DF.count()
+final_keys = FINAL_DF.select(KEY).distinct().count()
+summary, detail = [], []
+
+for lbl, agg in aggs.items():
+    inc = agg if lbl == BASE else agg.join(base.select(KEY), KEY, "left_semi")   # in source AND base -> in final
+    exc = agg.join(base.select(KEY), KEY, "left_anti") if lbl != BASE else agg.limit(0)  # source-only -> dropped by left join
+    miss = base.join(agg.select(KEY), KEY, "left_anti") if lbl != BASE else base.limit(0)  # base-only -> zero-filled
+
+    inc_total, exc_total = _scalar(inc, "v"), _scalar(exc, "v")
+    final_total = _scalar(FINAL_DF, F.col(f"`{lbl}`"))
+    diff = final_total - inc_total
+
+    summary.append({"Source": lbl, **info[lbl],
+        "Included_Keys(in base)": inc.count(), "Included_Total": inc_total,
+        "Excluded_Keys(not in base)": exc.count(), "Excluded_Total": exc_total,
+        "Base_Keys_Missing_In_Source(zero-filled)": miss.count(),
+        "Final_Total": final_total, "Final_minus_Included": diff,
+        "Status": "PASS" if abs(diff) <= TOL and info[lbl]["dup_keys"] == 0 else "FAIL"})
+
+    for reason, d in [("EXCLUDED - in source, not in base", exc),
+                      ("ZERO-FILLED - in base, not in source", miss)]:
+        p = d.select(KEY, "v").toPandas()
+        if len(p):
+            p.insert(0, "Reason", reason); p.insert(0, "Source", lbl)
+            detail.append(p)
+
+summary_pd = pd.DataFrame(summary)
+detail_pd  = pd.concat(detail) if detail else pd.DataFrame(columns=["Source", "Reason", KEY, "v"])
+rows_pd = pd.DataFrame([{
+    "Base_Distinct_Keys": info[BASE]["distinct_keys"], "Final_Rows": final_rows,
+    "Final_Distinct_Keys": final_keys,
+    "Status": "PASS" if final_rows == info[BASE]["distinct_keys"] == final_keys else "FAIL (join fan-out / dup keys)"}])
+
+# 3) write excel via cp.openpyxl
+wb = Workbook(); wb.remove(wb.active)
+for name, pdf in [("Summary", summary_pd), ("Row_Check", rows_pd), ("Included_Excluded_Detail", detail_pd)]:
+    ws = wb.create_sheet(name)
+    ws.append(list(pdf.columns))
+    for r in pdf.itertuples(index=False):
+        ws.append(list(r))
+    for c in ws[1]:
+        c.font = c.font.copy(bold=True)
+    ws.freeze_panes = "A2"
+cp.openpyxl.write(wb, VALID_XLSX, register=True)
+
+display(spark.createDataFrame(summary_pd.astype(str)))
+print(rows_pd.to_string(index=False))
