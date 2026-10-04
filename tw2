@@ -1,7 +1,8 @@
-# ============ VALIDATION: RAW vs PARQUET vs FINAL DF vs EXCEL (TB Tieout) ============
+# ============ VALIDATION: RAW vs PARQUET vs FINAL DF vs EXCEL (TB Tieout) | serverless ============
+import numpy as np
 import pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Font
+from openpyxl.styles import Alignment, Font, PatternFill
 
 # ---------- CONFIG (only edit here) ----------
 VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_TieOut_Validation.xlsx"
@@ -24,7 +25,36 @@ SRC = {   # label order matters: 1st = current (YTD), 2nd = prior. QTD = cur - p
                      parquet=f"{OUTPUT_DIRECTORY}/TB_12312025.parquet",
                      final=TB_12312025, tab="Trial Balance 6-26"),
 }
+
+# Summary sheet = one stacked table per entry: (title bar, columns). Columns = keys of the summary row dict.
+TABLES = [
+    ("RAW - Excel vs Parquet snapshot",
+     ["Period", "Raw_Rows", "Raw_Total", "Parquet_Rows", "Parquet_Total"]),
+    ("FILTERED OUT - no Account",
+     ["Period", "NoAcct_Rows", "NoAcct_Total"]),
+    ("KEPT - after Account filter",
+     ["Period", "Kept_Rows", "Kept_Total"]),
+    ("FINAL - after mapping join (Diff must be 0)",
+     ["Period", "Final_Rows", "Final_Total", "Diff_Rows", "Diff_Total", "Fanout_Map_Accts", "Map_Unused_Accts"]),
+    ("EXCLUDED FROM TIE-OUT",
+     ["Period", "NoCode_Rows", "NoCode_Total", "Unused_Code_Count", "Unused_Code_Total", "Config_Codes_Missing"]),
+    ("EXCEL TB TAB - read-back",
+     ["Period", "PreBS_Rows", "PreBS_Total", "Expected_Excel_Rows", "Excel_Rows",
+      "Expected_Excel_Total", "Excel_Total", "Diff_Excel_Total"]),
+    ("DATA QUALITY",
+     ["Period", "DT_Nonzero_Rows", "DT_Abs_Total", "Bad_Cells", "Bad_Cols", "Dropped_Nonzero_Cols"]),
+    ("STATUS",
+     ["Period", "Status"]),
+]
+NAVY, BLUE, BAND = "1F3864", "0070C0", "DDEBF7"            # title bar / header / banded row
+ACC = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
+STATUS_FILL = {"PASS": "C6EFCE", "WARN": "FFEB9C", "FAIL": "FFC7CE"}
 # ---------------------------------------------
+
+def hold(df):
+    """Serverless: no cache/persist. Run plan once, keep result as in-memory df (also freezes row_id)."""
+    p = df.toPandas()
+    return spark.createDataFrame(p.astype(object).where(p.notna(), None), schema=df.schema)
 
 def bt(c): return F.col("`" + c.replace("`", "``") + "`")
 def num(c):   # same cleaning as pipeline ($ stripped), safe cast
@@ -42,14 +72,14 @@ def prep(df, s, full):
         df = df.withColumnRenamed(a, b)
     df = df.drop(*s["drop"])
     vals = [c for c in df.columns if c not in EXCLUDE]
-    if full:                                   # non-empty cells that fail numeric parse -> silently 0 in net total
+    if full:                                   # non-empty cells failing numeric parse -> silently 0 in net total
         r = df.agg(*[F.sum(F.when(bt(c).isNotNull() & (F.trim(bt(c).cast("string")) != "") & num(c).isNull(),
                                   1).otherwise(0)).alias(f"c{i}") for i, c in enumerate(vals)]).first()
         ex["bad"] = {c: r[i] for i, c in enumerate(vals) if r[i]}
     net = sum((F.coalesce(num(c), F.lit(0.0)) for c in vals), F.lit(0.0))
     k = df.select(F.col(ACCT).alias("A"), F.col("row_id").alias("I"), net.alias("V"),
                   F.coalesce(num(CONSOL), F.lit(0.0)).alias("B"))
-    return k.cache(), ex
+    return hold(k), ex
 
 def det(lab, reason, df, v="V"):
     p = (df.filter(F.col(v) != 0)
@@ -73,13 +103,45 @@ def excel_tb(wb, name):
             tot += float(v) if isinstance(v, (int, float)) else 0.0
     return n, tot
 
+# ---------- excel writer: one stacked table per block ----------
+def _fill(c): return PatternFill("solid", fgColor=c)
+
+def block(ws, r, title, cols, rows):
+    """Title bar + header + banded rows starting at row r. Returns next free row (one blank row gap)."""
+    n = len(cols)
+    if n > 1:
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n)
+    for j in range(1, n + 1):
+        ws.cell(r, j).fill = _fill(NAVY)
+    ws.cell(r, 1, title).font = Font(bold=True, color="FFFFFF")
+    for j, c in enumerate(cols, 1):
+        h = ws.cell(r + 1, j, c)
+        h.font, h.fill = Font(bold=True, color="FFFFFF"), _fill(BLUE)
+        h.alignment = Alignment(horizontal="center", vertical="center")
+    for i, row in enumerate(rows):
+        for j, c in enumerate(cols, 1):
+            v = row.get(c)
+            if isinstance(v, np.generic): v = v.item()
+            if isinstance(v, float) and v != v: v = None                 # NaN -> blank
+            cell = ws.cell(r + 2 + i, j, v)
+            if i % 2 == 0: cell.fill = _fill(BAND)
+            if isinstance(v, bool): pass
+            elif isinstance(v, int) and c != "RowId": cell.number_format = "#,##0"
+            elif isinstance(v, float): cell.number_format = ACC
+            if c == "Status" and v in STATUS_FILL:
+                cell.fill, cell.font = _fill(STATUS_FILL[v]), Font(bold=True)
+    return r + len(rows) + 3
+
+def records(pdf):
+    return pdf.astype(object).where(pdf.notna(), None).to_dict("records")
+
 nan = float("nan")
 LABS = list(SRC)
 USED = ({c.strip() for sp in TIEOUT_SHEETS for t in sp.tables for r in t.rows if r.kind == "sigma" for c in r.codes.split("+")}
         | {sp.side.code for sp in TIEOUT_SHEETS if sp.side})          # codes the tie-out tabs actually read
 
-m = read_excel(MAP["path"], sheet_name=[MAP["sheet"]], header=MAP["header"],
-               naming_convention="neutral", trim=True).select(ACCT, CODE)
+m = hold(read_excel(MAP["path"], sheet_name=[MAP["sheet"]], header=MAP["header"],
+                    naming_convention="neutral", trim=True).select(ACCT, CODE))
 mcnt = m.filter(F.col(ACCT).isNotNull()).groupBy(ACCT).agg(F.count("*").alias("n"))
 mdup = mcnt.filter("n > 1").withColumnRenamed(ACCT, "A")
 
@@ -90,9 +152,9 @@ except Exception as e:
 
 summary, detail, cov = [], [], {}
 for lab, s in SRC.items():
-    raw = (read_excel(s["path"], sheet_name=[s["sheet"]], header=s["header"],
-                      naming_convention="neutral", trim=True)
-           .withColumn("row_id", F.monotonically_increasing_id()))
+    raw = hold(read_excel(s["path"], sheet_name=[s["sheet"]], header=s["header"],
+                          naming_convention="neutral", trim=True)
+               .withColumn("row_id", F.monotonically_increasing_id()))
     k, ex = prep(raw, s, True)
     ka = F.col("A").isNotNull()
     dt = F.abs(F.col("B") - F.col("V"))
@@ -111,8 +173,8 @@ for lab, s in SRC.items():
         print(f"[{lab}] parquet read failed:", e); pq_rows = pq_tot = nan
 
     # final df (after mapping join)
-    f = s["final"].select(F.col(ACCT).alias("A"), F.col("row_id").alias("I"),
-                          F.col(TOT).cast("double").alias("V"), F.col(CODE).alias("C")).cache()
+    f = hold(s["final"].select(F.col(ACCT).alias("A"), F.col("row_id").alias("I"),
+                               F.col(TOT).cast("double").alias("V"), F.col(CODE).alias("C")))
     nocode = F.col("C").isNull() | (F.trim(F.col("C")) == "")
     bs_id = f.filter(F.lower(F.col("A")) == BS_MARKER).agg(F.min("I")).first()[0]
     bs_id = -1 if bs_id is None else bs_id
@@ -139,9 +201,9 @@ for lab, s in SRC.items():
     # excel read-back
     ex_rows, ex_tot = (excel_tb(xwb, s["tab"]) if xwb is not None and s["tab"] in xwb.sheetnames else (nan, nan))
 
-    bad = (pd.isna(pq_rows) is False and (pq_rows != raw_rows or abs(pq_tot - raw_tot) > TOL)   # stale parquet
-           or f_rows != kept_rows or abs(f_tot - kept_tot) > TOL                                 # join fan-out / loss
-           or (not pd.isna(ex_rows) and (ex_rows != tab_rows or abs(ex_tot - tab_tot) > TOL)))   # excel != df
+    bad = ((not pd.isna(pq_rows) and (pq_rows != raw_rows or abs(pq_tot - raw_tot) > TOL))   # stale parquet
+           or f_rows != kept_rows or abs(f_tot - kept_tot) > TOL                              # join fan-out / loss
+           or (not pd.isna(ex_rows) and (ex_rows != tab_rows or abs(ex_tot - tab_tot) > TOL)))  # excel != df
     warn = (nc_rows or dt_rows or ex["bad"] or ex.get("dropped") or len(un) or cfg_missing or pre_rows
             or pd.isna(pq_rows) or pd.isna(ex_rows))
     summary.append({
@@ -163,32 +225,47 @@ for lab, s in SRC.items():
         "Status": "FAIL" if bad else ("WARN" if warn else "PASS")})
 
     det(lab, "NO ACCT - filtered out", k.filter(~ka))
-    det(lab, "D&T CHECK <> 0 (consol col - sum of entity cols)", k.filter(ka & (dt > TOL)).withColumn("D", F.col("B") - F.col("V")), v="D")
+    det(lab, "D&T CHECK <> 0 (consol col - sum of entity cols)",
+        k.filter(ka & (dt > TOL)).withColumn("D", F.col("B") - F.col("V")), v="D")
     det(lab, "NO CODE - on TB tab, not in tie-out", f.filter(nocode))
     det(lab, "ABOVE BS MARKER - not on TB tab", f.filter(pre))
-    det(lab, "MAP DUP - extra amount counted by join", k.filter(ka).join(mdup, "A").withColumn("D", F.col("V") * (F.col("n") - 1)), v="D")
+    det(lab, "MAP DUP - extra amount counted by join",
+        k.filter(ka).join(mdup, "A").withColumn("D", F.col("V") * (F.col("n") - 1)), v="D")
 
-# ---- code coverage sheet ----
+# ---- code coverage frame ----
 cov_pd = pd.DataFrame(cov).fillna(0.0)
 cov_pd = cov_pd.reindex(cov_pd.index.union(list(USED))).fillna(0.0).sort_index()
 if len(LABS) > 1:
     cov_pd[f"QTD_{LABS[0]}"] = cov_pd[LABS[0]] - cov_pd[LABS[1]]
 cov_pd["Used_In_TieOut"] = cov_pd.index.isin(USED)
 cov_pd = cov_pd.rename_axis("Grouping Code").reset_index()
+cov_pd.columns = [str(c) for c in cov_pd.columns]
 
-summary_pd = pd.DataFrame(summary)
 detail_pd = (pd.concat(detail, ignore_index=True) if detail
              else pd.DataFrame(columns=["Period", "Reason", "RowId", "Account", "Value"]))
 
 # ---- write excel via cp.openpyxl ----
-wb = Workbook(); wb.remove(wb.active)
-for name, pdf in [("Summary", summary_pd), ("Excluded_Detail", detail_pd), ("Code_Coverage", cov_pd)]:
-    ws = wb.create_sheet(name)
-    ws.append([str(c) for c in pdf.columns])
-    for r in pdf.astype(object).where(pdf.notna(), None).itertuples(index=False):
-        ws.append(list(r))
-    for c in ws[1]: c.font = Font(bold=True)
-    ws.freeze_panes = "A2"
+wb = Workbook()
+
+ws = wb.active; ws.title = "Summary"; ws.sheet_view.showGridLines = False
+r = 1
+for title, cols in TABLES:                       # separate stacked table per entry, same sheet
+    r = block(ws, r, title, cols, summary)
+ws.column_dimensions["A"].width = 14
+for c in "BCDEFGH": ws.column_dimensions[c].width = 24
+
+ws2 = wb.create_sheet("Excluded_Detail"); ws2.sheet_view.showGridLines = False
+block(ws2, 1, "EXCLUDED / FLAGGED ROWS", list(detail_pd.columns), records(detail_pd))
+for c, w in zip("ABCDE", (12, 50, 14, 45, 22)): ws2.column_dimensions[c].width = w
+ws2.freeze_panes = "A3"
+
+ws3 = wb.create_sheet("Code_Coverage"); ws3.sheet_view.showGridLines = False
+block(ws3, 1, "GROUPING CODE COVERAGE - used by tie-out tabs?", list(cov_pd.columns), records(cov_pd))
+ws3.column_dimensions["A"].width = 16
+for j in range(2, len(cov_pd.columns) + 1):
+    ws3.column_dimensions[chr(64 + j)].width = 22
+ws3.freeze_panes = "A3"
+
 cp.openpyxl.write(wb, VALID_XLSX, register=True)
 
-display(spark.createDataFrame(summary_pd.astype(str)))
+display(spark.createDataFrame(pd.DataFrame(summary).astype(str)))
