@@ -1,1526 +1,53 @@
-# Databricks notebook source
-# DBTITLE 0,Journal Entry Read-In and Mapping
-# MAGIC %md
-# MAGIC # Overview
-# MAGIC ---
-# MAGIC # =====================================================================
-# MAGIC # Broadridge FY27 Scoping Automation - Residual Analytic Pipeline
-# MAGIC # =====================================================================
-# MAGIC ### What this notebook does, top to bottom:
-# MAGIC    1. Read CY/PY Omnia trial-balance exports (Balance Sheet + Income
-# MAGIC       Statement) into Spark, tag every row with a stable row_id.
-# MAGIC    2. Detect "blue font" cells in the source Excel (D&T's manual
-# MAGIC       override marker) and map each one to (spark_column, row_id).
-# MAGIC    3. Cast GL numeric columns to Decimal for downstream math.
-# MAGIC    4. Grey-out the blue-marked cells in the Spark data.
-# MAGIC    5. Write the Quantitative / Qualitative Evaluation tables into the
-# MAGIC       ANA-347B template workbook (Tab 1 calc columns = live Excel formulas
-# MAGIC       that read materiality from C10).
-# MAGIC    6. Build the CY-vs-PY residual join and write the
-# MAGIC       "3. Residual Analytic" tab (parameter cells C6:C9 drive all formulas).
-# MAGIC    7. Write "3a. Times M by Entity" (per-account entity breakdown).
-# MAGIC    8. Write "3b. Residual Analytic by entity" (Tab-3b filtered view).
-# MAGIC    9. Save the finished workbook.
-# MAGIC # =====================================================================
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # 1. Initialize Environment
-# MAGIC ---
-
-# COMMAND ----------
-
-# DBTITLE 1,Initialize
-# MAGIC %run /Workspace/Shared/centralized_analytics/init_cp
-
-# COMMAND ----------
-
-# DBTITLE 1,Install libraries
-# MAGIC %%bash
-# MAGIC pip install \
-# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/pyod.git" \
-# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/cdm_tools.git" \
-# MAGIC     --quiet \
-# MAGIC     --index-url https://pypi.org/simple
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ##### Refer to below PyOD overview and CDM Tools documentations in GitHub.
-# MAGIC
-# MAGIC - [**PyOD**](https://psychic-adventure-prk2wj9.pages.github.io/): Overview in generic data transformations, file operations, and workflows
-# MAGIC - [**CDM Tools**](https://legendary-adventure-o7zy2on.pages.github.io/): Tools for validating and verifying CDM behavior
-
-# COMMAND ----------
-
-# DBTITLE 1,Import methods
-import datetime
-from pathlib import Path
-
-from pyspark.sql import functions as F, types as T
-
-from pyod.config import DataFrame
-from pyod.fs import find, read, read_excel, write
-from pyod.column import cast_dtype
-from pyod.dataframe import aggregate, diagnose, map_columns
-from pyod.logging import logger
-
-from cdm_tools import read_table
-from cdm_tools.models import GeneralLedgerDetail, TrialBalance, ChartOfAccounts
-from cdm_tools.analytics import JournalEntryTesting
-
-import re
-from collections import defaultdict
-from decimal import Decimal, InvalidOperation
-from numbers import Integral
-from typing import Iterable, Tuple
-from openpyxl.cell.cell import MergedCell
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.styles.differential import DifferentialStyle
-from openpyxl.utils import get_column_letter, range_boundaries
-from openpyxl.utils.cell import absolute_coordinate, coordinate_to_tuple, quote_sheetname
-from openpyxl.formatting.rule import FormulaRule
-from openpyxl.worksheet.formula import ArrayFormula   # needed for Tab 1 Mean/Median/Highest (openpyxl >= 3.1)
-from pyspark.sql import DataFrame, functions as F
-from pyspark.sql.window import Window
-from pyspark.sql.types import StringType
-
-# COMMAND ----------
-
-# This cell is for the user to run all the prerequisite codes above this line.
-# Please note that the user should scroll to the initialization section to initialize the notebook, else it would be waiting for all commands to run and it might time out and cause errors.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #2. Define Parameters
-# MAGIC ---
-# MAGIC
-# MAGIC Provide inputs required for journal entry reconciliation and downstream analytic(s).
-
-# COMMAND ----------
-
-# DBTITLE 1,Parameters
-OUTPUT_DIRECTORY: str = "SPEC-DATAPREP/FY27/Scoping Automation"
-
-MATERIALITY: int = 63370000                       # Audit materiality baseline; drives all "investigate" logic.
-THRESHOLD_VALUE: float = (MATERIALITY * 25) / 100   # $ trigger = 25% of materiality.
-THRESHOLD_PERCENTAGE: float = 15 / 100              # 15% movement trigger. Written to Tab 3 cell C8.
-INVESTIGATE_MULTIPLE: float = 1                     # Times-of-materiality trigger. Written to Tab 3 cell C9.
-
-# Source Omnia exports (inside a zip) + the empty template + the final output path.
-excel_path_CY: str = "User Imported Data/EFT_UP/FY27/Scoping Automation/TB_Omnia_Export/TB_Omnia_Export.zip/CY Omnia Export.xlsx"
-excel_path_PY: str = 'User Imported Data/EFT_UP/FY27/Scoping Automation/3.31.2026_Omnia_Export.xlsx'
-# excel_path_PY: str = 'User Imported Data/EFT_UP/FY27/Scoping Automation/TB_Omnia_Export/TB_Omnia_Export.zip/PY Omnia Export.xlsx'
-MANUAL_MAPPING_PATH = "User Imported Data/EFT_UP/FY27/Scoping Automation/Manual_Mapping.xlsx"
-TEMPLATE_PATH = (
-    "User Imported Data/EFT_UP/FY27/Scoping Automation/ANA-347B_Year-End_Residual_Analytic_Templet.xlsx"
-)
-OUTPUT_PATH = (
-    f"{OUTPUT_DIRECTORY}/Year End Residual analytics.xlsx"   # Written on the last line of the whole script.
-)
-VALIDATION_PATH = (
-    "SPEC-DATAPREP/FY27/Scoping Automation/validation.xlsx"
-)
-
-# COMMAND ----------
-
-def Ctrl_Totals(df, column_names):
-    agg_exprs = [F.sum(F.col(c)).alias(c) for c in column_names]
-    result_df = df.agg(*agg_exprs, F.count("*").alias("count"))
-    return result_df
-DISABLE_DISPLAY=False
-
-ready_for_logs = DISABLE_DISPLAY
-def display_mask(*args, **kwargs):
-    # Apply your masking or logging behavior here.
-    pass
-
-
-# Capture the original display function once, before replacing it.
-if "_original_display" not in globals():
-    _original_display = display
-
-
-def display_router(*args, **kwargs):
-    # This condition is evaluated every time display() is called.
-    if ready_for_logs:
-        return display_mask(*args, **kwargs)
-
-    return _original_display(*args, **kwargs)
-
-
-display = display_router
-
-def clean_df(df):
-    """
-    The function performs the following operations on the DataFrame:
-    1) Replace dot (.) with underscore (_) in all field names
-    2) Removes the leading and trailing spaces from all field names
-    3) Removes the leading and trailing spaces from all field values
-    """
-    new_columns = [
-        F.trim(F.expr(f"`{c}`")).alias(c.replace(".", "_").strip()) for c in df.columns
-    ]
-    return df.select(new_columns)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #3. Omnia Export Readin
-# MAGIC ---
-
-# COMMAND ----------
-
-cp.fs.ls('User Imported Data/EFT_UP/FY27/Scoping Automation',True)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SHARED UTILITIES
-# MAGIC ### =====================================================================
-# MAGIC  One implementation each of: string->Decimal parsing (`to_decimal`), grey-marker
-# MAGIC  check, text normalization, account-name key, record helpers.
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-GREY_MARKER = "__grey__"   # sentinel written into cells that were manually overridden ("blue font" in source)
-
-def is_grey_marker(value) -> bool:
-    # True if `value` is the grey/blue-override sentinel (case-insensitive)
-    return isinstance(value, str) and value.strip().casefold() == GREY_MARKER
-
-def to_decimal(value):
-    # Safely parse inputs (numbers, accounting strings, percentages) into Decimals, or None
-    # Handles: real numbers, accounting notation "(123)" -> -123, "$"/","/"%" stripping,
-    # and treats blanks/dashes/the grey sentinel as "no value" rather than an error.
-    if value is None or isinstance(value, bool) or is_grey_marker(value):
-        return None
-    if isinstance(value, Decimal):
-        return value if value.is_finite() else None
-
-    if isinstance(value, (int, float)) or hasattr(value, "__float__"):
-        try:
-            numeric_value = float(value)
-        except (ValueError, TypeError, OverflowError):
-            numeric_value = None
-        if numeric_value is not None:
-            if numeric_value != numeric_value:   # NaN
-                return None
-            decimal_value = Decimal(str(round(numeric_value, 10)))
-            return decimal_value if decimal_value.is_finite() else None
-
-    try:
-        text = str(value).replace(",", "").replace("$", "").strip()
-        if text.endswith("%"):
-            text = text[:-1].strip()
-        if text.startswith("(") and text.endswith(")"):
-            text = "-" + text[1:-1]                        # accounting negative "(123)" -> "-123"
-        if text in {"", "-", "\u2014", GREY_MARKER}:
-            return None
-        decimal_value = Decimal(text)
-        return decimal_value if decimal_value.is_finite() else None
-    except (InvalidOperation, ValueError, TypeError):
-        return None
-
-def to_excel_number(value):
-    # Write-side counterpart to to_decimal: Decimal -> float, sentinel/None -> blank cell
-    if value is None or is_grey_marker(value):
-        return None
-    if isinstance(value, Decimal):
-        return float(value)
-    return value
-
-def normalize_text(value) -> str:
-    # Whitespace-collapsed, case-folded key, used for loose column/value name matching
-    if value is None:
-        return ""
-    return " ".join(str(value).replace("\u00a0", " ").strip().split()).casefold()
-
-def is_present(value) -> bool:
-    # True if `value` counts as a real value (not blank/None/dash/the grey sentinel)
-    if value is None:
-        return False
-    return str(value).strip().casefold() not in {"", "blank", "none", "null", "nan", GREY_MARKER, "-", "\u2014"}
-
-_ACCOUNT_KEY_TYPO_FIXES = [
-    # known misspellings seen in source account names, fixed before matching
-    (re.compile(r"\bvalutaion\b"), "valuation"),
-    (re.compile(r"\bvalutations\b"), "valuation"),
-]
-
-_PLURAL_SAFE_ENDINGS = ("ss", "us", "is", "as", "ous")   # words ending these ways aren't plurals (bus/basis/...)
-
-def _strip_plural(token: str) -> str:
-    # Naive de-pluralizer used only for account-name matching, not general English.
-    if len(token) <= 2 or not token.endswith("s"):
-        return token
-    if token.endswith(_PLURAL_SAFE_ENDINGS):
-        return token
-    return token[:-1]
-
-def account_key(value) -> str:
-    # Deterministic normalization key for account-name matching (order/typo/plural-insensitive).
-    # Strips punctuation/apostrophes, fixes known typos, then SORTS tokens and singularizes each -
-    # so "Cash and Equivalents" and "Equivalents & Cash" normalize to the same key.
-    if not value:
-        return ""
-    text = str(value).casefold().strip()
-    text = text.replace("'", "").replace("\u2019", "")
-    text = text.replace("&", " and ")
-    text = re.sub(r"[-\u2013\u2014]", " ", text)
-    for pattern, replacement in _ACCOUNT_KEY_TYPO_FIXES:
-        text = pattern.sub(replacement, text)
-    text = re.sub(r"[^a-z0-9 ]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    tokens = sorted(text.split())
-    tokens = [_strip_plural(t) for t in tokens]
-    return " ".join(tokens)
-
-def spark_account_key(column_name: str, alias_map: dict[str, str] | None = None):
-    # Spark-expression equivalent of account_key() - same normalization, runs distributed across the whole DataFrame instead of row-by-row in Python.
-    step = F.lower(F.trim(F.col(f"`{column_name}`").cast("string")))
-    step = F.regexp_replace(step, r"['\u2019]", "")
-    step = F.regexp_replace(step, r"&", " and ")
-    step = F.regexp_replace(step, r"[-\u2013\u2014]", " ")
-    step = F.regexp_replace(step, r"(?i)\bvalutaions?\b", "valuation")
-    step = F.regexp_replace(step, r"[^a-z0-9 ]+", " ")
-    step = F.trim(F.regexp_replace(step, r"\s+", " "))
-
-    tokens = F.array_sort(F.split(step, " "))
-    tokens_singular = F.transform(
-        tokens,
-        lambda t: F.when(
-            (F.length(t) > 2) & t.endswith("s")
-            & (~t.endswith("ss")) & (~t.endswith("us")) & (~t.endswith("is"))
-            & (~t.endswith("as")) & (~t.endswith("ous")),
-            F.regexp_replace(t, "s$", ""),
-        ).otherwise(t),
-    )
-    rich_key = F.concat_ws(" ", tokens_singular)
-
-    if alias_map:
-        # optional manual-override lookup: swap the computed key for its canonical alias if one's defined
-        map_literal = F.create_map(*[
-            item for pair in alias_map.items() for item in (F.lit(pair[0]), F.lit(pair[1]))
-        ])
-        return F.coalesce(map_literal[rich_key], rich_key)
-    return rich_key
-
-def records_from(dataframe):
-    # Normalize a Spark DataFrame / pandas DataFrame / plain row-iterable into a list of dicts
-    if dataframe is None:
-        return []
-    if hasattr(dataframe, "collect"):
-        return [row.asDict(recursive=True) for row in dataframe.collect()]   # Spark: pulls all rows to driver
-    if hasattr(dataframe, "to_dict"):
-        return dataframe.to_dict(orient="records")
-    return [row.asDict(recursive=True) if hasattr(row, "asDict") else dict(row) for row in dataframe]
-
-def dataframe_columns(dataframe):
-    # Get column names whether input is a real DataFrame or a plain list of row-dicts
-    if hasattr(dataframe, "columns"):
-        return list(dataframe.columns)
-    records = records_from(dataframe)
-    return list(records[0].keys()) if records else []
-
-def get_field(record, *field_names):
-    # Look up a dict value by any of several accepted spellings of the field name
-    wanted = {normalize_text(name) for name in field_names}
-    for actual_name, value in record.items():
-        if normalize_text(actual_name) in wanted:
-            return value
-    return None
-
-def find_entity_columns(columns, anchor="Test consolidated amount", excludes=(), row_id_col="row_id"):
-    # Legal-entity columns = everything positioned AFTER `anchor`, minus excludes/row_id
-    cols = list(columns)
-    excl_keys = {normalize_text(e) for e in excludes} | {normalize_text(row_id_col)}
-
-    anchor_idx = next((i for i, c in enumerate(cols) if normalize_text(c) == normalize_text(anchor)), None)
-    if anchor_idx is None:
-        raise KeyError(f"Anchor not found: {anchor!r}")
-
-    result = [c for c in cols[anchor_idx + 1:] if normalize_text(c) not in excl_keys]
-    if not result:
-        raise ValueError(f"No entity columns found after {anchor!r}")
-    return result
-
-def require_column(columns, requested_name):
-    # Case/whitespace-insensitive column lookup that raises a clear error if missing
-    target = normalize_text(requested_name)
-    for column in columns:
-        if normalize_text(column) == target:
-            return column
-    raise KeyError(f"Required column not found: {requested_name!r}. Available: {columns}")
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # ---- Generic openpyxl style factories -------------------------------
-
-# COMMAND ----------
-
-def make_font(color, name="Calibri", size=10, bold=False):
-    return Font(name=name, size=size, bold=bold, color=color)
-
-def make_fill(color):
-    return PatternFill(fill_type="solid", fgColor=color)
-
-def make_border(color="FF000000", style="thin"):
-    side = Side(style=style, color=color)
-    return Border(left=side, right=side, top=side, bottom=side)
-
-def make_alignment(horizontal="center", vertical="center", wrap=False):
-    return Alignment(horizontal=horizontal, vertical=vertical, wrap_text=wrap)
-
-def clear_worksheet_area(worksheet, start_row, start_column, end_row=None, end_column=None, reset_fill=None):
-    # Wipe a rectangular block of a sheet before rewriting it, so a re-run doesn't leave stale
-    # values/styling from a prior run. Skips merged non-anchor cells (openpyxl can't set those)
-    end_row = worksheet.max_row if end_row is None else end_row
-    end_column = worksheet.max_column if end_column is None else end_column
-    for row in worksheet.iter_rows(min_row=start_row, max_row=end_row, min_col=start_column, max_col=end_column):
-        for cell in row:
-            if isinstance(cell, MergedCell):
-                continue
-            cell.value = None
-            if reset_fill is not None:
-                cell.fill = reset_fill
-
-def clear_conditional_formatting(worksheet):
-    # Drop leftover conditional-format rules from a prior run before adding fresh ones
-    try:
-        worksheet.conditional_formatting._cf_rules.clear()
-    except AttributeError:
-        pass   # openpyxl internal API changed/missing - fail silently rather than crash the pipeline
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 1 - Blue-cell detection
-# MAGIC ### =====================================================================
-# MAGIC  "Blue font" cells in the source Omnia export are D&T's manual
-# MAGIC  override marker. Converts (sheet, Excel cell) references into
-# MAGIC  (spark_column_name, global_row_id) pairs.
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-TARGET_SHEETS = ("Balance Sheet", "Income Statement")
-CELL_PATTERN = re.compile(r"^\$?([A-Za-z]+)\$?(\d+)$")   # matches "A1", "$B$12" etc.
-
-def excel_column_index(excel_column):
-    # Excel column letters ("A", "AB", ...) -> 0-based numeric index (base-26)
-    index = 0
-    for letter in excel_column.upper():
-        index = index * 26 + ord(letter) - ord("A") + 1
-    return index - 1
-
-def normalize_sheet_names(sheet_names):
-    # Accept None / a single name / a collection of names -> always a set (or None = all sheets)
-    if sheet_names is None:
-        return None
-    if isinstance(sheet_names, str):
-        return {sheet_names.strip()}
-    return {str(name).strip() for name in sheet_names}
-
-def get_blue_amounts(excel_path, sheet_names, excel_data_start_row=4):
-    # Scan target sheets for cells whose font is the manual-override "blue", returning each
-    # one's sheet, cell address, value, and a row id relative to where data actually starts.
-    # Opens the workbook twice - once for cached formula RESULTS, once for the raw FORMULAS -
-    # so both the computed value and the formula text are available
-    values_workbook = cp.openpyxl.read(excel_path, data_only=True)
-    formulas_workbook = cp.openpyxl.read(excel_path, data_only=False)
-
-    selected_sheet_names = normalize_sheet_names(sheet_names)
-    blue_amounts = []
-
-    def get_font_rgb(cell):
-        color = cell.font.color
-        if color is None: return None
-        if color.type == "rgb" and color.rgb:
-            return str(color.rgb).replace("#", "")[-6:].upper()
-        return None
-
-    def is_blue_font(cell):
-        # Heuristic: blue channel must be reasonably strong AND clearly dominate red/green,
-        # rather than an exact color match (source files vary slightly in the exact blue used).
-        rgb = get_font_rgb(cell)
-        if rgb is None: return False
-        red, green, blue = int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16)
-        return blue >= 100 and blue > red * 1.25 and blue > green * 1.10
-
-    try:
-        available_sheet_names = {ws.title for ws in formulas_workbook.worksheets}
-        if selected_sheet_names is not None:
-            missing = selected_sheet_names - available_sheet_names
-            if missing: raise ValueError(f"Worksheet(s) not found: {sorted(missing)}")
-
-        for formula_worksheet in formulas_workbook.worksheets:
-            sheet_name = formula_worksheet.title
-            if selected_sheet_names is not None and sheet_name not in selected_sheet_names:
-                continue
-            value_worksheet = values_workbook[sheet_name]
-
-            for row in formula_worksheet.iter_rows(min_row=1, max_row=formula_worksheet.max_row):
-                for formula_cell in row:
-                    value_cell = value_worksheet[formula_cell.coordinate]
-                    cached_value = value_cell.value
-                    formula_or_value = formula_cell.value
-                    if cached_value is None and formula_or_value is None: continue
-                    if not is_blue_font(formula_cell): continue
-
-                    amount = cached_value if cached_value is not None else formula_or_value
-                    local_row_id = formula_cell.row - excel_data_start_row + 1   # sheet row -> data-relative row id
-                    if local_row_id < 1: continue   # above data start (header rows) - skip
-
-                    blue_amounts.append({
-                        "sheet_name": sheet_name,
-                        "cell_address": formula_cell.coordinate,
-                        "amount": amount,
-                        "font_rgb": get_font_rgb(formula_cell),
-                        "is_blue": True,
-                        "row_id": local_row_id,
-                    })
-    finally:
-        values_workbook.close()
-        formulas_workbook.close()
-
-    return blue_amounts
-
-def get_dynamic_sheet_row_counts(excel_path, sheet_names=TARGET_SHEETS, excel_data_start_row=4, max_data_column=None):
-    # For each sheet, count real data rows by scanning until the last row with any non-blank
-    # cell - more reliable than worksheet.max_row, which can overstate due to stray formatting
-    # on otherwise-empty rows
-    workbook = cp.openpyxl.read(excel_path, data_only=False)
-    selected_sheet_names = normalize_sheet_names(sheet_names)
-    sheet_row_counts = {}
-    try:
-        available_sheet_names = {ws.title for ws in workbook.worksheets}
-        if selected_sheet_names is not None:
-            missing = selected_sheet_names - available_sheet_names
-            if missing: raise ValueError(f"Worksheet(s) not found: {sorted(missing)}")
-
-        for worksheet in workbook.worksheets:
-            sheet_name = worksheet.title
-            if selected_sheet_names is not None and sheet_name not in selected_sheet_names:
-                continue
-            if worksheet.max_row < excel_data_start_row:
-                sheet_row_counts[sheet_name] = 0
-                continue
-            scan_to_column = worksheet.max_column if max_data_column is None else min(max_data_column, worksheet.max_column)
-            last_data_row = excel_data_start_row - 1
-            for row in worksheet.iter_rows(min_row=excel_data_start_row, max_row=worksheet.max_row,
-                                           min_col=1, max_col=scan_to_column):
-                if any(cell.value is not None for cell in row):
-                    last_data_row = row[0].row
-            sheet_row_counts[sheet_name] = max(0, last_data_row - excel_data_start_row + 1)
-    finally:
-        workbook.close()
-    return sheet_row_counts
-
-def create_appended_spark_column_row_pairs(blue_amounts, spark_columns, sheet_row_counts, sheet_order=TARGET_SHEETS):
-    # Translate blue-cell hits (sheet + Excel cell address) into (spark_column, global_row_id)
-    # pairs. "Global" accounts for Balance Sheet rows being appended before Income Statement rows
-    # in the combined Spark frame - so each sheet's local row ids get shifted by an offset
-    spark_columns = list(spark_columns)
-    sheet_order = tuple(sheet_order)
-    missing_counts = {s for s in sheet_order if s not in sheet_row_counts}
-    if missing_counts: raise ValueError(f"Missing dynamic row counts for: {sorted(missing_counts)}")
-
-    sheet_offsets, current_offset = {}, 0
-    for sheet_name in sheet_order:
-        sheet_offsets[sheet_name] = current_offset
-        current_offset += sheet_row_counts[sheet_name]
-
-    pairs, seen_pairs, missing_excel_columns = [], set(), set()
-
-    for item in blue_amounts:
-        if item.get("is_blue") is not True: continue
-        sheet_name, local_row_id = item.get("sheet_name"), item.get("row_id")
-        if sheet_name not in sheet_offsets or local_row_id is None: continue
-        local_row_id = int(local_row_id)
-        if not (1 <= local_row_id <= sheet_row_counts[sheet_name]): continue
-
-        match = CELL_PATTERN.fullmatch(str(item.get("cell_address", "")).strip().upper())
-        if not match: continue
-
-        excel_column = match.group(1)
-        column_index = excel_column_index(excel_column)
-        if column_index >= len(spark_columns):
-            missing_excel_columns.add(excel_column)   # Excel column has no counterpart in the Spark frame
-            continue
-
-        column_name = spark_columns[column_index]
-        row_id = sheet_offsets[sheet_name] + local_row_id   # shift into the combined frame's numbering
-        pair = (column_name, row_id)
-        if pair not in seen_pairs:
-            pairs.append(pair)
-            seen_pairs.add(pair)
-
-    if missing_excel_columns:
-        print("Skipped Excel columns without matching Spark columns: " + ", ".join(sorted(missing_excel_columns)))
-    return pairs
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC
-# MAGIC # SECTION 2 - Read CY / PY trial balances into Spark
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-# DBTITLE 1,Readin
-def add_row_id(df, row_id_col="row_id"):
-    # Attach a stable 1-based row_id reflecting the frame's current row order.
-    # Note: Assumes single-partition sequential read in Spark
-    if row_id_col in df.columns: raise ValueError(f"Column '{row_id_col}' already exists.")
-    temp_col = "__temporary_row_order__"
-    while temp_col in df.columns:
-        temp_col = f"_{temp_col}"
-    df_with_order = df.withColumn(temp_col, F.monotonically_increasing_id())
-    row_number_window = Window.orderBy(F.col(temp_col))
-    return (df_with_order
-            .withColumn(row_id_col, F.row_number().over(row_number_window).cast("long"))
-            .drop(temp_col))
-
-PERCENTAGE_COLUMN_NAME = "% of consolidated balance"
-_clean_percentage = F.regexp_replace(F.trim(F.col(PERCENTAGE_COLUMN_NAME)), "%", "")
-_COLUMNS_TO_DROP = ["Eliminations", "TopSide", "Reclassifications", "__sheet__"]
-
-def load_trial_balance(excel_path):
-    # Read both target sheets from one workbook, tag rows, clean the % column, drop rows with
-    # no "Significance" tag at all, then drop helper columns not needed downstream
-    raw = read_excel(excel_path, sheet_name=["Balance Sheet", "Income Statement"],
-                     header=2, naming_convention="neutral", trim=True)
-    raw = add_row_id(raw).withColumn(PERCENTAGE_COLUMN_NAME, _clean_percentage)
-    Ctrl_Totals(raw, [])   # row-count snapshot BEFORE the filter
-    raw = raw.filter(~(F.col('Significance').isin("") | F.col('Significance').isNull()))
-    Ctrl_Totals(raw, [])   # row-count snapshot AFTER the filter, to compare
-    return raw.drop(*_COLUMNS_TO_DROP)
-
-
-raw_tb_CY = load_trial_balance(excel_path_CY)
-raw_tb_PY = load_trial_balance(excel_path_PY)
-
-display(raw_tb_CY)
-display(raw_tb_PY)
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 3 - Locate blue cells in CY and PY workbooks
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-EXCEL_DATA_START_ROW = 4   # rows 1-3 are title/header rows in the source Excel; data starts row 4
-
-def locate_blue_cell_pairs(excel_path, spark_columns, label):
-    # Per-workbook driver: find blue cells + per-sheet row counts, then convert both into
-    # (spark_column, global_row_id) pairs, printing diagnostics along the way.
-    blue_amounts = get_blue_amounts(excel_path=excel_path, sheet_names=TARGET_SHEETS,
-                                    excel_data_start_row=EXCEL_DATA_START_ROW)
-    sheet_row_counts = get_dynamic_sheet_row_counts(excel_path=excel_path, sheet_names=TARGET_SHEETS,
-                                                    excel_data_start_row=EXCEL_DATA_START_ROW)
-    print("Dynamic sheet row counts:", sheet_row_counts)
-
-    spark_column_row_pairs = create_appended_spark_column_row_pairs(
-        blue_amounts=blue_amounts, spark_columns=spark_columns,
-        sheet_row_counts=sheet_row_counts, sheet_order=TARGET_SHEETS)
-
-    total_appended_rows = sum(sheet_row_counts[s] for s in TARGET_SHEETS)
-    highest_blue_row_id = max((row_id for _, row_id in spark_column_row_pairs), default=0)
-    print("Total appended rows:", total_appended_rows)
-    print("Highest blue row_id:", highest_blue_row_id)   # sanity check: should never exceed total_appended_rows
-    print("Sample column/row_id pairs:", spark_column_row_pairs[:10])
-    return spark_column_row_pairs
-
-spark_column_row_pairs_cy = locate_blue_cell_pairs(excel_path=excel_path_CY, spark_columns=raw_tb_CY.columns, label="CY")
-spark_column_row_pairs_py = locate_blue_cell_pairs(excel_path=excel_path_PY, spark_columns=raw_tb_PY.columns, label="PY")
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC
-# MAGIC # SECTION 4 - GL numeric/date typecasting
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-def cast_gl_columns(data, numeric_columns, ):
-    all_columns = numeric_columns
-    aggregate(data=data, columns=all_columns).display()   # BEFORE snapshot
-
-    data = (data
-            .transform(map_columns, mapping={c: cast_dtype(c, GeneralLedgerDetail.__decimal_type__) for c in numeric_columns}))
-
-    aggregate(data=data, columns=all_columns).display()   # AFTER snapshot
-    return data
-
-GL_NUMERIC_COLUMNS_CY: list[str] = ['Consolidated', 'Untested Balance', '% of consolidated balance', 'DL275: Broadridge Business Process Outsourcing, LLC - DLT Repo Intraday Cust', 'HB011: Signal Agency Limited', 'HB015: Broadridge Financial Solutions, Inc_', 'HB018: BR REC, LLC', 'HB020: Broadridge (Suisse) S_A_', 'HB025: Broadridge Securities Processing Solutions, LLC', 'HB026: Broadridge BPO Holding LLC', 'HB035: Broadridge Output Solutions, LLC', 'HB036: QED Financial Systems, Inc', 'HB037: Broadridge Mail, LLC', 'HB050: Broadridge ICS (Canada) ULC', 'HB051: Broadridge Customer Communications Canada, ULC', 'HB052: BR (Canada) Holdings, Inc', 'HB053: DOJLD', 'HB054: 4Sight Financial Software Ltd', 'HB055: Broadridge Trading Transfer Corporation', 'HB056: 4Sight IT Services, LTD', 'HB058: 4Sight Financial Software Inc_', 'HB060: Broadridge Investor Communications Solutions, Inc_', 'HB062: ActivePath Solutions Ltd_', 'HB070: Broadridge Financial Solutions (Canada) Corp', 'HB073: Advisorstream Ltd', 'HB075: Broadridge Nederland III B_V_', 'HB080: Broadridge Software ULC', 'HB081: Broadridge Technologies ULC', 'HB085: Broadridge Investor Communications Corporation', 'HB090: Broadridge Nederland II B_V_', 'HB095: Broadridge (Australia) Pty_ Ltd_', 'HB105: Broadridge Financial Solutions International, Ltd_', 'HB107: Broadridge (Deutschland) GmbH', 'HB108: Fund Buyer Focus, Ltd_ (In Liquidation)', 'HB110: Broadridge Nederland I B_V_', 'HB118: Broadridge UK Holdco Limited', 'HB119: Broadridge Acquisition FinCo Limited', 'HB120: Broadridge Financial Solutions Ltd_ (UK)', 'HB121: Broadridge Analytics Solutions Limited', 'HB122: Broadridge Analytics Solutions Limited (German Branch)', 'HB123: ClearStructure Financial Technology Limited', 'HB124: FundsLibrary Limited (In Liquidation)', 'HB128: Message Automation Limited', 'HB129: Systemwire Limited', 'HB130: Broadridge Asia Pacific Limited', 'HB135: Broadridge Czech Republic s_r_o_', 'HB140: Broadridge Financial Solutions (India) Private Limited', 'HB141: Summit Disclosure Solutions India Pvt Ltd', 'HB142: Rockall Technologies Ltd', 'HB150: Broadridge Wealth Aggregation and Insight Inc', 'HB155: Access Data Corporation', 'HB160: BR NYC Solutions, Inc_', 'HB165: Broadridge Corporate Issuer Solutions, LLC', 'HB175: Broadridge City Networks (UK) Ltd_', 'HB185: Broadridge (Singapore) Private Limited', 'HB200: Broadridge (Japan) Ltd_', 'HB230: Matrix Settlement & Clearance Services, LLC', 'HB235: Broadridge Retirement and Workplace Inc_', 'HB236: Broadridge Ireland Limited', 'HB237: FI360, Inc_', 'HB240: Broadridge Managed Solutions, Inc_', 'HB245: Paladyne Asia Limited', 'HB250: Paladyne Europe Limited', 'HB255: Paladyne Systems Cayman (St Petersburg branch)', 'HB260: Broadridge Financial Solutions Ltd (South Africa Foreign Branch)', 'HB261: Broadridge Financial Solutions Ltd (Belgium Branch)', 'HB265: Broadridge SPS LLC', 'HB270: Broadridge Rus LLC', 'HB280: Broadridge France SAS', 'HB285: Matrix Trust Company', 'HB290: Broadridge Poland Sp_ Z_O_O_', 'HB295: Newkirk', 'HB300: Broadridge Fixed Income Liquidity Solutions, LLC', 'HB400: Broadridge Sweden Holdings AB', 'HB401: Itiviti Holding AB', 'HB402: Itiviti AB', 'HB403: Itiviti PreferenceCo AB', 'HB404: Itiviti Group Holding AB', 'HB405: Broadridge Trading and Connectivity Solutions AB', 'HB406: Ullink UK Holdco 1 Limited', 'HB407: Ullink UK Holdco 2 Limited', 'HB409: Broadridge Trading and Connectivity Solutions Holdings SAS', 'HB410: Broadridge Trading and Connectivity Solutions SAS', 'HB411: Ullink Inc_', 'HB413: Broadridge Connectivity Solutions Philippines Inc_', 'HB414: Broadridge Trading and Connectivity Solutions Inc_', 'HB415: Ullink NYFIX Australia Pty Ltd', 'HB416: Broadridge Trading and Connectivity Solutions Japan K_K_', 'HB417: Broadridge Trading and Connectivity Solutions Limited', 'HB418: Itiviti FIX City Limited', 'HB421: Broadridge Trading and Connectivity Solutions Do Brasil LTDA', 'HB422: Broadridge Trading and Connectivity Solutions SRL', 'HB423: Broadridge Trading and Connectivity Solutions (UK) Ltd_', 'HB424: Broadridge Trading and Connectivity Solutions Pte_ Ltd', 'HB426: Broadridge Trading and Connectivity Solutions Hong Kong Limited', 'HB427: Broadridge Trading and Connectivity Solutions Operations SAS', 'HB428: Itiviti UK Services Ltd', 'HB429: Broadridge Trading And Connectivity Solutions India Private Limited', 'HB430: CameronTec AB', 'HB432: Itiviti USA Inc_', 'HB435: Itiviti Group Canada Inc', 'HB436: Itiviti Software East AB', 'HB437: Itiviti Software East AB (Russian Branch)', 'HB438: Broadridge Trading and Connectivity Solutions S_R_L_', 'HB439: Broadridge Trading and Connectivity Solutions Pty Ltd', 'HB440: Itiviti Asia Limited', 'HB441: Itiviti UK Ltd', 'HB442: Tbricks AB', 'HB445: Broadridge Trading and Connectivity Solutions Spain S_L_', "HB600: Int'l Disc'd Legal Entities", 'LT275: Broadridge Business Process Outsourcing, LLC - LTX Bond Trading Solut', 'MF275: Broadridge Business Process Outsourcing, LLC - Mutual Fund Processing', 'OP275: Broadridge Business Process Outsourcing, LLC - Operations Outsourcing', 'UK408: Ullink UK Holdco 3 Limited UK', 'US408: Ullink UK Holdco 3 Limited US', 'Elimination', 'HB016: Broadridge Holdings, LLC', 'HB310: Acolin Group (HoldCo) Limited', 'HB311: Acolin Group Limited', 'HB312: Acolin (UK) Limited', 'HB313: Accelerando associates GmbH', 'HB314: Acolin Europe AG', 'HB315: Acolin Netherlands BV', 'HB316: Accelerando Associates International SL', 'HB317: Acolin Fund Services AG', 'HB318: Acolin Holding AG', 'HB319: Acolin InfoTech AG', 'HB320: Acolin Luxembourg', 'HB321: Acolin Slovakia s_r_o', 'HB322: Acolin d_o_o_ Beograd', 'HB017: 605 Studios, LLC', 'HB156: AdvisorTarget LLC', 'HB330: CQGI MA, LLC', 'HB331: CQG Australia Pty Ltd', 'HB332: Shenzhen CQG Financial and Economic Technology Co_, LTD', 'HB333: CQG Hong Kong Ltd', 'HB334: CQG Singapore Pte Ltd', 'HB335: CQG UK Limited', 'HB336: CQGI Ukraine, LLC', 'EE140: Broadridge\nFinancial Solutions\n(India) Private\nLimited (Reclass)', 'HB047: Broadridge\nCanada Holdco 1\nULC', 'HB048: Broadridge\nCanada Holdco 2\nULC', 'HB049: Broadridge\nCanada Holdco LP', 'HB316: Acolin\nIntelligence']
-
-raw_tb_CY = cast_gl_columns(data=raw_tb_CY, numeric_columns=GL_NUMERIC_COLUMNS_CY)
-
-# NOTE: PY list is currently identical to the CY list, so it reuses it. Replace with an explicit list if PY columns ever differ.
-GL_NUMERIC_COLUMNS_PY: list[str] = list(GL_NUMERIC_COLUMNS_CY)
-# GL_NUMERIC_COLUMNS_PY: list[str] =['Consolidated', 'Untested Balance', '% of consolidated balance',  'ALOMF', 'BPOUS', 'BRTDA', 'MSSUS', 'MTRCO', 'MTXUS', 'WTRIS', 'FISUS', 'ICMFS', 'IDSMF', 'SVUSA', 'BNRUS', 'MFUSA - residual', 'TAXUS', 'CCUSA', 'TISSR', 'ICADM', 'BBDUS', 'EURMF', 'CCGBL', 'BBDFX', 'GTBAM', 'GTBPS', 'GTADM', 'GTOFI', 'GTOCN', 'GEMEA', 'GTOUK', 'GTPAC', 'BBPO', 'BBPO - residual', 'FRAOP', 'ITSEK', 'NYFIX', 'BTCS - residual', 'Division', 'DHOLD', 'INDIA', 'BRGTT', 'WLSAL', 'BIMSA', 'QELIM', 'DISCONTINUED OPERATIONS', 'TOTAL ALLOCATIONS']
-
-raw_tb_PY = cast_gl_columns(data=raw_tb_PY, numeric_columns=GL_NUMERIC_COLUMNS_PY)
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 5 - Grey-out blue-marked cells in the Spark data
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-ROW_ID_COLUMN = "row_id"
-
-def drop_row_id_pairs(column_row_pairs):
-    # Defensive filter: row_id itself must never appear as a "cell to grey out" - strip it if it does.
-    return [(c, r) for c, r in column_row_pairs if c != ROW_ID_COLUMN]
-
-spark_column_row_pairs_py = drop_row_id_pairs(spark_column_row_pairs_py)
-spark_column_row_pairs_cy = drop_row_id_pairs(spark_column_row_pairs_cy)
-
-def replace_spark_cells(df: DataFrame, column_row_pairs: Iterable[Tuple[str, int]],
-                         row_id_col: str = ROW_ID_COLUMN, replacement: str = GREY_MARKER) -> DataFrame:
-    # Overwrite each flagged (column, row_id) cell with the grey-marker sentinel - the audit's
-    # "manually overridden, don't re-test" flag - leaving every other cell in that column
-    # (now cast to string, to hold the sentinel) untouched.
-    if row_id_col not in df.columns: raise ValueError(f"Missing row ID column: {row_id_col}")
-
-    targets = defaultdict(set)
-    for column_name, row_id in column_row_pairs:
-        targets[column_name].add(int(row_id))   # group target rows per column so each column is touched once
-
-    result = df
-    for column_name, row_ids in targets.items():
-        original = result[column_name]
-        if not isinstance(df.schema[column_name].dataType, StringType):
-            original = original.cast("string")
-        result = result.withColumn(
-            column_name,
-            F.when(result[row_id_col].isin(list(row_ids)), F.lit(replacement)).otherwise(original))
-    return result
-
-updated_raw_tb_CY = replace_spark_cells(df=raw_tb_CY, column_row_pairs=spark_column_row_pairs_cy)
-display(updated_raw_tb_CY.limit(100))
-
-updated_raw_tb_PY = replace_spark_cells(df=raw_tb_PY, column_row_pairs=spark_column_row_pairs_py)
-display(updated_raw_tb_PY.limit(100))
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC
-# MAGIC # SECTION 6 - Write "1. Quantitative Evaluation" / "2. Qualitative Evaluation"
-# MAGIC ### =====================================================================
-# MAGIC  Tab 1: calculated columns (Times of materiality, Mean, Median, Highest balance,
-# MAGIC  % of total balance, Multiple of materiality) and the two per-entity detail rows are
-# MAGIC  LIVE EXCEL FORMULAS. Every materiality reference points at C10.
-# MAGIC  Tab 2: source data only (no calculated columns).
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-QUANTITATIVE_SHEET = "1. Quantitative Evaluation"
-QUALITATIVE_SHEET = "2. Qualitative Evaluation"
-TABLE_ANCHOR_CELL = "B12"
-MATERIALITY_CELL_T1 = "$C$10"   # set_materiality() writes here; every Tab 1 formula reads from it
-
-BLUE_FONT_COLOR = "FF0E81E6"
-BLACK = "FF000000"
-WHITE = "FFFFFFFF"
-GREY_OUT_FILL = "FFD9D9D9"
-GREYED_OUT_FONT_COLOR = "FFBFBFBF"
-
-CALCULATED_COLUMNS = [
-    # Extra analysis columns injected into the Quantitative sheet only (not present in source data)
-    "Times of materiality", "Mean", "Median",
-    "Highest balance in a residual entity", "% of the total balance", "Multiple of materiality balance",
-]
-HIGHEST_BALANCE_GROUP = {
-    # subset of CALCULATED_COLUMNS grouped under a merged "Highest balance..." sub-header
-    "highest balance in a residual entity", "% of the total balance", "multiple of materiality balance",
-}
-_ARRAY_KEYS = {"mean", "median", "highest balance in a residual entity"}   # written as array formulas
-ENTITY_PERCENT_DETAIL_LABEL = "% of the total balance at each legal entity"
-ENTITY_MULTIPLE_DETAIL_LABEL = "Multiple of materiality balance at each legal entity"
-
-def _unique_texts(items):
-    # Stringify/strip/de-dup a list, preserving first-seen order and dropping blanks.
-    result, seen = [], set()
-    for item in items or []:
-        text = str(item).strip()
-        if text and text not in seen:
-            result.append(text)
-            seen.add(text)
-    return result
-
-def _to_excel_percentage(value):
-    # Excel stores % as a 0..1 fraction.
-    number = to_decimal(value)
-    if number is None:
-        return None
-    # Heuristic: if the value already looks like "15" (post "%"-strip elsewhere), it meant 15%,
-    # so divide by 100; if it's already a small fraction like 0.15, leave it as-is.
-    return number / Decimal("100") if abs(number) > 1 else number
-
-def _is_nonzero(value):
-    number = to_decimal(value)
-    return number is not None and number != 0
-
-def _is_no(value):
-    # Loose "did the cell literally say No" check for the "Test consolidated amount" flag.
-    return str(value).strip().casefold() == "no"
-
-def _median_decimal(values):
-    # Median in Decimal precision (no float mixing).
-    if not values: return None
-    ordered = sorted(values)
-    middle = len(ordered) // 2
-    if len(ordered) % 2:
-        return ordered[middle]
-    return (ordered[middle - 1] + ordered[middle]) / Decimal("2")
-
-def _number_format(column_label):
-    # Pick an Excel number format based on which column this is.
-    normalized = normalize_text(column_label)
-    if normalized in {"% of consolidated balance", "% of the total balance"}: return "0.00%"
-    if normalized in {"times of materiality", "multiple of materiality balance"}: return "0.00"
-    return "#,##0;(#,##0)"
-
-def _arrange_output_columns(source_columns, calculated_columns):
-    # Decide final column order: keep source columns, but splice CALCULATED_COLUMNS in right
-    # after "Test consolidated amount" (so entity balances follow after them).
-    calculated_columns = _unique_texts(calculated_columns)
-    if not calculated_columns: return list(source_columns)
-    calculated_keys = {normalize_text(c) for c in calculated_columns}
-    source_without_calculated = [c for c in source_columns if normalize_text(c) not in calculated_keys]
-    test_column = require_column(source_without_calculated, "Test consolidated amount")
-    insert_position = source_without_calculated.index(test_column) + 1
-    return source_without_calculated[:insert_position] + calculated_columns + source_without_calculated[insert_position:]
-
-def set_materiality(template, value, target_sheet=QUANTITATIVE_SHEET, cell="C10"):
-    # Write the materiality $ amount into its labeled cell, resolving through any merged-cell
-    # range first (openpyxl only lets you set the anchor cell of a merge).
-    worksheet = template[target_sheet]
-    for merged_range in worksheet.merged_cells.ranges:
-        if cell in merged_range:
-            cell = merged_range.coord.split(":", 1)[0]
-            break
-    target = worksheet[cell]
-    target.value = int(value)
-    target.number_format = "[$$-en-US]#,##0"
-
-def _unmerge_intersecting_ranges(worksheet, row_number, start_column, end_column):
-    # Remove any merged cells overlapping this range before writing fresh header text -
-    # openpyxl silently no-ops writes to non-anchor merged cells otherwise.
-    for merged_range in list(worksheet.merged_cells.ranges):
-        if (merged_range.min_row <= row_number <= merged_range.max_row
-                and merged_range.min_col <= end_column and merged_range.max_col >= start_column):
-            worksheet.unmerge_cells(merged_range.coord)
-
-def _apply_header_style(cell, fill, border, font, alignment):
-    cell.fill, cell.border, cell.font, cell.alignment = fill, border, font, alignment
-    cell.number_format = "General"
-
-def _write_table_headers(worksheet, header_row, start_column, output_columns, fill, border, font, alignment):
-    # Write the single-row column header labels across the full output width.
-    end_column = start_column + len(output_columns) - 1
-    _unmerge_intersecting_ranges(worksheet, header_row, start_column, end_column)
-    for index, column_label in enumerate(output_columns):
-        cell = worksheet.cell(row=header_row, column=start_column + index)
-        cell.value = column_label
-        _apply_header_style(cell, fill, border, font, alignment)
-
-def _write_analysis_headers(worksheet, header_row, start_column, output_columns, calculated_columns,
-                             fill, border, font, alignment):
-    # Add two merged super-header rows ABOVE the column headers: "D&T analysis" spanning all
-    # calculated columns, and "Highest balance in a residual entities" spanning the narrower
-    # HIGHEST_BALANCE_GROUP subset.
-    if not calculated_columns: return
-    calculated_keys = {normalize_text(c) for c in calculated_columns}
-    calculated_indices = [i for i, c in enumerate(output_columns) if normalize_text(c) in calculated_keys]
-    highest_indices = [i for i, c in enumerate(output_columns) if normalize_text(c) in HIGHEST_BALANCE_GROUP]
-
-    analysis_start, analysis_end = start_column + min(calculated_indices), start_column + max(calculated_indices)
-    highest_start, highest_end = start_column + min(highest_indices), start_column + max(highest_indices)
-    top_row, subgroup_row = header_row - 2, header_row - 1
-
-    for row_number in (top_row, subgroup_row):
-        _unmerge_intersecting_ranges(worksheet, row_number, analysis_start, analysis_end)
-        for column_number in range(analysis_start, analysis_end + 1):
-            cell = worksheet.cell(row=row_number, column=column_number)
-            cell.value = None
-            _apply_header_style(cell, fill, border, font, alignment)
-
-    worksheet.merge_cells(start_row=top_row, start_column=analysis_start, end_row=top_row, end_column=analysis_end)
-    dt_header = worksheet.cell(row=top_row, column=analysis_start)
-    dt_header.value = "D&T analysis"
-    _apply_header_style(dt_header, fill, border, font, alignment)
-
-    worksheet.merge_cells(start_row=subgroup_row, start_column=highest_start, end_row=subgroup_row, end_column=highest_end)
-    highest_header = worksheet.cell(row=subgroup_row, column=highest_start)
-    highest_header.value = "Highest balance in a residual entities"
-    _apply_header_style(highest_header, fill, border, font, alignment)
-
-def _build_analysis_formulas(row_number, start_column, col_letter, entity_idx, blue_idx,
-                              consolidated_idx, untested_idx, calc_idx, materiality_ref=MATERIALITY_CELL_T1):
-    # Returns {normalized calc column: Excel formula} for one visible account row.
-    # Residual balances = entity cells that are numeric, non-zero, and not manually overridden ("blue").
-    # Blue cells cannot be detected by Excel (font colour), so their column numbers are baked into a MATCH mask.
-    first, last = col_letter[min(entity_idx)], col_letter[max(entity_idx)]
-    rng = f"{first}{row_number}:{last}{row_number}"
-    valid = f"({rng}<>0)*ISNUMBER({rng})"
-    if blue_idx:
-        nums = ",".join(str(start_column + i) for i in sorted(blue_idx))
-        valid += f"*ISNA(MATCH(COLUMN({rng}),{{{nums}}},0))"
-
-    cons = f"{col_letter[consolidated_idx]}{row_number}"
-    unt = f"{col_letter[untested_idx]}{row_number}"
-    hi = f"{col_letter[calc_idx['highest balance in a residual entity']]}{row_number}"
-    m = materiality_ref
-
-    def agg(fn):
-        return f'=IF(SUMPRODUCT({valid})=0,"",{fn}(IF({valid},{rng})))'
-
-    return {
-        "times of materiality": f'=IF(AND(ISNUMBER({unt}),{m}<>0),{unt}/{m},"")',
-        "mean": agg("AVERAGE"),
-        "median": agg("MEDIAN"),
-        "highest balance in a residual entity": agg("MAX"),
-        "% of the total balance": f'=IF(AND(ISNUMBER({hi}),ISNUMBER({cons})),IF({cons}=0,"",{hi}/{cons}),"")',
-        "multiple of materiality balance": f'=IF(AND(ISNUMBER({hi}),{m}<>0),{hi}/{m},"")',
-    }
-
-def _write_detail_row(worksheet, row_number, start_column, output_columns, account_column,
-                       entity_columns, record, consolidated_idx, account_row, label,
-                       calculation_type, white_fill, body_border, body_font,
-                       materiality_ref=MATERIALITY_CELL_T1):
-    # Write one of the two extra detail rows placed under each visible account row
-    # (per-entity % of total, or per-entity multiple of materiality) as live formulas that
-    # reference the account row's balance cells and the Consolidated cell / materiality cell.
-    cons_ref = f"${get_column_letter(start_column + consolidated_idx)}${account_row}"
-    value_alignment, label_alignment = make_alignment("right", "center"), make_alignment("right", "center")
-
-    for index, column_label in enumerate(output_columns):
-        cell = worksheet.cell(row=row_number, column=start_column + index)
-        cell.value = None
-        cell.fill, cell.border, cell.font, cell.alignment = white_fill, body_border, body_font, value_alignment
-        cell.number_format = "General"
-
-        if column_label == account_column:
-            cell.value, cell.alignment = label, label_alignment   # descriptive label sits under the Account column
-            continue
-        if column_label not in entity_columns: continue
-        if to_decimal(record.get(column_label)) is None: continue
-
-        ent = f"{get_column_letter(start_column + index)}{account_row}"
-        if calculation_type == "percentage":
-            cell.value = f'=IF(AND(ISNUMBER({ent}),ISNUMBER({cons_ref})),IF({cons_ref}=0,"",{ent}/{cons_ref}),"")'
-            cell.number_format = "0.00%"
-        else:
-            cell.value = f'=IF(AND(ISNUMBER({ent}),{materiality_ref}<>0),{ent}/{materiality_ref},"")'
-            cell.number_format = "0.00"
-
-def _apply_package_borders(worksheet, package_start_row, package_end_row, start_column, end_column):
-    # Bold black outline around each 3-row "package" (account row + its 2 detail rows), with
-    # thin light-grey lines inside.
-    black_side, light_side = Side(style="thin", color=BLACK), Side(style="thin", color="FFE6E6E6")
-    for row_number in range(package_start_row, package_end_row + 1):
-        for column_number in range(start_column, end_column + 1):
-            worksheet.cell(row=row_number, column=column_number).border = Border(
-                left=black_side if column_number == start_column else light_side,
-                right=black_side if column_number == end_column else light_side,
-                top=black_side if row_number == package_start_row else light_side,
-                bottom=black_side if row_number == package_end_row else light_side,
-            )
-
-def _build_cy_blue_pair_lookup(spark_column_row_pairs_cy, raw_tb_CY, row_id_col=ROW_ID_COLUMN):
-    # Convert the CY blue-cell list into a fast-lookup set of (column, int(row_id)) tuples.
-    exact_pairs = set()
-    for position, pair in enumerate(spark_column_row_pairs_cy or [], start=1):
-        column_name, row_id = pair
-        exact_pairs.add((column_name, int(row_id)))
-    return exact_pairs
-
-def append_raw_tb_cy_to_sheet(template, raw_tb_CY, spark_column_row_pairs_cy, target_sheet,
-                               anchor_cell=TABLE_ANCHOR_CELL, calculated_columns=None,
-                               clear_existing=True, materiality=None, row_id_col=ROW_ID_COLUMN):
-    # Main writer for both Quantitative and Qualitative sheets: builds the header block, then
-    # loops every trial-balance record writing either a full visible row (with calc-column
-    # formulas + 2 formula detail rows, Quantitative only) or a collapsed/greyed row.
-    # `materiality` is accepted for backward compatibility; formulas read MATERIALITY_CELL_T1 instead.
-    worksheet = template[target_sheet]
-    source_columns = [c for c in raw_tb_CY.columns if c != row_id_col]
-
-    calculated_columns = _unique_texts(CALCULATED_COLUMNS if calculated_columns is None else calculated_columns)
-    if target_sheet != QUANTITATIVE_SHEET: calculated_columns = []   # Qualitative sheet never gets the calc columns
-
-    output_columns = _arrange_output_columns(source_columns, calculated_columns)
-    calculated_keys = {normalize_text(c) for c in calculated_columns}
-
-    blue_pair_keys = _build_cy_blue_pair_lookup(spark_column_row_pairs_cy, raw_tb_CY, row_id_col=row_id_col)
-    account_column = require_column(source_columns, "Account")
-    percentage_column = require_column(source_columns, PERCENTAGE_COLUMN_NAME)
-    test_column = require_column(source_columns, "Test consolidated amount")
-
-    entity_columns, consolidated_column, untested_column = [], None, None
-    if calculated_columns:
-        entity_columns = find_entity_columns(source_columns, excludes=calculated_columns)
-        consolidated_column = require_column(source_columns, "Consolidated")
-        untested_column = require_column(source_columns, "Untested Balance")
-
-    header_row, start_column = coordinate_to_tuple(anchor_cell)
-
-    if clear_existing:
-        end_column = start_column + max(len(output_columns), 1) - 1
-        clear_worksheet_area(worksheet, header_row, start_column, end_column=worksheet.max_column)
-
-    header_fill = white_fill = make_fill(WHITE)
-    grey_fill = make_fill(GREY_OUT_FILL)
-    body_border = header_border = make_border(BLACK)
-    no_border = Border()
-    header_font = make_font(BLACK, name="Arial", size=9, bold=True)
-    body_font = make_font(BLACK, name="Arial", size=9)
-    greyed_out_font = make_font(GREYED_OUT_FONT_COLOR, name="Arial", size=9)
-    blue_font = make_font(BLUE_FONT_COLOR, name="Arial", size=9)
-    header_alignment = make_alignment("center", "center", wrap=True)
-    body_alignment = Alignment(vertical="center")
-
-    _write_table_headers(worksheet, header_row, start_column, output_columns, header_fill, header_border, header_font, header_alignment)
-    _write_analysis_headers(worksheet, header_row, start_column, output_columns, calculated_columns,
-                             header_fill, header_border, header_font, header_alignment)
-
-    # Column geometry used to build formulas (only needed when calc columns exist)
-    col_letter = [get_column_letter(start_column + i) for i in range(len(output_columns))]
-    entity_set = set(entity_columns)
-    entity_idx = [i for i, c in enumerate(output_columns) if c in entity_set]
-    consolidated_idx = output_columns.index(consolidated_column) if consolidated_column else None
-    untested_idx = output_columns.index(untested_column) if untested_column else None
-    calc_idx = {normalize_text(c): i for i, c in enumerate(output_columns) if normalize_text(c) in calculated_keys}
-
-    account_output_index = output_columns.index(account_column)
-    data_start_row = header_row + 1
-    records_written = detail_rows_written = 0
-    package_ranges = []   # (start_row, end_row) of each 3-row account package, for later border styling
-
-    for record in records_from(raw_tb_CY.select(*(source_columns + [row_id_col]))):
-        source_row_id = int(record[row_id_col])
-        # "visible" (residual candidate) rows need a non-zero % of consolidated balance AND
-        # a "No" flag on full-population testing - everything else collapses to a grey row.
-        keep_row_visible = _is_nonzero(record.get(percentage_column)) and _is_no(record.get(test_column))
-
-        package_start_row = data_start_row + records_written
-
-        analysis_formulas = {}
-        if calculated_columns and keep_row_visible:
-            blue_idx = {i for i in entity_idx if (output_columns[i], source_row_id) in blue_pair_keys}
-            analysis_formulas = _build_analysis_formulas(
-                package_start_row, start_column, col_letter, entity_idx, blue_idx,
-                consolidated_idx, untested_idx, calc_idx)
-
-        for index, column_label in enumerate(output_columns):
-            cell = worksheet.cell(row=package_start_row, column=start_column + index)
-            normalized = normalize_text(column_label)
-            is_account_cell = index == account_output_index
-            is_calculated = normalized in calculated_keys
-
-            blue_key = (column_label, source_row_id)
-            selected_blue = blue_key in blue_pair_keys
-
-            if not keep_row_visible:
-                cell.alignment, cell.number_format, cell.border = body_alignment, "General", no_border
-                if is_account_cell:
-                    cell.value = record.get(account_column)
-                    cell.fill, cell.font = PatternFill(fill_type=None), greyed_out_font
-                else:
-                    cell.value, cell.fill, cell.font = None, grey_fill, body_font
-                continue
-
-            if is_calculated:
-                formula = analysis_formulas.get(normalized)
-                cell.value = ArrayFormula(cell.coordinate, formula) if normalized in _ARRAY_KEYS else formula
-            else:
-                cell.value = record.get(column_label)
-                if normalized == normalize_text(percentage_column):
-                    cell.value = _to_excel_percentage(cell.value)
-
-            cell.fill, cell.border, cell.font, cell.alignment = white_fill, body_border, body_font, body_alignment
-            if is_calculated:
-                cell.number_format = _number_format(column_label)
-            else:
-                cell.number_format = _number_format(column_label) if cell.value not in (None, "") and to_decimal(cell.value) is not None else "General"
-
-            if selected_blue and not is_calculated:
-                cell.font = blue_font   # re-mark manually-overridden source cells in blue, like the original workbook
-
-        records_written += 1
-
-        if target_sheet == QUANTITATIVE_SHEET and keep_row_visible:
-            percentage_row = data_start_row + records_written
-            _write_detail_row(worksheet, percentage_row, start_column, output_columns, account_column,
-                               entity_columns, record, consolidated_idx, package_start_row,
-                               ENTITY_PERCENT_DETAIL_LABEL, "percentage", white_fill, body_border, body_font)
-            records_written += 1
-            detail_rows_written += 1
-
-            multiple_row = data_start_row + records_written
-            _write_detail_row(worksheet, multiple_row, start_column, output_columns, account_column,
-                               entity_columns, record, consolidated_idx, package_start_row,
-                               ENTITY_MULTIPLE_DETAIL_LABEL, "multiple", white_fill, body_border, body_font)
-            records_written += 1
-            detail_rows_written += 1
-
-            package_ranges.append((package_start_row, data_start_row + records_written - 1))
-
-    end_column = start_column + len(output_columns) - 1
-    if target_sheet == QUANTITATIVE_SHEET:
-        for package_start, package_end in package_ranges:
-            _apply_package_borders(worksheet, package_start, package_end, start_column, end_column)
-
-    data_end_row = data_start_row + records_written - 1 if records_written else header_row
-    worksheet.auto_filter.ref = f"{get_column_letter(start_column)}{header_row}:{get_column_letter(end_column)}{data_end_row}"
-    worksheet.freeze_panes = f"{get_column_letter(start_column)}{data_start_row}"
-    worksheet.row_dimensions[header_row].height = 32
-    worksheet.sheet_view.showGridLines = False
-
-    return {"sheet": target_sheet, "detail_rows_written": detail_rows_written}
-
-template = cp.openpyxl.read(TEMPLATE_PATH, data_only=False, rich_text=True)
-set_materiality(template, MATERIALITY)   # must run BEFORE reading: Tab 1 formulas depend on C10
-
-quant_result = append_raw_tb_cy_to_sheet(
-    template=template, raw_tb_CY=raw_tb_CY, spark_column_row_pairs_cy=spark_column_row_pairs_cy,
-    target_sheet=QUANTITATIVE_SHEET, anchor_cell="B12",
-    calculated_columns=CALCULATED_COLUMNS, materiality=MATERIALITY, row_id_col=ROW_ID_COLUMN)
-
-qual_result = append_raw_tb_cy_to_sheet(
-    template=template, raw_tb_CY=raw_tb_CY, spark_column_row_pairs_cy=spark_column_row_pairs_cy,
-    target_sheet=QUALITATIVE_SHEET, anchor_cell="B12",
-    calculated_columns=[], row_id_col=ROW_ID_COLUMN)   # same writer, no calc columns/detail rows here
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 7 - "3. Residual Analytic" sheet (CY vs PY comparison)
-# MAGIC ### =====================================================================
-# MAGIC  Full-outer-joins updated_raw_tb_CY and updated_raw_tb_PY on account
-# MAGIC  name + occurrence number, then writes the comparison table with live Excel
-# MAGIC  formulas. Parameter block (C6:C9): Materiality, Threshold, Investigate %,
-# MAGIC  Investigate multiple. All formulas read these cells.
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-# DBTITLE 1,Manual Mapping Readin
-manual_mapping = read_excel(MANUAL_MAPPING_PATH, sheet_name=["Sheet1"], header=0,
-                             naming_convention="neutral", trim=True)
-manual_mapping = (manual_mapping.drop('__sheet__')
-                   .withColumnRenamed('Account Grp CY', "Account CY")
-                   .withColumnRenamed('Account Grp PY Exact Match', "Account PY"))
-
-# COMMAND ----------
-
-MATERIALITY_CELL = "$C$6"
-T3_THRESHOLD_CELL = "$C$7"      # 25% of materiality
-T3_PCT_CELL = "$C$8"            # Investigate #1: |Difference %| > this
-T3_MULTIPLE_CELL = "$C$9"       # Investigate #2: |Times of materiality| > this
-NULL_MARKER = GREY_MARKER
-
-RESIDUAL_ANALYTIC_SHEET_HINT = "3. Residual Analytic"   # substring match; actual sheet name may have a date suffix
-RESIDUAL_ANALYTIC_ANCHOR_CELL = "B12"   # was B8. Rows 8-9 are now parameter rows, template header must sit here too
-
-ACCOUNT_COLUMN = "Account"
-TEST_COLUMN = "Test consolidated amount"
-UNTESTED_COLUMN = "Untested Balance"
-
-RESIDUAL_ANALYTIC_HEADERS = [
-    "BALANCE SHEET CY", "BALANCE SHEET PY",
-    "Total Residual balance per Account Grouping - CY", "Total Residual balance per Account Grouping - PY",
-    "Difference ($)", "Difference (%)", "Threshold", "Investigate", "T/M",
-    "Times of materiality", "Investigate?", "T/M",
-]
-
-MONEY_FMT = '#,##0;(#,##0);"-"'
-PCT_FMT = "0%"
-TOM_FMT = "0.00"
-
-HEADER_FILL, WHITE_FILL = make_fill("8EA9DB"), make_fill("FFFFFF")
-GREEN_FILL, RED_FILL, GREY_FILL = make_fill("C6EFCE"), make_fill("FFCBCB"), make_fill("D9D9D9")
-
-HEADER_FONT, BLACK_FONT = make_font("000000", bold=True), make_font("000000")
-RED_BOLD, GREY_FONT = make_font("C00000", bold=True), make_font("808080")
-FULL_BORDER = make_border("000000")
-
-HEADER_ALIGN, NUM_ALIGN = make_alignment("center", "center", wrap=True), make_alignment("right", "center")
-CTR_ALIGN, LEFT_ALIGN = make_alignment("center", "center"), make_alignment("left", "center")
-
-COLUMN_WIDTHS = {
-    "acct_cy": 34, "acct_py": 34, "cy": 20, "py": 20, "diff": 15, "pct": 11,
-    "thr": 13, "inv1": 12, "tm1": 8, "tom": 16, "inv2": 12, "tm2": 8,
-}
-KEYS = ["acct_cy", "acct_py", "cy", "py", "diff", "pct", "thr", "inv1", "tm1", "tom", "inv2", "tm2"]  # canonical column order for this sheet
-RED_KEYS = {"inv1", "tm1", "tom", "inv2", "tm2"}   # the "D&T-added" analysis columns, styled bold red
-
-def _resolve_residual_analytic_sheet(template, hint=RESIDUAL_ANALYTIC_SHEET_HINT):
-    # Find the actual sheet name by substring match, since it may carry a date suffix.
-    target = hint.strip().casefold()
-    matches = [name for name in template.sheetnames if target in name.strip().casefold()]
-    if matches: return matches[0]
-    raise ValueError(f"No sheet matching {hint!r}")
-
-def _write_tab3_parameters(worksheet):
-    # Parameter block read by every Tab 3 formula. Labels are written only if the template cell is empty.
-    params = [
-        (MATERIALITY_CELL,  "Materiality",                                  float(MATERIALITY),           "[$$-en-US]#,##0"),
-        (T3_THRESHOLD_CELL, "Threshold (25% of materiality)",               float(THRESHOLD_VALUE),       "[$$-en-US]#,##0"),
-        (T3_PCT_CELL,       "Investigate % (Difference %)",                 float(THRESHOLD_PERCENTAGE),  "0%"),
-        (T3_MULTIPLE_CELL,  "Investigate multiple (Times of materiality)",  float(INVESTIGATE_MULTIPLE),  "0.00"),
-    ]
-    for ref, label, value, number_format in params:
-        coord = ref.replace("$", "")
-        row_number = coordinate_to_tuple(coord)[0]
-        label_cell = worksheet.cell(row=row_number, column=2)
-        if not isinstance(label_cell, MergedCell) and label_cell.value in (None, ""):
-            label_cell.value = label
-        value_cell = worksheet[coord]
-        value_cell.value, value_cell.number_format = value, number_format
-
-def _style_data_cell(cell, key, grey=False):
-    cell.fill = GREY_FILL if grey else WHITE_FILL
-    cell.border = FULL_BORDER
-    cell.font = GREY_FONT if grey else (RED_BOLD if key in RED_KEYS else BLACK_FONT)
-    if key in {"acct_cy", "acct_py"}: cell.alignment = LEFT_ALIGN
-    elif key in {"inv1", "tm1", "inv2", "tm2"}: cell.alignment = CTR_ALIGN
-    else: cell.alignment = NUM_ALIGN
-
-def _style_data_row(worksheet, row_number, column_letters, grey=False):
-    for key in KEYS:
-        _style_data_cell(worksheet[f"{column_letters[key]}{row_number}"], key, grey=grey)
-
-def _apply_number_formats(worksheet, row_number, column_letters):
-    for key in ("cy", "py", "diff", "thr"):
-        worksheet[f"{column_letters[key]}{row_number}"].number_format = MONEY_FMT
-    worksheet[f"{column_letters['pct']}{row_number}"].number_format = PCT_FMT
-    worksheet[f"{column_letters['tom']}{row_number}"].number_format = TOM_FMT
-
-def _spark_account_is_valid(column_name):
-    # Column expr: True where the account-name cell is non-null and non-blank after trim.
-    source = F.col(f"`{column_name}`")
-    return source.isNotNull() & (F.trim(source.cast("string")) != F.lit(""))
-
-def _spark_numeric_or_null(column_name):
-    # Column expr: parse a text/number cell into a double, treating blank/None/the grey
-    # marker as SQL NULL (not 0) - so joins/sums don't silently zero-fill missing data.
-    source = F.col(f"`{column_name}`")
-    source_text = F.trim(source.cast("string"))
-    cleaned_text = F.regexp_replace(F.regexp_replace(source_text, ",", ""), "%", "")
-    return F.when(
-        source.isNull() | (source_text == F.lit("")) | (F.lower(source_text) == F.lit(NULL_MARKER)),
-        F.lit(None).cast("double"),
-    ).otherwise(cleaned_text.cast("double"))
-
-def _spark_test_is_not_exact_no(dataframe, column_name):
-    # Column expr: True unless the "Test consolidated amount" cell is exactly "no". Used to
-    # flag CY rows that WERE fully tested (so they get greyed out on Tab 3).
-    if column_name.lower() not in [c.lower() for c in dataframe.columns]: return F.lit(False)
-    source_text = F.trim(F.col(f"`{column_name}`").cast("string"))
-    return F.col(f"`{column_name}`").isNull() | (F.lower(source_text) != F.lit("no"))
-
-def _add_account_occurrence_number(dataframe, account_column, alias_map):
-    # Number each occurrence of a duplicate account name in row_id order (1st, 2nd, ...) so
-    # the CY/PY join can pair the Nth CY "Cash" with the Nth PY "Cash" instead of exploding into
-    # a many-to-many cross join on duplicate names.
-    row_id_column = "row_id"
-    source = (dataframe
-              .filter(_spark_account_is_valid(account_column))
-              .withColumn("_account_key", spark_account_key(account_column, alias_map))
-              .withColumn("_row_id", F.col(f"`{row_id_column}`").cast("long"))
-              .withColumn("_source_tiebreaker", F.monotonically_increasing_id()))
-    occurrence_window = Window.partitionBy("_account_key").orderBy(
-        F.col("_row_id").asc_nulls_last(), F.col("_source_tiebreaker").asc())
-    return source.withColumn("_account_occurrence", F.row_number().over(occurrence_window))
-
-def _build_fuzzy_alias_map(cy_keys, py_keys):
-    # Build {PY_name: CY_name} aliases for account names that normalize to the same
-    # account_key() but aren't textually identical - catches typos/formatting differences
-    # automatically, without needing an entry in the manual mapping file.
-    cy_norm_to_key = {}
-    for key in cy_keys:
-        norm = account_key(key)
-        if norm and norm not in cy_norm_to_key: cy_norm_to_key[norm] = key   # first CY name wins for a given normalized key
-    alias_map = {}
-    for py_key in set(py_keys):
-        if not py_key: continue
-        cy_key = cy_norm_to_key.get(account_key(py_key))
-        if cy_key is not None and cy_key != py_key: alias_map[py_key] = cy_key
-    return alias_map
-
-def _collect_account_rich_keys(dataframe, account_column):
-    # Distinct, non-null account-name strings from a Spark frame, as a plain Python list.
-    return [row[0] for row in (
-        dataframe.select(F.col(f"`{account_column}`").cast("string"))
-        .filter(F.col(f"`{account_column}`").isNotNull()).distinct().collect())]
-
-def _build_manual_alias_map(manual_mapping) -> dict[str, str]:
-    # Convert Manual_Mapping.xlsx rows into {account_key(PY): account_key(CY)}, skipping
-    # blank rows or no-op mappings (same key on both sides).
-    rows = (manual_mapping
-            .select(F.trim(F.col("`Account CY`").cast("string")).alias("acct_cy"),
-                    F.trim(F.col("`Account PY`").cast("string")).alias("acct_py"))
-            .filter(F.col("acct_cy").isNotNull() & (F.col("acct_cy") != "")
-                    & F.col("acct_py").isNotNull() & (F.col("acct_py") != ""))
-            .distinct().collect())
-    return {
-        account_key(row["acct_py"]): account_key(row["acct_cy"])
-        for row in rows if account_key(row["acct_py"]) != account_key(row["acct_cy"])
-    }
-
-def build_residual_join(updated_raw_tb_CY, updated_raw_tb_PY, manual_mapping=None):
-    # Core of Tab 3: full outer join CY accounts to PY accounts (fuzzy-key + manual alias +
-    # occurrence-number matched), carrying each side's Untested Balance and whether the CY row
-    # is "greyed" (fully tested / not a residual candidate).
-    cy_rich_keys = _collect_account_rich_keys(updated_raw_tb_CY, ACCOUNT_COLUMN)
-    py_rich_keys = _collect_account_rich_keys(updated_raw_tb_PY, ACCOUNT_COLUMN)
-    alias_map = _build_fuzzy_alias_map(cy_keys=cy_rich_keys, py_keys=py_rich_keys)
-    if manual_mapping is not None:
-        alias_map.update(_build_manual_alias_map(manual_mapping))   # manual aliases applied last so they override fuzzy guesses
-
-    cy_greyed = _spark_test_is_not_exact_no(updated_raw_tb_CY, TEST_COLUMN)
-
-    cy_source = (_add_account_occurrence_number(updated_raw_tb_CY, ACCOUNT_COLUMN, alias_map)
-                 .select(F.col(f"`{ACCOUNT_COLUMN}`").alias("Account_CY"), F.col("_account_key"),
-                         F.col("_account_occurrence"), F.col("_row_id").alias("CY_Row_ID"),
-                         _spark_numeric_or_null(UNTESTED_COLUMN).alias("Untested_Balance_CY"),
-                         cy_greyed.alias("CY_Greyed")))
-
-    py_source = (_add_account_occurrence_number(updated_raw_tb_PY, ACCOUNT_COLUMN, alias_map)
-                 .select(F.col(f"`{ACCOUNT_COLUMN}`").alias("Account_PY"), F.col("_account_key"),
-                         F.col("_account_occurrence"), F.col("_row_id").alias("PY_Row_ID"),
-                         _spark_numeric_or_null(UNTESTED_COLUMN).alias("Untested_Balance_PY")))
-
-    cy, py = cy_source.alias("cy"), py_source.alias("py")
-    join_condition = ((F.col("cy._account_key") == F.col("py._account_key"))
-                        & (F.col("cy._account_occurrence") == F.col("py._account_occurrence")))
-    joined = cy.join(py, join_condition, how="full_outer")   # keeps CY-only and PY-only rows too, not just matches
-
-    result = joined.select(
-        F.col("cy.Account_CY").alias("Account_CY"),
-        F.col("cy.Untested_Balance_CY").alias("Untested_Balance_CY"),
-        F.col("py.Account_PY").alias("Account_PY"),
-        F.col("py.Untested_Balance_PY").alias("Untested_Balance_PY"),
-        # No CY side at all -> greyed (nothing to investigate on the CY side); otherwise use the
-        # real CY_Greyed flag, defaulting True if it's somehow null.
-        F.when(F.col("cy.Account_CY").isNull(), F.lit(True))
-         .otherwise(F.coalesce(F.col("cy.CY_Greyed"), F.lit(True))).alias("CY_Greyed"),
-        F.col("cy.CY_Row_ID").alias("CY_Row_ID"),
-        F.col("py.PY_Row_ID").alias("PY_Row_ID"),
-        F.coalesce(F.col("cy.CY_Row_ID"), F.col("py.PY_Row_ID")).alias("_sort_row_id"),
-        F.coalesce(F.col("cy._account_occurrence"), F.col("py._account_occurrence")).alias("_sort_occurrence"),
-        F.coalesce(F.col("cy.Account_CY"), F.col("py.Account_PY")).alias("_sort_account"),
-    )
-
-    return (result
-            .orderBy(F.col("_sort_row_id").asc_nulls_last(), F.col("_sort_occurrence").asc_nulls_last(),
-                     F.col("_sort_account").asc_nulls_last())   # stable ordering: original CY row order first
-            .drop("_sort_row_id", "_sort_occurrence", "_sort_account"))
-
-_num = to_excel_number
-
-def _apply_investigate_colors(worksheet, column_letters, non_grey_rows):
-    # For every non-greyed row's 2 "Investigate?" cells: color directly if literal text is
-    # already there, AND also attach live conditional-formatting rules so the color stays
-    # correct after a user edits the cell or if it later holds a formula result.
-    for row_number in non_grey_rows:
-        for key in ("inv1", "inv2"):
-            cell_reference = f"{column_letters[key]}{row_number}"
-            cell = worksheet[cell_reference]
-            if isinstance(cell.value, str) and not cell.value.startswith("="):
-                cell.fill = GREEN_FILL if cell.value.strip().casefold() == "no" else RED_FILL
-            else:
-                cell.fill = WHITE_FILL
-            no_formula = f'IFERROR(UPPER(TRIM({cell_reference}))="NO",FALSE)'
-            worksheet.conditional_formatting.add(cell_reference, FormulaRule(formula=[no_formula], fill=GREEN_FILL, stopIfTrue=True))
-            worksheet.conditional_formatting.add(cell_reference, FormulaRule(formula=[f"NOT({no_formula})"], fill=RED_FILL, stopIfTrue=True))
-
-def write_residual_analytic_sheet(template, residual_df, sheet_name=None, anchor_cell=RESIDUAL_ANALYTIC_ANCHOR_CELL):
-    # Render build_residual_join()'s output into the "3. Residual Analytic" sheet: parameter block,
-    # header row, one data row per join result (with live Excel formulas for diff/%/investigate),
-    # and colored investigate flags.
-    if sheet_name is None: sheet_name = _resolve_residual_analytic_sheet(template)
-    residual_rows = residual_df.collect()
-    worksheet = template[sheet_name]
-
-    _write_tab3_parameters(worksheet)
-
-    header_row, start_column = coordinate_to_tuple(anchor_cell)
-    label_row = header_row + 1
-    first_data_row = header_row + 2
-    end_column = start_column + len(KEYS) - 1
-
-    clear_worksheet_area(worksheet, header_row, start_column, end_column=end_column, reset_fill=WHITE_FILL)
-    clear_conditional_formatting(worksheet)
-    worksheet.auto_filter.ref = None
-
-    c = {key: get_column_letter(start_column + index) for index, key in enumerate(KEYS)}
-    worksheet.row_dimensions[header_row].height = 42
-
-    for offset, header in enumerate(RESIDUAL_ANALYTIC_HEADERS):
-        cell = worksheet.cell(row=header_row, column=start_column + offset, value=header)
-        cell.fill, cell.font, cell.alignment, cell.border = HEADER_FILL, HEADER_FONT, HEADER_ALIGN, FULL_BORDER
-
-    for key, width in COLUMN_WIDTHS.items():
-        worksheet.column_dimensions[c[key]].width = width
-
-    for key in KEYS: worksheet[f"{c[key]}{label_row}"].fill = WHITE_FILL
-
-    for key, text in (("cy", "Tab 2"), ("py", "PY Omnia Export Reference"), ("inv1", "{b}")):
-        label_cell = worksheet[f"{c[key]}{label_row}"]
-        label_cell.value, label_cell.font, label_cell.alignment = text, RED_BOLD, CTR_ALIGN
-
-    non_grey_rows, grey_rows = [], []
-
-    for index, record in enumerate(residual_rows):
-        row = first_data_row + index
-        cy_greyed = bool(record["CY_Greyed"])
-
-        if cy_greyed:
-            # Greyed rows: only account names shown, everything else blank/grey.
-            grey_rows.append(row)
-            for key in KEYS: worksheet[f"{c[key]}{row}"].value = None
-            worksheet[f"{c['acct_cy']}{row}"].value = record["Account_CY"]
-            worksheet[f"{c['acct_py']}{row}"].value = record["Account_PY"]
-            _style_data_cell(worksheet[f"{c['acct_cy']}{row}"], "acct_cy", grey=False)
-            _style_data_cell(worksheet[f"{c['acct_py']}{row}"], "acct_py", grey=False)
-            _style_data_row(worksheet, row, c, grey=True)
-            continue
-
-        non_grey_rows.append(row)
-        worksheet[f"{c['acct_cy']}{row}"].value = record["Account_CY"]
-        worksheet[f"{c['acct_py']}{row}"].value = record["Account_PY"]
-        worksheet[f"{c['cy']}{row}"].value = _num(record["Untested_Balance_CY"])
-        worksheet[f"{c['py']}{row}"].value = _num(record["Untested_Balance_PY"])
-
-        # Difference = CY - PY, blank if either side is missing.
-        worksheet[f"{c['diff']}{row}"] = (
-            f'=IF(OR(ISBLANK({c["cy"]}{row}),ISBLANK({c["py"]}{row})),"",'
-            f'{c["cy"]}{row}-{c["py"]}{row})'
-        )
-
-        # % difference relative to CY, guarding blank/zero denominators.
-        worksheet[f"{c['pct']}{row}"] = (
-            f'=IF(OR(ISBLANK({c["cy"]}{row}),ISBLANK({c["py"]}{row}),{c["py"]}{row}=0),"",'
-            f'{c["diff"]}{row}/{c["cy"]}{row})'
-        )
-
-        # Threshold column reads the parameter cell (C7)
-        worksheet[f"{c['thr']}{row}"] = f'=IF(ISBLANK({c["cy"]}{row}),"",{T3_THRESHOLD_CELL})'
-
-        # "Investigate?" #1: Yes only if BOTH the $ diff exceeds threshold AND the % move exceeds the % parameter (C8).
-        worksheet[f"{c['inv1']}{row}"] = (
-            f'=IF(OR(ISBLANK({c["diff"]}{row}),ISBLANK({c["thr"]}{row}),ISBLANK({c["pct"]}{row})),"",'
-            f'IF(AND(ABS({c["diff"]}{row})>{c["thr"]}{row},'
-            f'ABS({c["pct"]}{row})>{T3_PCT_CELL}),"Yes","No"))'
-        )
-
-        worksheet[f"{c['tm1']}{row}"] = f'=IF({c["inv1"]}{row}="Yes","Tab 3b","")'   # cross-reference to the entity-detail tab
-
-        # Times-of-materiality = CY balance / materiality cell (C6).
-        worksheet[f"{c['tom']}{row}"] = (
-            f'=IF(OR(ISBLANK({c["cy"]}{row}),{MATERIALITY_CELL}=0,ISBLANK({MATERIALITY_CELL})),"",'
-            f'{c["cy"]}{row}/{MATERIALITY_CELL})'
-        )
-
-        # "Investigate?" #2: balance itself exceeds the multiple parameter (C9) x materiality.
-        worksheet[f"{c['inv2']}{row}"] = (
-            f'=IF(ISBLANK({c["tom"]}{row}),"",IF(ABS({c["tom"]}{row})>{T3_MULTIPLE_CELL},"Yes","No"))'
-        )
-
-        worksheet[f"{c['tm2']}{row}"] = f'=IF({c["inv2"]}{row}="Yes","Tab 3a","")'   # cross-reference to the by-entity tab
-
-        _style_data_row(worksheet, row, c, grey=False)
-        _apply_number_formats(worksheet, row, c)
-
-    if residual_rows:
-        last_data_row = first_data_row + len(residual_rows) - 1
-        _apply_investigate_colors(worksheet, c, non_grey_rows)
-        worksheet.auto_filter.ref = f"{c['acct_cy']}{header_row}:{c['tm2']}{last_data_row}"
-    else:
-        last_data_row = first_data_row - 1
-
-    worksheet.freeze_panes = worksheet.cell(row=first_data_row, column=start_column)
-    worksheet.sheet_view.showGridLines = False
-
-    return {"sheet": sheet_name, "rows_written": len(residual_rows)}
-
-residual_cy_py = build_residual_join(updated_raw_tb_CY, updated_raw_tb_PY, manual_mapping)   # run once, reused by Sections 8-11 too
-write_residual_analytic_sheet(template, residual_cy_py)
-
-
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC # SECTION 8 - "3a. Times M by Entity" sheet
 # MAGIC ### =====================================================================
-# MAGIC  (unchanged) For every account whose Untested Balance exceeds materiality, write a
+# MAGIC  For every account whose Untested Balance exceeds materiality, write a
 # MAGIC  per-entity block cross-referenced against Tab 3 for a Total/Difference check.
+# MAGIC  NEW: "Entities to Investigate" column after Difference, listing every entity
+# MAGIC  in the block that triggered Investigate.
 # MAGIC ### =====================================================================
 
 # COMMAND ----------
 
-from openpyxl.styles.styleable import StyleArray   # internal openpyxl type; lets us copy a cell's full style in one assignment
+from openpyxl.styles.styleable import StyleArray
 
 SHEET_3A = "3a. Times M by Entity"
-TAB_2_SHEET = "3. Residual Analytic 6-30-2026"   # hardcoded (dated) sheet name Tab 3a cross-references for "Total as per Tab 2"
+TAB_2_SHEET = "3. Residual Analytic 6-30-2026"
 
 ANCHOR_CELL = "B12"
-BLOCK_HEIGHT = 5           # each account gets a repeating 5-row block in the template
-DATA_ROWS = 3              # of those 5 rows, only the first 3 hold real content; rows 4-5 are spacers
+BLOCK_HEIGHT = 5
+DATA_ROWS = 3
 THRESHOLD_CELL = "$C$7"
-TAB_2_TOTAL_COLUMN = "C"   # column on Tab 3 holding the CY total to cross-check against (CHECK: C = Account PY, CY total is in D)
+TAB_2_TOTAL_COLUMN = "C"   # CHECK: C = Account PY, CY total is in D
 DEEMED_SIGNIFICANT = "Deemed significant"
-FORMULA_DEEMED_SIGNIFICANT = "Deemed Significant"   # alt-casing also matched by the generated formula
+FORMULA_DEEMED_SIGNIFICANT = "Deemed Significant"
 
 TOTAL_HEADER = "Total"
 TAB_2_TOTAL_HEADER = "Total as per Tab 2"
 DIFFERENCE_HEADER = "Difference"
+INVESTIGATE_LIST_HEADER = "Entities to Investigate"
+INVESTIGATE_LIST_WIDTH = 60
 BLUE = "FF0070C0"
 GREEN_FILL_COLOR = "FFC6EFCE"
 RED_FILL_COLOR = "FFFFCBCB"
 
-_DEFAULT_STYLE = [0] * 9   # fallback StyleArray payload if a source cell has no _style set
+_DEFAULT_STYLE = [0] * 9
 
 S3A_FONT_BLACK, S3A_FONT_BLUE, S3A_FONT_HEADER = make_font(BLACK), make_font(BLUE), make_font(BLACK, bold=True)
 S3A_ALIGN_HEADER, S3A_ALIGN_LEFT = make_alignment(wrap=True), make_alignment("left")
 S3A_ALIGN_RIGHT, S3A_ALIGN_CENTER = make_alignment("right"), make_alignment("center")
+S3A_ALIGN_LEFT_WRAP = make_alignment("left", "center", wrap=True)
 S3A_FILL_WHITE, S3A_FILL_NONE = make_fill(WHITE), PatternFill()
 S3A_BORDER_FULL, S3A_BORDER_NONE = make_border(BLACK), Border()
 
 def s3a_get_sheet_materiality(worksheet, fallback_value):
-    # Read materiality off the worksheet cell if populated/non-zero, else fall back.
-    # NOTE: defined but never actually called.
     coordinate = MATERIALITY_CELL.replace("$", "")
     sheet_value = to_decimal(worksheet[coordinate].value)
     return fallback_value if sheet_value in {None, Decimal("0")} else sheet_value
 
 def s3a_build_blue_pair_lookups(spark_column_row_pairs_cy, row_id_col=ROW_ID_COLUMN):
-    # Build exact-text AND normalized-text lookup sets of blue/overridden (column, row_id)
-    # pairs, so matching can fall back to fuzzy column-name comparison if exact text differs.
     exact_pairs, normalized_pairs = set(), set()
     row_id_key = normalize_text(row_id_col)
     for pair in spark_column_row_pairs_cy or []:
@@ -1535,17 +62,12 @@ def s3a_build_blue_pair_lookups(spark_column_row_pairs_cy, row_id_col=ROW_ID_COL
     return exact_pairs, normalized_pairs
 
 def s3a_is_blue_cell(entity_column, source_row_id, blue_exact_pairs, blue_normalized_pairs):
-    # True if this (entity_column, row) was flagged as a manual override - exact match first,
-    # then normalized-name fallback.
     try: source_row_id = int(source_row_id)
     except (ValueError, TypeError): return False
     return ((str(entity_column).strip(), source_row_id) in blue_exact_pairs
             or (normalize_text(entity_column), source_row_id) in blue_normalized_pairs)
 
 def s3a_build_residual_rows(updated_raw_tb_CY, materiality, row_id_col=ROW_ID_COLUMN):
-    # Select CY rows that qualify for Tab 3a: has an account name, non-zero % of consolidated
-    # balance, "No" test flag, AND Untested Balance exceeds 1x materiality (matches Tab 3's
-    # "inv2 = Yes" test, so this sheet stays in sync with which rows Tab 3 flags).
     materiality_value = to_decimal(materiality)
     source_columns = list(updated_raw_tb_CY.columns)
     row_id_column = require_column(source_columns, row_id_col)
@@ -1566,12 +88,10 @@ def s3a_build_residual_rows(updated_raw_tb_CY, materiality, row_id_col=ROW_ID_CO
         if abs(untested_value / materiality_value) <= Decimal("1"): continue
 
         residual_rows.append({"Account_CY": record.get(account_column), "row_id": source_row_id, "record": record})
-    residual_rows.sort(key=lambda row: row["row_id"])   # preserve original trial-balance row order
+    residual_rows.sort(key=lambda row: row["row_id"])
     return residual_rows
 
 def s3a_build_tab2_row_lookup(template):
-    # Scan the "3. Residual Analytic..." sheet's column B for account names -> row number,
-    # so 3a can pull each account's Tab-3 total by a live cross-sheet cell reference.
     worksheet = template[TAB_2_SHEET]
     lookup = {}
     for row_number in range(1, worksheet.max_row + 1):
@@ -1581,20 +101,17 @@ def s3a_build_tab2_row_lookup(template):
     return lookup
 
 def s3a_copy_block_style(worksheet, source_start_row, target_start_row, start_column, end_column, source_max_column):
-    # Clone the template's first block's row heights + full per-cell style onto a newly-added
-    # block, so every account's block looks identical to the template's example block.
     for row_offset in range(DATA_ROWS):
         source_row, target_row = source_start_row + row_offset, target_start_row + row_offset
         worksheet.row_dimensions[target_row].height = worksheet.row_dimensions[source_row].height
         for column in range(start_column, end_column + 1):
-            source_cell = worksheet.cell(row=source_row, column=min(column, source_max_column))   # clamp so we never read past the template's real columns
+            source_cell = worksheet.cell(row=source_row, column=min(column, source_max_column))
             target_cell = worksheet.cell(row=target_row, column=column)
             if not isinstance(target_cell, MergedCell):
                 style_args = source_cell._style if source_cell._style is not None else _DEFAULT_STYLE
-                target_cell._style = StyleArray(style_args)   # whole-style copy in one shot (font+fill+border+alignment+format)
+                target_cell._style = StyleArray(style_args)
 
 def s3a_wipe_spacer_rows(worksheet, spacer_start_row, start_column, end_column):
-    # Reset the two blank spacer rows between account blocks (value/style/format all cleared).
     for spacer_row in (spacer_start_row, spacer_start_row + 1):
         for column in range(start_column, end_column + 1):
             cell = worksheet.cell(row=spacer_row, column=column)
@@ -1603,8 +120,6 @@ def s3a_wipe_spacer_rows(worksheet, spacer_start_row, start_column, end_column):
                 cell.font, cell.alignment, cell.number_format = Font(), Alignment(), "General"
 
 def s3a_apply_all_investigate_colors(worksheet, investigate_coordinates):
-    # Add conditional-formatting rules to every "Investigate?" formula cell across all blocks:
-    # red if the result isn't literally "No", green if it is.
     for coordinate in investigate_coordinates:
         abs_coord = absolute_coordinate(coordinate)
         red_rule = FormulaRule(formula=[f'{abs_coord}<>"No"'], stopIfTrue=True)
@@ -1618,13 +133,13 @@ def s3a_apply_all_investigate_colors(worksheet, investigate_coordinates):
 
 def s3a_write_block(worksheet, block_start_row, record, account_column, source_row_id,
                      entity_columns, blue_exact_pairs, blue_normalized_pairs, tab2_row_lookup):
-    # Write one 3-row account block: row1 = entity name headers + Total/Tab2/Difference
-    # headers, row2 = account name + each entity's balance + computed Total/Tab2-lookup/Difference,
+    # One 3-row block: row1 = headers, row2 = account + balances + Total/Tab2/Difference/Entities list,
     # row3 = "Investigate?" label + per-entity investigate formula.
     header_row, balance_row, investigate_row = block_start_row, block_start_row + 1, block_start_row + 2
     entity_start_column = 3
     entity_end_column = entity_start_column + len(entity_columns) - 1
     total_column, tab2_column, difference_column = entity_end_column + 1, entity_end_column + 2, entity_end_column + 3
+    list_column = difference_column + 1   # NEW
 
     investigate_coordinates = []
     account_header = worksheet.cell(row=header_row, column=2)
@@ -1634,7 +149,7 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
 
     account_value = record.get(account_column)
     if account_value in {None, ""}:
-        return investigate_coordinates   # blank account name - nothing further to write for this block
+        return investigate_coordinates
 
     account_cell = worksheet.cell(row=balance_row, column=2)
     account_cell.value = account_value
@@ -1662,7 +177,6 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
         balance_cell.fill, balance_cell.border = S3A_FILL_WHITE, S3A_BORDER_FULL
 
         if grey_marker or is_blue:
-            # Manually-overridden cell: show a text label instead of a number, in blue font.
             balance_cell.value = DEEMED_SIGNIFICANT
             balance_cell.font, balance_cell.alignment, balance_cell.number_format = S3A_FONT_BLUE, S3A_ALIGN_CENTER, "General"
         elif numeric_value is not None:
@@ -1673,8 +187,6 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
             balance_cell.font, balance_cell.alignment, balance_cell.number_format = S3A_FONT_BLACK, S3A_ALIGN_RIGHT, "General"
 
         balance_coordinate = balance_cell.coordinate
-        # Per-entity Investigate? formula: "No" if the cell is a deemed-significant override;
-        # blank if not a real number; else "Investigate" only when |balance| exceeds the $ threshold.
         investigate_cell.value = (
             f'=IF(OR({balance_coordinate}="{DEEMED_SIGNIFICANT}",{balance_coordinate}="{FORMULA_DEEMED_SIGNIFICANT}"),"No",'
             f'IF(OR(ISBLANK({balance_coordinate}),NOT(ISNUMBER({balance_coordinate}))),"",'
@@ -1684,7 +196,8 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
         investigate_cell.border, investigate_cell.number_format, investigate_cell.fill = S3A_BORDER_FULL, "General", S3A_FILL_NONE
         investigate_coordinates.append(investigate_cell.coordinate)
 
-    for column, label in ((total_column, TOTAL_HEADER), (tab2_column, TAB_2_TOTAL_HEADER), (difference_column, DIFFERENCE_HEADER)):
+    for column, label in ((total_column, TOTAL_HEADER), (tab2_column, TAB_2_TOTAL_HEADER),
+                          (difference_column, DIFFERENCE_HEADER), (list_column, INVESTIGATE_LIST_HEADER)):
         header_cell = worksheet.cell(row=header_row, column=column)
         header_cell.value = label
         header_cell.font, header_cell.alignment = S3A_FONT_HEADER, S3A_ALIGN_HEADER
@@ -1693,7 +206,7 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
     total_cell = worksheet.cell(row=balance_row, column=total_column)
     first_coordinate = worksheet.cell(row=balance_row, column=entity_start_column).coordinate
     last_coordinate = worksheet.cell(row=balance_row, column=entity_end_column).coordinate
-    total_cell.value = f"=SUM({first_coordinate}:{last_coordinate})"   # SUM ignores the "Deemed significant" text cells automatically
+    total_cell.value = f"=SUM({first_coordinate}:{last_coordinate})"
     total_cell.font, total_cell.alignment = S3A_FONT_BLACK, S3A_ALIGN_RIGHT
     total_cell.fill, total_cell.border, total_cell.number_format = S3A_FILL_WHITE, S3A_BORDER_FULL, MONEY_FMT
 
@@ -1703,9 +216,9 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
     tab2_cell.fill, tab2_cell.border, tab2_cell.number_format = S3A_FILL_WHITE, S3A_BORDER_FULL, MONEY_FMT
 
     if tab2_row is None:
-        tab2_cell.value, tab2_cell.number_format = "-", "General"   # account not found on Tab 3 - show a dash instead of a broken formula
+        tab2_cell.value, tab2_cell.number_format = "-", "General"
     else:
-        tab2_cell.value = f"={quote_sheetname(TAB_2_SHEET)}!${TAB_2_TOTAL_COLUMN}${tab2_row}"   # live cross-sheet reference
+        tab2_cell.value = f"={quote_sheetname(TAB_2_SHEET)}!${TAB_2_TOTAL_COLUMN}${tab2_row}"
 
     difference_cell = worksheet.cell(row=balance_row, column=difference_column)
     difference_cell.font, difference_cell.alignment = S3A_FONT_BLACK, S3A_ALIGN_RIGHT
@@ -1714,15 +227,27 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
     if tab2_row is None:
         difference_cell.value, difference_cell.number_format = "-", "General"
     else:
-        # Difference = Total - Tab2 total, shown as "-" (not 0) once rounded difference ties out,
-        # and "-" whenever either side isn't a real number.
         difference_cell.value = (
             f'=IF(OR(NOT(ISNUMBER({total_cell.coordinate})),NOT(ISNUMBER({tab2_cell.coordinate}))),"-",'
             f'IF(ROUND({total_cell.coordinate}-{tab2_cell.coordinate},0)=0,"-",'
             f'{total_cell.coordinate}-{tab2_cell.coordinate}))'
         )
 
-    for column in (total_column, tab2_column, difference_column):
+    # NEW: comma-separated list of every entity whose per-entity Investigate? = "Investigate"
+    hdr_first = worksheet.cell(row=header_row, column=entity_start_column).coordinate
+    hdr_last = worksheet.cell(row=header_row, column=entity_end_column).coordinate
+    inv_first = worksheet.cell(row=investigate_row, column=entity_start_column).coordinate
+    inv_last = worksheet.cell(row=investigate_row, column=entity_end_column).coordinate
+
+    list_cell = worksheet.cell(row=balance_row, column=list_column)
+    list_cell.value = ArrayFormula(
+        list_cell.coordinate,
+        f'=_xlfn.TEXTJOIN(", ",TRUE,IF({inv_first}:{inv_last}="Investigate",{hdr_first}:{hdr_last},""))'
+    )
+    list_cell.font, list_cell.alignment = S3A_FONT_BLACK, S3A_ALIGN_LEFT_WRAP
+    list_cell.fill, list_cell.border, list_cell.number_format = S3A_FILL_WHITE, S3A_BORDER_FULL, "General"
+
+    for column in (total_column, tab2_column, difference_column, list_column):
         summary_cell = worksheet.cell(row=investigate_row, column=column)
         summary_cell.value = None
         summary_cell.font, summary_cell.alignment = S3A_FONT_BLACK, S3A_ALIGN_CENTER
@@ -1731,9 +256,6 @@ def s3a_write_block(worksheet, block_start_row, record, account_column, source_r
     return investigate_coordinates
 
 def populate_sheet_3a(template, updated_raw_tb_CY, residual_rows, spark_column_row_pairs_cy, materiality, row_id_col=ROW_ID_COLUMN):
-    # Top-level driver for Tab 3a: sizes the sheet to fit one 5-row block per qualifying
-    # account (growing the sheet if needed), writes materiality/threshold cells, then calls
-    # s3a_write_block() per account.
     worksheet = template[SHEET_3A]
     source_columns = list(updated_raw_tb_CY.columns)
     account_column = require_column(source_columns, "Account")
@@ -1749,12 +271,13 @@ def populate_sheet_3a(template, updated_raw_tb_CY, residual_rows, spark_column_r
     header_row, start_column = coordinate_to_tuple(ANCHOR_CELL)
     last_entity_column = start_column + len(entity_columns)
     total_column, tab2_column = last_entity_column + 1, last_entity_column + 2
-    difference_column = output_end_column = tab2_column + 1
+    difference_column = tab2_column + 1
+    list_column = output_end_column = difference_column + 1   # NEW: list col is now the last col
     source_max_column = worksheet.max_column
     required_end_row = header_row + max(len(residual_rows), 1) * BLOCK_HEIGHT - 1
 
     if required_end_row > worksheet.max_row:
-        worksheet.insert_rows(worksheet.max_row + 1, amount=required_end_row - worksheet.max_row)   # grow the sheet if more accounts than the template had rows for
+        worksheet.insert_rows(worksheet.max_row + 1, amount=required_end_row - worksheet.max_row)
 
     clear_worksheet_area(worksheet, header_row, start_column, end_row=max(worksheet.max_row, required_end_row), end_column=max(worksheet.max_column, output_end_column))
     clear_conditional_formatting(worksheet)
@@ -1769,504 +292,12 @@ def populate_sheet_3a(template, updated_raw_tb_CY, residual_rows, spark_column_r
             entity_columns=entity_columns, blue_exact_pairs=blue_exact_pairs,
             blue_normalized_pairs=blue_normalized_pairs, tab2_row_lookup=tab2_row_lookup)
         all_investigate_coordinates.extend(investigate_coordinates)
-        s3a_wipe_spacer_rows(worksheet, block_start_row + DATA_ROWS, start_column, difference_column)
+        s3a_wipe_spacer_rows(worksheet, block_start_row + DATA_ROWS, start_column, output_end_column)
 
     s3a_apply_all_investigate_colors(worksheet, all_investigate_coordinates)
+    worksheet.column_dimensions[get_column_letter(list_column)].width = INVESTIGATE_LIST_WIDTH
 
     return {"entity_columns": entity_columns, "blocks_written": len(residual_rows)}
 
-residual_rows = s3a_build_residual_rows(updated_raw_tb_CY, MATERIALITY)   # accounts exceeding 1x materiality, needing a per-entity breakdown
+residual_rows = s3a_build_residual_rows(updated_raw_tb_CY, MATERIALITY)
 populate_sheet_3a(template, updated_raw_tb_CY, residual_rows, spark_column_row_pairs_cy, MATERIALITY)
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 9 - "3b. Residual Analytic by entity" sheet
-# MAGIC ### =====================================================================
-# MAGIC  (unchanged) For every account meeting the Tab-3b criterion ({b}: |diff| >
-# MAGIC  threshold AND |diff%| > 15%), write a per-entity CY/PY/Difference block.
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-SHEET_3B = "3b. Residual Analytic by entity"
-
-ROW_ACCT_HEADER = 9     # merged "account name" super-header, one per 5-col account group
-ROW_SUB_HEADER = 10     # the 5 sub-column labels (CY/PY/Diff $/Diff %/Investigate) per group
-ROW_SOURCE_LABEL = 11   # small "source" labels under each sub-header (Tab 2 / XXXXX / Rx / {b})
-COL_ENTITY = 2          # column B: legal-entity name, one row per entity
-COL_DATA_START = 3      # column C: first data column of the first account group
-SUB_COLS = ["CY balances", "PY balance", "Difference ($)", "Difference (%)", "Investigate?"]
-SRC_LBLS = ["Tab 2", "XXXXX", "Rx", "Rx", "{b}"]
-N_SUB = 5   # sub-columns per account group (must match len(SUB_COLS))
-THRESHOLD_REF = "$C$7"
-
-_NAVY, _ACCT_HDR, _RED_FONT, _PY_ONLY, _GREY_FILL, _GREY_FONT = "FF1F3864", "FF8EA9DB", "FFFF0000", "FFFFFDE7", "FFD9D9D9", "FF808080"
-
-S3B_FONT_HEADER, S3B_FONT_HEADER_BLACK, S3B_FONT_SOURCE = make_font(WHITE, bold=True), make_font(BLACK, bold=True), make_font(_RED_FONT, size=9, bold=True)
-S3B_FONT_DATA, S3B_FONT_GREY = make_font(BLACK), make_font(_GREY_FONT)
-S3B_FILL_WHITE, S3B_FILL_NAVY, S3B_FILL_ACCT_HDR = make_fill(WHITE), make_fill(_NAVY), make_fill(_ACCT_HDR)
-S3B_FILL_PY_ONLY, S3B_FILL_GREY = make_fill(_PY_ONLY), make_fill(_GREY_FILL)
-S3B_BORDER = make_border(BLACK)
-
-_S3B_SKIP_COLS = {"account", "test consolidated amount", PERCENTAGE_COLUMN_NAME, "untested balance", "reference id", "significance", "consolidated", "row_id"}
-# non-entity metadata columns to exclude when scanning "which columns are legal entities"
-
-def _unmerge_from_row9(ws):
-    """Remove merges touching row 9+ since this whole block gets rebuilt each run."""
-    for rng in list(ws.merged_cells.ranges):
-        _, min_row, _, max_row = range_boundaries(str(rng))
-        if max_row >= ROW_ACCT_HEADER:
-            ws.unmerge_cells(str(rng))
-
-def _clear_from_row9(ws):
-    """Blank out every cell (value/font/fill/border/format/alignment) from row 9 down."""
-    for row in ws.iter_rows(min_row=ROW_ACCT_HEADER, max_row=ws.max_row):
-        for cell in row:
-            if isinstance(cell, MergedCell): continue
-            cell.value, cell.font, cell.fill = None, S3B_FONT_DATA, S3B_FILL_WHITE
-            cell.border, cell.number_format, cell.alignment = Border(), "General", Alignment()
-
-def _filter_tab3b(residual_cy_py, threshold_value):
-    """Select which accounts get a column-group on Tab 3b: not greyed out, both years present,
-    and the same $/% movement test used for Tab 3's "inv1" flag."""
-    thresh, pct_thresh = to_decimal(threshold_value), to_decimal(THRESHOLD_PERCENTAGE)
-    if thresh is None or pct_thresh is None: return []
-
-    results = []
-    for rec in records_from(residual_cy_py):
-        if rec.get("CY_Greyed"): continue
-        cy, py = to_decimal(rec.get("Untested_Balance_CY")), to_decimal(rec.get("Untested_Balance_PY"))
-        if cy is None or py is None: continue
-        diff = cy - py
-        pct = (diff / cy) if cy != Decimal("0") else None
-        if abs(diff) > thresh and pct is not None and abs(pct) > pct_thresh:
-            results.append(rec)
-    return results
-
-def _build_lookup(records, account_col):
-    """normalized-account-name -> full record, first occurrence wins."""
-    lookup = {}
-    for rec in records:
-        key = account_key(rec.get(account_col, ""))
-        if key: lookup[key] = rec
-    return lookup
-
-def _get_entity_columns_s3b(df, account_col):
-    """Entity columns = everything after the account column not in the metadata skip-list
-    (a different rule from find_entity_columns' anchor-based approach used elsewhere)."""
-    after, entities = False, []
-    for c in dataframe_columns(df):
-        if normalize_text(c) == normalize_text(account_col): after = True; continue
-        if after and normalize_text(c) not in _S3B_SKIP_COLS:
-            entities.append(c)
-    return entities
-
-def _build_combined_entities(cy_entity_cols, py_entity_cols):
-    """Union of CY+PY entity columns: CY ones first (in CY order), then any PY-only entity
-    (existed in PY but not CY - e.g. divested/renamed) appended after."""
-    cy_normed = {normalize_text(e) for e in cy_entity_cols}
-    combined = [(e, "cy") for e in cy_entity_cols]
-    for py_ent in py_entity_cols:
-        if normalize_text(py_ent) not in cy_normed:
-            combined.append((py_ent, "py_only"))
-    return combined
-
-def _write_row9_header(ws, col_start, col_end, acct_name):
-    """Merge & style the account-name super-header spanning this account's 5 sub-columns."""
-    col_s_l, col_e_l = get_column_letter(col_start), get_column_letter(col_end)
-    ws.merge_cells(f"{col_s_l}{ROW_ACCT_HEADER}:{col_e_l}{ROW_ACCT_HEADER}")
-    anchor = ws.cell(row=ROW_ACCT_HEADER, column=col_start)
-    anchor.value = acct_name
-    anchor.font, anchor.fill, anchor.border, anchor.alignment = S3B_FONT_HEADER_BLACK, S3B_FILL_ACCT_HDR, S3B_BORDER, make_alignment("center", wrap=True)
-    for c in range(col_start + 1, col_end + 1):
-        mc = ws.cell(row=ROW_ACCT_HEADER, column=c)
-        if not isinstance(mc, MergedCell):
-            mc.fill, mc.border = S3B_FILL_ACCT_HDR, S3B_BORDER
-
-def _write_grey_cell(cell):
-    """Reset a cell to the standard "no data here" grey styling."""
-    cell.value = None
-    cell.fill, cell.font, cell.number_format = S3B_FILL_GREY, S3B_FONT_GREY, "General"
-    cell.alignment, cell.border = make_alignment("center"), S3B_BORDER
-
-def populate_sheet_3b(template, updated_raw_tb_CY, updated_raw_tb_PY, residual_cy_py, threshold_value, account_col="Account", py_account_col=None):
-    """Top-level driver for Tab 3b: for every flagged account (from _filter_tab3b), builds a
-    5-column group (CY/PY/Diff$/Diff%/Investigate) and fills one row per legal entity."""
-    py_account_col = account_col if py_account_col is None else py_account_col
-    ws = template[SHEET_3B]
-    ws["C6"].value = float(MATERIALITY)
-    ws["C7"].value = float(threshold_value)
-
-    tab3b_rows = _filter_tab3b(residual_cy_py, threshold_value)
-    if not tab3b_rows: return {}   # nothing exceeds threshold - leave the sheet untouched beyond row 6/7
-
-    cy_records, py_records = records_from(updated_raw_tb_CY), records_from(updated_raw_tb_PY)
-    cy_entity_cols = _get_entity_columns_s3b(updated_raw_tb_CY, account_col)
-    py_entity_cols = _get_entity_columns_s3b(updated_raw_tb_PY, py_account_col)
-    cy_lookup, py_lookup = _build_lookup(cy_records, account_col), _build_lookup(py_records, py_account_col)
-    combined_entities = _build_combined_entities(cy_entity_cols, py_entity_cols)
-
-    _unmerge_from_row9(ws)
-    _clear_from_row9(ws)
-
-    b9 = ws.cell(row=ROW_ACCT_HEADER, column=COL_ENTITY)
-    b9.fill, b9.border = S3B_FILL_ACCT_HDR, S3B_BORDER
-    b10 = ws.cell(row=ROW_SUB_HEADER, column=COL_ENTITY)
-    b10.value = "Legal Entity"
-    b10.font, b10.fill, b10.border, b10.alignment = S3B_FONT_HEADER, S3B_FILL_NAVY, S3B_BORDER, make_alignment("center", wrap=True)
-    b11 = ws.cell(row=ROW_SOURCE_LABEL, column=COL_ENTITY)
-    b11.fill, b11.border = S3B_FILL_WHITE, S3B_BORDER
-
-    for a_idx, rec in enumerate(tab3b_rows):
-        acct_name = str(rec.get("Account_CY") or rec.get("Account_PY") or "").strip()
-        cs = COL_DATA_START + a_idx * N_SUB   # this account's group starts N_SUB columns after the previous one
-        ce = cs + N_SUB - 1
-        _write_row9_header(ws, cs, ce, acct_name)
-        for s, label in enumerate(SUB_COLS):
-            sh = ws.cell(row=ROW_SUB_HEADER, column=cs + s)
-            sh.value, sh.font, sh.fill, sh.border, sh.alignment = label, S3B_FONT_HEADER, S3B_FILL_NAVY, S3B_BORDER, make_alignment("center", wrap=True)
-        for s, src in enumerate(SRC_LBLS):
-            sl = ws.cell(row=ROW_SOURCE_LABEL, column=cs + s)
-            sl.value, sl.font, sl.fill, sl.border, sl.alignment = src, S3B_FONT_SOURCE, S3B_FILL_WHITE, S3B_BORDER, make_alignment("center")
-
-    last_col_l = get_column_letter(COL_DATA_START + len(tab3b_rows) * N_SUB - 1)
-    ws.auto_filter.ref = f"{get_column_letter(COL_ENTITY)}{ROW_SUB_HEADER}:{last_col_l}{ROW_SUB_HEADER}"
-
-    for e_idx, (entity, source) in enumerate(combined_entities):
-        data_row = ROW_DATA_START + e_idx
-        row_fill = S3B_FILL_PY_ONLY if source == "py_only" else S3B_FILL_WHITE   # flag entities that only existed in PY
-
-        ec = ws.cell(row=data_row, column=COL_ENTITY)
-        ec.value = str(entity).strip()
-        ec.font, ec.fill, ec.border, ec.alignment = S3B_FONT_DATA, row_fill, S3B_BORDER, make_alignment("left")
-
-        for a_idx, rec in enumerate(tab3b_rows):
-            acct_key = account_key(str(rec.get("Account_CY") or rec.get("Account_PY") or ""))
-            cs = COL_DATA_START + a_idx * N_SUB
-
-            cy_rec, py_rec = cy_lookup.get(acct_key, {}), py_lookup.get(acct_key, {})
-            raw_cy = None if source == "py_only" else cy_rec.get(entity)   # a py_only entity never had a CY balance, by definition
-            raw_py = py_rec.get(entity)
-
-            is_cy_grey, is_py_grey = is_grey_marker(raw_cy), is_grey_marker(raw_py)
-            cy_val = None if is_cy_grey else to_decimal(raw_cy)
-            py_val = None if is_py_grey else to_decimal(raw_py)
-
-            cy_c, py_c = ws.cell(row=data_row, column=cs), ws.cell(row=data_row, column=cs + 1)
-            dif_c, pct_c, inv_c = ws.cell(row=data_row, column=cs + 2), ws.cell(row=data_row, column=cs + 3), ws.cell(row=data_row, column=cs + 4)
-
-            for cell in (cy_c, py_c, dif_c, pct_c, inv_c):
-                cell.font, cell.fill, cell.border = S3B_FONT_DATA, row_fill, S3B_BORDER
-
-            if is_cy_grey:
-                for cell in (cy_c, py_c, dif_c, pct_c, inv_c): _write_grey_cell(cell)   # CY manually overridden -> grey the whole 5-cell row for this account
-                continue
-
-            cy_c.value = float(cy_val) if cy_val is not None else None
-            cy_c.number_format, cy_c.alignment = MONEY_FMT if cy_val is not None else "General", make_alignment("right")
-
-            if is_py_grey:
-                for cell in (py_c, dif_c, pct_c, inv_c): _write_grey_cell(cell)
-                continue
-
-            py_c.value = float(py_val) if py_val is not None else None
-            py_c.number_format, py_c.alignment = MONEY_FMT if py_val is not None else "General", make_alignment("right")
-
-            cy_addr, py_addr, dif_addr, pct_addr = cy_c.coordinate, py_c.coordinate, dif_c.coordinate, pct_c.coordinate
-
-            # Difference: CY-PY if both numeric; -PY if only PY numeric (CY treated as 0); blank otherwise.
-            dif_c.value = (f'=IF(ISNUMBER({cy_addr}),IF(ISNUMBER({py_addr}),{cy_addr}-{py_addr},{cy_addr}),'
-                           f'IF(ISNUMBER({py_addr}),0-{py_addr},""))')
-            dif_c.number_format, dif_c.alignment = MONEY_FMT, make_alignment("right")
-
-            # % difference relative to CY; if CY isn't usable but PY is, treat as a full 100% swing; else 0.
-            pct_c.value = (f'=IFERROR(IF(AND(ISNUMBER({cy_addr}),{cy_addr}<>0),{dif_addr}/{cy_addr},'
-                           f'IF(ISNUMBER({py_addr}),1,0)),0)')
-            pct_c.number_format, pct_c.alignment = PCT_FMT, make_alignment("right")
-
-            # per-entity Investigate?: Yes only if $ diff exceeds threshold AND % diff exceeds THRESHOLD_PERCENTAGE.
-            inv_c.value = f'=IFERROR(IF(AND(ABS({dif_addr})>{THRESHOLD_REF},ABS({pct_addr})>{THRESHOLD_PERCENTAGE}),"Yes","No"),"")'
-            inv_c.alignment = make_alignment("center")
-
-    last_data_row = ROW_DATA_START + len(combined_entities) - 1
-    for a_idx in range(len(tab3b_rows)):
-        inv_l = get_column_letter(COL_DATA_START + a_idx * N_SUB + 4)
-        rng = f"{inv_l}{ROW_DATA_START}:{inv_l}{last_data_row}"
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'{inv_l}{ROW_DATA_START}="Yes"'],
-                                                       fill=PatternFill(fill_type="solid", fgColor="FFFFCBCB"), stopIfTrue=True))
-        ws.conditional_formatting.add(rng, FormulaRule(formula=[f'{inv_l}{ROW_DATA_START}="No"'],
-                                                       fill=PatternFill(fill_type="solid", fgColor="FFC6EFCE"), stopIfTrue=True))
-
-    ws.column_dimensions[get_column_letter(COL_ENTITY)].width = 28
-    for a_idx in range(len(tab3b_rows)):
-        for s, w in enumerate([14, 14, 15, 13, 13]): ws.column_dimensions[get_column_letter(COL_DATA_START + a_idx * N_SUB + s)].width = w
-    ws.freeze_panes = ws.cell(row=ROW_DATA_START, column=COL_DATA_START)
-
-    return {"sheet": SHEET_3B, "accounts_written": len(tab3b_rows)}
-
-# NOTE: ROW_DATA_START is used inside populate_sheet_3b above but only DEFINED here, after the
-# function body - works only because the function isn't executed until it's called below (Python
-# late-binds globals). Fragile if this section's code is ever reordered.
-ROW_DATA_START = 12
-COL_DATA_START = 3
-
-populate_sheet_3b(template, updated_raw_tb_CY, updated_raw_tb_PY, residual_cy_py, THRESHOLD_VALUE, account_col="Account", py_account_col="Account")
-
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC
-# MAGIC # SECTION 10 - Save workbook
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-cp.openpyxl.write(template, OUTPUT_PATH, register=True)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # SECTION 11 - Validation Report
-# MAGIC ### =====================================================================
-# MAGIC  (unchanged) Counts, Consolidated and Untested totals for the raw files and every
-# MAGIC  generated sheet, written to validation.xlsx.
-# MAGIC ### =====================================================================
-
-# COMMAND ----------
-
-from copy import copy
-from openpyxl import Workbook
-from openpyxl.worksheet.table import Table
-
-CY_BS_LINE_COUNT = 126     # expected Balance Sheet row count in the CY export (used to classify BS vs IS by position)
-PY_BS_LINE_COUNT = 130     # same for PY (differs year to year as line items are added/removed)
-CONSOLIDATED_COLUMN = "Consolidated"
-ACCOUNT_CY_COLUMN = "Account_CY"
-ACCOUNT_PY_COLUMN = "Account_PY"
-CY_BALANCE_COLUMN = "Untested_Balance_CY"
-PY_BALANCE_COLUMN = "Untested_Balance_PY"
-
-def add_source_positions(records):
-    """Tag each row-dict with its 1-based position in the original list, since some records
-    don't carry an explicit sheet/row identifier."""
-    return [{**record, "__source_position__": position} for position, record in enumerate(records, start=1)]
-
-def get_statement_type(record, position, balance_sheet_line_count):
-    """Decide "BS" vs "IS": try an explicit sheet-name-like field first; if none found, fall
-    back to position (rows before the known BS line count are BS, the rest are IS)."""
-    for field_name in ("__sheet__", "sheet_name", "sheet", "statement", "statement_type"):
-        value = get_field(record, field_name)
-        if value is None: continue
-        text = str(value).casefold()
-        if "balance" in text: return "BS"
-        if "income" in text or "statement" in text: return "IS"
-    try: source_position = int(record.get("__source_position__", position))
-    except (TypeError, ValueError): source_position = position
-    return "BS" if source_position <= balance_sheet_line_count else "IS"
-
-def source_summary(records, label, balance_sheet_line_count):
-    """Aggregate row counts + Consolidated/Untested $ totals, split BS vs IS and combined
-    ("net"), for one pipeline stage (raw CY, raw PY, visible CY rows, etc.)."""
-    summary = {
-        "stage": label,
-        "bs_count": 0, "bs_consolidated": Decimal("0"), "bs_untested": Decimal("0"),
-        "is_count": 0, "is_consolidated": Decimal("0"), "is_untested": Decimal("0"),
-    }
-    for position, record in enumerate(records, start=1):
-        statement = get_statement_type(record, position, balance_sheet_line_count)
-        consolidated = to_decimal(get_field(record, CONSOLIDATED_COLUMN, "Consolidated Balance", "Consolidated Total")) or Decimal("0")
-        untested = to_decimal(get_field(record, "Untested Balance", "Untested", "Untested Total")) or Decimal("0")
-        prefix = "bs" if statement == "BS" else "is"
-        summary[f"{prefix}_count"] += 1
-        summary[f"{prefix}_consolidated"] += consolidated
-        summary[f"{prefix}_untested"] += untested
-    summary["net_count"] = summary["bs_count"] + summary["is_count"]
-    summary["net_consolidated"] = summary["bs_consolidated"] + summary["is_consolidated"]
-    summary["net_untested"] = summary["bs_untested"] + summary["is_untested"]
-    return summary
-
-def is_non_grey_cy_record(record):
-    """A CY row is "visible/active" (i.e. ends up on Tabs 1 & 2) only if it has an account
-    name, a non-zero % of consolidated balance, and a "no" test flag."""
-    account = get_field(record, "Account")
-    percentage = to_decimal(get_field(record, PERCENTAGE_COLUMN_NAME, "% of consolidated", "Percentage"))
-    test_value = str(get_field(record, "Test consolidated amount", "Test Consolidated Amount") or "").strip().casefold()
-    return is_present(account) and percentage is not None and percentage != Decimal("0") and test_value == "no"
-
-def sum_field(records, field_name):
-    """Decimal-safe sum of one field across records, skipping unparseable/missing values."""
-    total = Decimal("0")
-    for record in records:
-        value = to_decimal(get_field(record, field_name))
-        if value is not None: total += value
-    return total
-
-def account_balance_row(record):
-    """Extract (Account, Consolidated, Untested Balance) for the CY/PY detail sheets."""
-    return [
-        get_field(record, "Account"),
-        to_decimal(get_field(record, CONSOLIDATED_COLUMN, "Consolidated Balance", "Consolidated Total")),
-        to_decimal(get_field(record, "Untested Balance", "Untested", "Untested Total")),
-    ]
-
-cy_records = add_source_positions(records_from(updated_raw_tb_CY))
-py_records = add_source_positions(records_from(updated_raw_tb_PY))
-
-cy_raw_summary = source_summary(cy_records, "1. Raw CY Data", CY_BS_LINE_COUNT)
-py_raw_summary = source_summary(py_records, "2. Raw PY Data", PY_BS_LINE_COUNT)
-cy_non_grey_records = [r for r in cy_records if is_non_grey_cy_record(r)]
-py_account_records = [r for r in py_records if is_present(get_field(r, "Account"))]
-cy_visible_summary = source_summary(cy_non_grey_records, "3. Tab 1 & 2 (Visible Active Rows CY)", CY_BS_LINE_COUNT)
-
-residual_records = records_from(residual_cy_py)
-full_join_count = len(residual_records)
-common_line_count = cy_only_line_count = py_only_line_count = 0
-
-for record in residual_records:
-    # classify each joined row: matched both sides, CY-only, or PY-only (feeds the Tab 3 breakup stat)
-    has_cy = is_present(get_field(record, ACCOUNT_CY_COLUMN))
-    has_py = is_present(get_field(record, ACCOUNT_PY_COLUMN))
-    if has_cy and has_py: common_line_count += 1
-    elif has_cy: cy_only_line_count += 1
-    elif has_py: py_only_line_count += 1
-
-cy_untested_total = sum_field(residual_records, CY_BALANCE_COLUMN)
-py_untested_total = sum_field(residual_records, PY_BALANCE_COLUMN)
-
-V_BLACK, V_WHITE = "000000", "FFFFFF"
-CY_SECTION_COLOR, PY_SECTION_COLOR = "F4CCCC", "E2F0D9"   # light red/green banding separating CY vs PY sections
-
-thin_side = Side(style="thin", color=V_BLACK)
-table_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-
-BLACK_HEADER_FILL, WHITE_BODY_FILL = PatternFill(fill_type="solid", fgColor=V_BLACK), PatternFill(fill_type="solid", fgColor=V_WHITE)
-CY_SECTION_FILL, PY_SECTION_FILL = PatternFill(fill_type="solid", fgColor=CY_SECTION_COLOR), PatternFill(fill_type="solid", fgColor=PY_SECTION_COLOR)
-
-title_font, section_font = Font(name="Arial", size=12, italic=True, underline="single"), Font(name="Arial", size=10, bold=True)
-header_font, body_font = Font(name="Arial", size=10, bold=True, color=V_WHITE), Font(name="Arial", size=10, color=V_BLACK)
-left_alignment, center_alignment, right_alignment = Alignment(horizontal="left", vertical="center", wrap_text=True), Alignment(horizontal="center", vertical="center", wrap_text=True), Alignment(horizontal="right", vertical="center")
-V_MONEY_FORMAT, V_COUNT_FORMAT = '$#,##0.00;($#,##0.00);-', '#,##0'
-
-def excel_value(value):
-    return float(value) if isinstance(value, Decimal) else value
-
-def write_row(worksheet, row_number, values, header=False, body_fill=None):
-    """Write one full row with consistent styling: header rows get black fill/white bold/
-    centered text; body rows right-align numbers and left-align text, picking a number format
-    off the Python type."""
-    fill = body_fill or WHITE_BODY_FILL
-    for column_number, raw_value in enumerate(values, start=1):
-        value = excel_value(raw_value)
-        cell = worksheet.cell(row=row_number, column=column_number, value=value)
-        cell.border = table_border
-        if header: cell.fill, cell.font, cell.alignment = copy(BLACK_HEADER_FILL), header_font, center_alignment
-        else:
-            cell.fill, cell.font = copy(fill), body_font
-            cell.alignment = right_alignment if isinstance(value, (int, float)) and not isinstance(value, bool) else left_alignment
-        if isinstance(value, int) and not isinstance(value, bool): cell.number_format = V_COUNT_FORMAT
-        elif isinstance(value, float): cell.number_format = V_MONEY_FORMAT
-
-def write_block(worksheet, start_row, rows, body_fill=None):
-    """Write a mini-table: first row is the header, the rest are body rows."""
-    for row_offset, values in enumerate(rows):
-        write_row(worksheet, start_row + row_offset, values, header=row_offset == 0, body_fill=body_fill)
-
-def add_excel_table(worksheet, table_name, first_row, last_row, last_column):
-    """Register a native Excel Table over the range (enables filter/sort UI), skipped if there's no data."""
-    if last_row >= first_row:
-        worksheet.add_table(Table(displayName=table_name, ref=f"A{first_row}:{last_column}{last_row}"))
-
-workbook = Workbook()   # brand-new validation workbook, separate file from the main output
-summary_ws = workbook.active
-summary_ws.title = "Validation Summary"
-cy_ws, py_ws, full_join_ws = workbook.create_sheet("CY"), workbook.create_sheet("PY"), workbook.create_sheet("Full Outer Join")
-
-summary_ws["A1"] = "Sheet Validation File"
-summary_ws["A1"].font, summary_ws["A1"].alignment = title_font, left_alignment
-
-# Top summary table: row counts + $ totals at 4 pipeline stages (raw CY, raw PY, visible CY rows, Tab 3 residual).
-write_block(summary_ws, 3, [
-    ["Stage / Sheet", "Total Accounts (Count)", "CY Consolidated Total", "CY Untested Total", "PY Consolidated Total", "PY Untested Total"],
-    ["1. Raw CY Data", cy_raw_summary["net_count"], cy_raw_summary["net_consolidated"], cy_raw_summary["net_untested"], None, None],
-    ["2. Raw PY Data", py_raw_summary["net_count"], None, None, py_raw_summary["net_consolidated"], py_raw_summary["net_untested"]],
-    ["3. Tab 1 & 2 (Visible Active Rows CY)", cy_visible_summary["net_count"], cy_visible_summary["net_consolidated"], cy_visible_summary["net_untested"], None, None],
-    ["4. Tab 3 (Residual CY vs PY)", full_join_count, None, cy_untested_total, None, py_untested_total],
-])
-
-summary_ws["A10"] = "Tab 3 Line Count Breakup"
-summary_ws["A10"].font, summary_ws["A10"].alignment = section_font, left_alignment
-write_block(summary_ws, 11, [
-    ["Full outer-join lines", "Common match between PY and CY", "PY Accounts which do not have CY Matches", "CY Accounts which do not have PY Matches"],
-    [full_join_count, common_line_count, py_only_line_count, cy_only_line_count],
-])
-
-raw_file_headers = ["Stage / Sheet", "BS Line Count", "BS Consolidated Total", "BS Untested Total", "IS Line Count", "IS Consolidated Total", "IS Untested Total", "Net Line Count", "Net Consolidated Total", "Net Untested Total"]
-
-summary_ws["A14"] = "CY Raw File"
-summary_ws["A14"].font, summary_ws["A14"].alignment = section_font, left_alignment
-# NOTE: body rows are all None here - none of cy_raw_summary/cy_visible_summary's fields are
-# actually plugged in. Looks like an unfinished/placeholder section rather than intentional.
-write_block(summary_ws, 15, [
-    raw_file_headers,
-    ["1. Raw CY Data", None, None, None, None, None, None, None, None, None],
-    ["3. Tab 1 & 2 (Visible Active Rows CY)", None, None, None, None, None, None, None, None],
-], body_fill=CY_SECTION_FILL)
-
-summary_ws["A20"] = "PY Raw File"
-summary_ws["A20"].font, summary_ws["A20"].alignment = section_font, left_alignment
-# Same placeholder pattern for the PY-side breakdown.
-write_block(summary_ws, 21, [
-    raw_file_headers,
-    ["2. Raw PY Data", None, None, None, None, None, None, None, None],
-    ["3. Tab 1 & 2 (Visible Active Rows PY)", None, None, None, None, None, None, None, None],
-], body_fill=PY_SECTION_FILL)
-
-account_headers = ["Account", "Consolidated Balance", "Untested Balance"]
-
-cy_ws["A1"] = "CY Non-Greyed Accounts"
-cy_ws["A1"].font, cy_ws["A1"].alignment = title_font, left_alignment
-write_block(cy_ws, 3, [account_headers])
-for row_number, record in enumerate(cy_non_grey_records, start=4): write_row(cy_ws, row_number, account_balance_row(record))
-if cy_non_grey_records: add_excel_table(cy_ws, "CY_NonGreyed_Accounts", 3, len(cy_non_grey_records) + 3, "C")
-
-py_ws["A1"] = "PY Accounts"
-py_ws["A1"].font, py_ws["A1"].alignment = title_font, left_alignment
-write_block(py_ws, 3, [account_headers])
-for row_number, record in enumerate(py_account_records, start=4): write_row(py_ws, row_number, account_balance_row(record))
-if py_account_records: add_excel_table(py_ws, "PY_All_Accounts", 3, len(py_account_records) + 3, "C")
-
-full_join_ws["A1"] = "Full Outer Join"
-full_join_ws["A1"].font, full_join_ws["A1"].alignment = title_font, left_alignment
-write_block(full_join_ws, 3, [["Join Row", "Account CY", "CY Untested Balance", "Account PY", "PY Untested Balance", "Match Category", "CY Greyed", "CY Row ID", "PY Row ID"]])
-for row_number, record in enumerate(residual_records, start=4):
-    has_cy, has_py = is_present(get_field(record, ACCOUNT_CY_COLUMN)), is_present(get_field(record, ACCOUNT_PY_COLUMN))
-    category = "Common CY/PY" if (has_cy and has_py) else ("CY only" if has_cy else "PY only")
-    write_row(full_join_ws, row_number, [
-        row_number - 3, get_field(record, ACCOUNT_CY_COLUMN), to_decimal(get_field(record, CY_BALANCE_COLUMN)),
-        get_field(record, ACCOUNT_PY_COLUMN), to_decimal(get_field(record, PY_BALANCE_COLUMN)),
-        category, get_field(record, "CY_Greyed"), get_field(record, "CY_Row_ID"), get_field(record, "PY_Row_ID"),
-    ])
-if residual_records: add_excel_table(full_join_ws, "Full_Outer_Join", 3, len(residual_records) + 3, "I")
-
-for col, w in {"A": 48, "B": 20, "C": 23, "D": 21, "E": 23, "F": 21, "G": 21, "H": 18, "I": 23, "J": 21}.items(): summary_ws.column_dimensions[col].width = w
-for col, w in {"A": 50, "B": 24, "C": 24}.items(): cy_ws.column_dimensions[col].width = w; py_ws.column_dimensions[col].width = w
-for col, w in {"A": 12, "B": 42, "C": 22, "D": 42, "E": 22, "F": 20, "G": 14, "H": 12, "I": 12}.items(): full_join_ws.column_dimensions[col].width = w
-
-for ws in (summary_ws, cy_ws, py_ws, full_join_ws): ws.freeze_panes, ws.sheet_view.showGridLines = "A4", False
-
-summary_ws.auto_filter.ref = "A3:F7"
-if cy_non_grey_records: cy_ws.auto_filter.ref = f"A3:C{len(cy_non_grey_records) + 3}"
-if py_account_records: py_ws.auto_filter.ref = f"A3:C{len(py_account_records) + 3}"
-if residual_records: full_join_ws.auto_filter.ref = f"A3:I{len(residual_records) + 3}"
-
-for row_number in (3, 11, 15, 21): summary_ws.row_dimensions[row_number].height = 38
-cy_ws.row_dimensions[3].height = 34
-py_ws.row_dimensions[3].height = 34
-full_join_ws.row_dimensions[3].height = 34
-
-cp.openpyxl.write(workbook, VALIDATION_PATH, register=True)   # persist the standalone validation/tie-out workbook
-
-# COMMAND ----------
