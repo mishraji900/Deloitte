@@ -1,441 +1,133 @@
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # SECTION 11 - Data Validation & Data Quality Report (separate workbook)
+# MAGIC # SECTION 12 - Data Validation & DQ (separate file: dq_validation.xlsx)
 # MAGIC ### =====================================================================
-# MAGIC  Written to VALIDATION_PATH. Reads the saved OUTPUT_PATH back and compares
-# MAGIC  RAW file vs EXCLUDED (greyed) items vs WRITTEN in Excel:
-# MAGIC    - Tab 1 & 2: raw CY -> excluded by reason -> included -> written (count + $ totals)
-# MAGIC    - Tab 3: CY side and PY side buckets -> written, plus CY vs PY summary
-# MAGIC    - Check log (PASS / REVIEW / FAIL), Excluded Items list, Full Outer Join (unchanged)
-# MAGIC  Run AFTER Section 10 (needs the saved output file).
+# MAGIC  Raw vs Excluded (greyed) vs Written, for Tab 1 and Tab 2, plus raw DQ checks and
+# MAGIC  the CY/PY full outer join. Run AFTER Sections 10-11 (reads OUTPUT_PATH back, reuses
+# MAGIC  Section 11 helpers/vars: cy_records, py_account_records, residual_records, write_block ...).
 # MAGIC ### =====================================================================
 
 # COMMAND ----------
 
-# DBTITLE 1,Config + helpers
 from collections import Counter
-from copy import copy
-from openpyxl import Workbook
-from openpyxl.worksheet.table import Table
 
-CONSOLIDATED_COLUMN = "Consolidated"
-ACCOUNT_CY_COLUMN, ACCOUNT_PY_COLUMN = "Account_CY", "Account_PY"
-CY_BALANCE_COLUMN, PY_BALANCE_COLUMN = "Untested_Balance_CY", "Untested_Balance_PY"
-ZERO = Decimal("0")
-TOLERANCE = Decimal("0.01")            # float round-trip noise only
-PARAM_TOLERANCE = Decimal("0.000001")
+DQ_PATH = f"{OUTPUT_DIRECTORY}/dq_validation.xlsx"
+HDR_ROW, FIRST_COL, TOL = 12, 2, Decimal("0.01")   # table anchor B12, same as writer
+DETAIL_LABELS = {ENTITY_PERCENT_DETAIL_LABEL, ENTITY_MULTIPLE_DETAIL_LABEL}
+RECON_COLS = [c for c in GL_NUMERIC_COLUMNS_CY if c != PERCENTAGE_COLUMN_NAME]   # % col is rewritten as fraction, skip
 
-R_PCT = "Zero / blank % of consolidated balance"
-R_TEST = "Test consolidated amount is not 'No'"
-R_OK = "Included"
+raw_cy = records_from(raw_tb_CY)   # exact frame the Tab 1/2 writer consumed (not the greyed copy)
 
-def dec(value):
-    return to_decimal(value) or ZERO
+def status(*checks): return "OK" if all(checks) else "DIFF"
 
-def has_name(value):
-    return value is not None and str(value).strip() != ""
+def tally(recs, cols):
+    # row count + per-column Decimal sums (None / grey / blank -> 0)
+    return {"Row count": len(recs),
+            **{c: sum((to_decimal(r.get(c)) or Decimal(0) for r in recs), Decimal(0)) for c in cols}}
 
-def has_formula(value):
-    return isinstance(value, ArrayFormula) or (isinstance(value, str) and value.startswith("="))
-
-def font_rgb(cell):
-    rgb = getattr(cell.font.color, "rgb", None) if cell.font is not None else None
-    return rgb.upper() if isinstance(rgb, str) else ""
-
-def last_data_row(ws):
-    ref = ws.auto_filter.ref
-    return range_boundaries(ref)[3] if ref else ws.max_row
-
-def merged_aware_value(ws, coordinate):
-    for merged_range in ws.merged_cells.ranges:
-        if coordinate in merged_range:
-            coordinate = merged_range.coord.split(":", 1)[0]
-            break
-    return ws[coordinate].value
-
-def tally(rows, entity_cols):
-    t = {"count": 0, "consolidated": ZERO, "untested": ZERO, "entity": ZERO}
-    for r in rows:
-        t["count"] += 1
-        t["consolidated"] += dec(r.get(CONSOLIDATED_COLUMN))
-        t["untested"] += dec(r.get(UNTESTED_COLUMN))
-        t["entity"] += sum((dec(r.get(c)) for c in entity_cols), ZERO)
-    return t
-
-def add_t(a, b):
-    return {k: a[k] + b[k] for k in a}
-
-def cnt_sum(rows):
-    return len(rows), sum((dec(r.get(UNTESTED_COLUMN)) for r in rows), ZERO)
-
-def sequence_mismatches(expected, written):
-    n = max(len(expected), len(written))
-    return sum(1 for i in range(n)
-               if (expected[i] if i < len(expected) else None) != (written[i] if i < len(written) else None))
-
-# COMMAND ----------
-
-# DBTITLE 1,Expected side (from Spark data)
-cy_raw = sorted(records_from(raw_tb_CY), key=lambda r: int(r[ROW_ID_COLUMN]))   # raw = after Significance filter
-py_raw = sorted(records_from(raw_tb_PY), key=lambda r: int(r[ROW_ID_COLUMN]))
-cy_raw_by_id = {int(r[ROW_ID_COLUMN]): r for r in cy_raw}
-py_raw_by_id = {int(r[ROW_ID_COLUMN]): r for r in py_raw}
-residual_records = records_from(residual_cy_py)
-
-T12_ENTITY_COLS = find_entity_columns(list(raw_tb_CY.columns), excludes=CALCULATED_COLUMNS)
-
-def t12_reason(record):
-    # exact same visibility rule as append_raw_tb_cy_to_sheet (pct first, then test flag)
-    if not _is_nonzero(get_field(record, PERCENTAGE_COLUMN_NAME)): return R_PCT
-    if not _is_no(get_field(record, "Test consolidated amount")): return R_TEST
-    return R_OK
-
-t12 = {R_PCT: [], R_TEST: [], R_OK: []}
-for r in cy_raw:
-    t12[t12_reason(r)].append(r)
-t12_tally = {k: tally(v, T12_ENTITY_COLS) for k, v in t12.items()}
-t12_all = tally(cy_raw, T12_ENTITY_COLS)
-t12_excl = add_t(t12_tally[R_PCT], t12_tally[R_TEST])
-visible_ids = {int(r[ROW_ID_COLUMN]) for r in t12[R_OK]}
-expected_seq = [("visible" if t12_reason(r) == R_OK else "greyed", normalize_text(get_field(r, ACCOUNT_COLUMN))) for r in cy_raw]
-expected_blue = sum(1 for _, rid in spark_column_row_pairs_cy if int(rid) in visible_ids)
-visible_blank_account = sum(1 for r in t12[R_OK] if not has_name(get_field(r, ACCOUNT_COLUMN)))
-
-# ---- Tab 3 buckets (CY side / PY side), built from the full outer join
-CY_B = [
-    "Excluded - greyed (Test consolidated amount is not 'No')",
-    "Excluded - Untested Balance blue-overridden (blank on Tab 3)",
-    "Excluded - Untested Balance blank / non-numeric",
-    "Included - CY Untested Balance written to Tab 3",
-]
-PY_B = [
-    "Excluded - PY-only account (no CY match, not shown)",
-    "Excluded - matched CY account is greyed (PY not shown)",
-    "Excluded - Untested Balance blue-overridden (blank on Tab 3)",
-    "Excluded - Untested Balance blank / non-numeric",
-    "Included - PY Untested Balance written to Tab 3",
-]
-cy_b = {n: [0, ZERO] for n in CY_B}
-py_b = {n: [0, ZERO] for n in PY_B}
-cy_blue_unt = {int(rid) for col, rid in spark_column_row_pairs_cy if normalize_text(col) == normalize_text(UNTESTED_COLUMN)}
-py_blue_unt = {int(rid) for col, rid in spark_column_row_pairs_py if normalize_text(col) == normalize_text(UNTESTED_COLUMN)}
-
-def bump(bucket, key, amount):
-    bucket[key][0] += 1
-    bucket[key][1] += amount
-
-excluded_items = []   # feeds the "Excluded Items" sheet
-for reason in (R_PCT, R_TEST):
-    for r in t12[reason]:
-        excluded_items.append(["Tab 1 & 2 - CY", reason, int(r[ROW_ID_COLUMN]), get_field(r, ACCOUNT_COLUMN),
-                               dec(r.get(CONSOLIDATED_COLUMN)), dec(r.get(UNTESTED_COLUMN))])
-
-for rec in residual_records:
-    rid = rec.get("CY_Row_ID")
-    if rid is not None:
-        rid = int(rid)
-        raw = cy_raw_by_id.get(rid, {})
-        amount = dec(raw.get(UNTESTED_COLUMN))
-        if rec.get("CY_Greyed"): key = CY_B[0]
-        elif rec.get("Untested_Balance_CY") is None: key = CY_B[1] if rid in cy_blue_unt else CY_B[2]
-        else: key = CY_B[3]
-        bump(cy_b, key, amount)
-        if key != CY_B[3]:
-            excluded_items.append(["Tab 3 - CY", key, rid, rec.get(ACCOUNT_CY_COLUMN), dec(raw.get(CONSOLIDATED_COLUMN)), amount])
-
-    rid = rec.get("PY_Row_ID")
-    if rid is not None:
-        rid = int(rid)
-        raw = py_raw_by_id.get(rid, {})
-        amount = dec(raw.get(UNTESTED_COLUMN))
-        if rec.get(ACCOUNT_CY_COLUMN) is None: key = PY_B[0]
-        elif rec.get("CY_Greyed"): key = PY_B[1]
-        elif rec.get("Untested_Balance_PY") is None: key = PY_B[2] if rid in py_blue_unt else PY_B[3]
-        else: key = PY_B[4]
-        bump(py_b, key, amount)
-        if key != PY_B[4]:
-            excluded_items.append(["Tab 3 - PY", key, rid, rec.get(ACCOUNT_PY_COLUMN), dec(raw.get(CONSOLIDATED_COLUMN)), amount])
-
-cy_named = [r for r in cy_raw if has_name(get_field(r, ACCOUNT_COLUMN))]
-py_named = [r for r in py_raw if has_name(get_field(r, ACCOUNT_COLUMN))]
-cy_blank = [r for r in cy_raw if not has_name(get_field(r, ACCOUNT_COLUMN))]
-py_blank = [r for r in py_raw if not has_name(get_field(r, ACCOUNT_COLUMN))]
-cy_all_n, cy_all_sum = cnt_sum(cy_raw); py_all_n, py_all_sum = cnt_sum(py_raw)
-cy_named_n, cy_named_sum = cnt_sum(cy_named); py_named_n, py_named_sum = cnt_sum(py_named)
-cy_blank_n, cy_blank_sum = cnt_sum(cy_blank); py_blank_n, py_blank_sum = cnt_sum(py_blank)
-
-# Python replica of Tab 3 formulas (Excel results can't be computed by openpyxl)
-def tab3_replica(rows):
-    d_mat, d_thr = to_decimal(MATERIALITY), to_decimal(THRESHOLD_VALUE)
-    d_pct, d_mult = to_decimal(THRESHOLD_PERCENTAGE), to_decimal(INVESTIGATE_MULTIPLE)
-    inv1 = inv2 = 0
-    for rec in rows:
-        if rec.get("CY_Greyed"): continue
-        cy, py = to_decimal(rec.get("Untested_Balance_CY")), to_decimal(rec.get("Untested_Balance_PY"))
-        if cy is not None and abs(cy / d_mat) > d_mult: inv2 += 1
-        if cy is None or py is None or py == 0 or cy == 0: continue
-        diff = cy - py
-        if abs(diff) > d_thr and abs(diff / cy) > d_pct: inv1 += 1
-    return inv1, inv2
-
-inv1_expected, inv2_expected = tab3_replica(residual_records)
-
-full_join_count = len(residual_records)
-common_line_count = cy_only_line_count = py_only_line_count = 0
-for record in residual_records:
-    has_cy, has_py = is_present(get_field(record, ACCOUNT_CY_COLUMN)), is_present(get_field(record, ACCOUNT_PY_COLUMN))
-    if has_cy and has_py: common_line_count += 1
-    elif has_cy: cy_only_line_count += 1
-    elif has_py: py_only_line_count += 1
-
-# COMMAND ----------
-
-# DBTITLE 1,Written side (read back from the saved Excel)
-try:
-    output_wb = cp.openpyxl.read(OUTPUT_PATH, data_only=False)
-    wb_source = "re-read from OUTPUT_PATH"
-except Exception as exc:
-    print(f"Could not re-read {OUTPUT_PATH} ({exc}); using in-memory workbook instead.")
-    output_wb, wb_source = template, "in-memory workbook (re-read failed)"
-
-def read_tab12(workbook, sheet_name, with_calc):
-    ws = workbook[sheet_name]
-    header_row, start_col = coordinate_to_tuple(TABLE_ANCHOR_CELL)
-    end_row = last_data_row(ws)
-    headers, end_col = {}, start_col
-    for c in range(start_col, ws.max_column + 1):
-        v = ws.cell(row=header_row, column=c).value
-        if v is not None:
-            headers[normalize_text(v)] = c
-            end_col = c
-    acct_c = headers.get(normalize_text(ACCOUNT_COLUMN))
-    cons_c = headers.get(normalize_text(CONSOLIDATED_COLUMN))
-    unt_c = headers.get(normalize_text(UNTESTED_COLUMN))
-    ent_c = [headers[normalize_text(c)] for c in T12_ENTITY_COLS if normalize_text(c) in headers]
-    calc_c = {c: headers[normalize_text(c)] for c in CALCULATED_COLUMNS if normalize_text(c) in headers} if with_calc else {}
-    detail_labels = {normalize_text(ENTITY_PERCENT_DETAIL_LABEL), normalize_text(ENTITY_MULTIPLE_DETAIL_LABEL)}
-    grey_tail, blue_tail = GREYED_OUT_FONT_COLOR[-6:], BLUE_FONT_COLOR[-6:]
-
-    out = {"tally": {"count": 0, "consolidated": ZERO, "untested": ZERO, "entity": ZERO},
-           "greyed": 0, "detail": 0, "leaks": 0, "blue": 0, "sequence": [],
-           "formulas": {c: 0 for c in calc_c}, "entity_cols_found": len(ent_c)}
-    if acct_c is None or cons_c is None or unt_c is None:
-        return out   # header problem -> every check below will FAIL
-
-    for r in range(header_row + 1, end_row + 1):
-        acct = ws.cell(row=r, column=acct_c)
-        label = normalize_text(acct.value)
-        if label in detail_labels:
-            out["detail"] += 1
-            continue
-        if font_rgb(acct).endswith(grey_tail):   # greyed-out account font = excluded row
-            out["greyed"] += 1
-            out["sequence"].append(("greyed", label))
-            out["leaks"] += sum(1 for c in range(start_col, end_col + 1)
-                                if c != acct_c and ws.cell(row=r, column=c).value is not None)
-            continue
-        out["sequence"].append(("visible", label))
-        t = out["tally"]
-        t["count"] += 1
-        t["consolidated"] += dec(ws.cell(row=r, column=cons_c).value)
-        t["untested"] += dec(ws.cell(row=r, column=unt_c).value)
-        t["entity"] += sum((dec(ws.cell(row=r, column=c).value) for c in ent_c), ZERO)
-        out["blue"] += sum(1 for c in range(start_col, end_col + 1)
-                           if font_rgb(ws.cell(row=r, column=c)).endswith(blue_tail))
-        for name, c in calc_c.items():
-            if has_formula(ws.cell(row=r, column=c).value): out["formulas"][name] += 1
+def read_written(sheet):
+    # Read the saved workbook back. Tag each row grey/not by Consolidated cell fill.
+    wb = cp.openpyxl.read(OUTPUT_PATH, data_only=False)
+    try:
+        rows = list(wb[sheet].iter_rows(min_row=HDR_ROW, min_col=FIRST_COL))
+    finally:
+        wb.close()
+    hdr = [c.value for c in rows[0]]
+    ci = hdr.index("Consolidated")
+    out = []
+    for r in rows[1:]:
+        rec = dict(zip(hdr, (c.value for c in r)))
+        if rec.get("Account") in (None, ""): continue
+        rec["_grey"] = r[ci].fill.fgColor.rgb == GREY_OUT_FILL
+        out.append(rec)
     return out
 
-def read_tab3(workbook):
-    name = _resolve_residual_analytic_sheet(workbook)
-    ws = workbook[name]
-    header_row, start_col = coordinate_to_tuple(RESIDUAL_ANALYTIC_ANCHOR_CELL)
-    first_row, end_row = header_row + 2, last_data_row(ws)
-    col = {k: start_col + i for i, k in enumerate(KEYS)}
-    out = {"sheet": name, "rows": 0, "active": 0, "greyed": 0, "leaks": 0,
-           "cy_count": 0, "py_count": 0, "cy_sum": ZERO, "py_sum": ZERO}
-    for r in range(first_row, end_row + 1):
-        a_cy, a_py = ws.cell(row=r, column=col["acct_cy"]).value, ws.cell(row=r, column=col["acct_py"]).value
-        if not has_name(a_cy) and not has_name(a_py): continue
-        out["rows"] += 1
-        cy_cell, py_cell = ws.cell(row=r, column=col["cy"]).value, ws.cell(row=r, column=col["py"]).value
-        if has_formula(ws.cell(row=r, column=col["diff"]).value):   # active rows carry formulas, greyed rows don't
-            out["active"] += 1
-            cy, py = to_decimal(cy_cell), to_decimal(py_cell)
-            if cy is not None: out["cy_count"] += 1; out["cy_sum"] += cy
-            if py is not None: out["py_count"] += 1; out["py_sum"] += py
-        else:
-            out["greyed"] += 1
-            out["leaks"] += sum(1 for v in (cy_cell, py_cell) if v is not None)
-    return out
+RECON_HDR = ["Metric", "Raw", "Excluded (grey)", "Included (Raw - Excl)", "Written (visible)", "Diff (Incl - Written)",
+             "Written in grey rows (count = Excl, values = 0)", "Status"]
 
-t12_written = {s: read_tab12(output_wb, s, w) for s, w in ((QUANTITATIVE_SHEET, True), (QUALITATIVE_SHEET, False))}
-t3w = read_tab3(output_wb)
+def recon(sheet, detail_per_row):
+    # detail_per_row: 2 for Tab 1 (% + multiple rows per visible account), 0 for Tab 2
+    w = read_written(sheet)
+    vis = [r for r in w if r["Account"] not in DETAIL_LABELS and not r["_grey"]]
+    gry = [r for r in w if r["_grey"]]
+    n_det = len(w) - len(vis) - len(gry)
+    R, W, G = tally(raw_cy, RECON_COLS), tally(vis, RECON_COLS), tally(gry, RECON_COLS)
+    X = tally([r for r in raw_cy if not is_non_grey_cy_record(r)], RECON_COLS)   # independent visibility rule
 
-# COMMAND ----------
+    rows = [RECON_HDR]
+    for k in R:
+        inc = R[k] - X[k]
+        diff = inc - W[k]
+        expect_grey = X[k] if k == "Row count" else 0
+        rows.append([k, R[k], X[k], inc, W[k], diff, G[k], status(abs(diff) < TOL, abs(G[k] - expect_grey) < TOL)])
+    exp_det = detail_per_row * (R["Row count"] - X["Row count"])
+    rows.append(["Detail rows", None, None, exp_det, n_det, n_det - exp_det, None, status(n_det == exp_det)])
+    return rows
 
-# DBTITLE 1,Check log
-checks = []
+def dq(recs, label, blue_cells):
+    # (check, count, must_be_zero) -> OK/REVIEW, or INFO when nonzero is expected
+    accts = [str(r.get("Account") or "").strip() for r in recs]
+    dup = sum(v > 1 for v in Counter(a for a in accts if a).values())
+    checks = [("Blank Account rows", accts.count(""), True),
+              ("Null Consolidated", sum(to_decimal(r.get("Consolidated")) is None for r in recs), True),
+              ("Null Untested Balance", sum(to_decimal(r.get("Untested Balance")) is None for r in recs), True),
+              ("Duplicate account names (handled by occurrence #)", dup, False),
+              ("Blue (manual override) cells", blue_cells, False)]
+    return [[label, n, v, ("OK" if v == 0 else "REVIEW") if must0 else "INFO"] for n, v, must0 in checks]
 
-def add_check(area, name, expected, actual, tol=TOLERANCE, soft=False, comment=""):
-    e, a = to_decimal(expected), to_decimal(actual)
-    if e is None or a is None:
-        diff, status = None, ("REVIEW" if soft else "FAIL")
-    else:
-        d = a - e
-        diff = int(d) if isinstance(expected, int) and isinstance(actual, int) else d
-        status = "PASS" if abs(d) <= tol else ("REVIEW" if soft else "FAIL")
-    checks.append([len(checks) + 1, area, name, expected, actual, diff, status, comment])
+# --- join checks: join lines/totals must tie back to the greyed CY/PY frames ---
+cy_account_records = [r for r in cy_records if is_present(get_field(r, "Account"))]
+join_checks = [["Check", "Source", "Join", "Diff", "Status"]]
+for name, src, jn in (
+    ("CY lines: accounts vs join", len(cy_account_records), common_line_count + cy_only_line_count),
+    ("PY lines: accounts vs join", len(py_account_records), common_line_count + py_only_line_count),
+    ("CY Untested total", sum_field(cy_account_records, "Untested Balance"), cy_untested_total),
+    ("PY Untested total", sum_field(py_account_records, "Untested Balance"), py_untested_total),
+):
+    join_checks.append([name, src, jn, src - jn, status(abs(src - jn) < TOL)])
 
-inc = t12_tally[R_OK]
+# --- write separate file ---
+dq_wb = Workbook()
+ws = dq_wb.active
+ws.title = "DQ Summary"
+ws["A1"], ws["A1"].font = "Data Validation & DQ Report", title_font
 
-# ---- Raw = Excluded + Included (logic partition)
-for field, label in (("count", "Row count"), ("consolidated", "Consolidated total"), ("untested", "Untested total")):
-    add_check("Tab 1 & 2 raw", f"Raw = Excluded + Included ({label})", t12_all[field], t12_excl[field] + inc[field])
-add_check("Tab 1 & 2 raw", "Visible rows with blank account name", 0, visible_blank_account, soft=True,
-          comment="Writer keeps a row visible on % and test flag only")
+write_block(ws, 3, [["Dataset", "Check", "Count", "Status"]]
+            + dq(raw_cy, "Raw CY", len(spark_column_row_pairs_cy))
+            + dq(records_from(raw_tb_PY), "Raw PY", len(spark_column_row_pairs_py)))
+ws["A15"], ws["A15"].font = "Full Outer Join Tie-out", section_font
+write_block(ws, 16, join_checks)
+ws["A23"], ws["A23"].font = "Full Outer Join Line Breakup", section_font
+write_block(ws, 24, [["Full outer-join lines", "Common CY/PY", "PY only", "CY only"],
+                     [full_join_count, common_line_count, py_only_line_count, cy_only_line_count]])
 
-# ---- Tab 1 / Tab 2 written vs expected
-for sheet_name, w in t12_written.items():
-    t = w["tally"]
-    add_check(sheet_name, "Header: entity columns found", len(T12_ENTITY_COLS), w["entity_cols_found"])
-    add_check(sheet_name, "Visible row count", inc["count"], t["count"])
-    add_check(sheet_name, "Consolidated total (visible rows)", inc["consolidated"], t["consolidated"])
-    add_check(sheet_name, "Untested Balance total (visible rows)", inc["untested"], t["untested"])
-    add_check(sheet_name, "Entity balances total (visible rows)", inc["entity"], t["entity"])
-    add_check(sheet_name, "Greyed row count (= excluded)", t12_excl["count"], w["greyed"])
-    add_check(sheet_name, "Values leaked into greyed rows", 0, w["leaks"])
-    add_check(sheet_name, "Row order / status mismatches vs raw", 0, sequence_mismatches(expected_seq, w["sequence"]))
-    add_check(sheet_name, "Blue-font (manual override) cells", expected_blue, w["blue"])
-    if sheet_name == QUANTITATIVE_SHEET:
-        add_check(sheet_name, "Detail rows (2 per visible account)", 2 * inc["count"], w["detail"])
-        for name, n in w["formulas"].items():
-            add_check(sheet_name, f"Formula populated - {name}", inc["count"], n)
-        add_check(sheet_name, "Materiality cell C10", MATERIALITY, merged_aware_value(output_wb[sheet_name], "C10"), tol=ZERO)
+recon_tabs = {"Tab1 Recon": recon(QUANTITATIVE_SHEET, 2), "Tab2 Recon": recon(QUALITATIVE_SHEET, 0)}
+for title, rows in recon_tabs.items():
+    sheet = dq_wb.create_sheet(title)
+    sheet["A1"], sheet["A1"].font = f"{title}: Raw vs Excluded vs Written", title_font
+    write_block(sheet, 3, rows)
+    sheet.freeze_panes = "B4"
 
-# ---- Tab 3 (CY vs PY)
-T3 = t3w["sheet"]
-cy_incl, py_incl = cy_b[CY_B[-1]], py_b[PY_B[-1]]
-join_greyed = sum(1 for r in residual_records if r.get("CY_Greyed"))
-add_check(T3, "Raw CY rows with account name = CY rows in join", cy_named_n, sum(v[0] for v in cy_b.values()))
-add_check(T3, "Raw CY Untested total = sum of CY buckets", cy_named_sum, sum((v[1] for v in cy_b.values()), ZERO))
-add_check(T3, "Raw PY rows with account name = PY rows in join", py_named_n, sum(v[0] for v in py_b.values()))
-add_check(T3, "Raw PY Untested total = sum of PY buckets", py_named_sum, sum((v[1] for v in py_b.values()), ZERO))
-add_check(T3, "Excel rows = full outer-join rows", full_join_count, t3w["rows"])
-add_check(T3, "Excel non-greyed rows = join non-greyed rows", full_join_count - join_greyed, t3w["active"])
-add_check(T3, "Excel greyed rows = join greyed rows", join_greyed, t3w["greyed"])
-add_check(T3, "Values leaked into greyed rows", 0, t3w["leaks"])
-add_check(T3, "CY values written (count)", cy_incl[0], t3w["cy_count"])
-add_check(T3, "CY Untested total written", cy_incl[1], t3w["cy_sum"])
-add_check(T3, "PY values written (count)", py_incl[0], t3w["py_count"])
-add_check(T3, "PY Untested total written", py_incl[1], t3w["py_sum"])
+fj = dq_wb.create_sheet("Full Outer Join")
+fj_rows = [["Account CY", "CY Untested", "Account PY", "PY Untested", "Match Category", "CY Greyed", "CY Row ID", "PY Row ID"]]
+for r in residual_records:
+    has_cy, has_py = is_present(get_field(r, ACCOUNT_CY_COLUMN)), is_present(get_field(r, ACCOUNT_PY_COLUMN))
+    fj_rows.append([get_field(r, ACCOUNT_CY_COLUMN), to_decimal(get_field(r, CY_BALANCE_COLUMN)),
+                    get_field(r, ACCOUNT_PY_COLUMN), to_decimal(get_field(r, PY_BALANCE_COLUMN)),
+                    "Common CY/PY" if has_cy and has_py else "CY only" if has_cy else "PY only",
+                    get_field(r, "CY_Greyed"), get_field(r, "CY_Row_ID"), get_field(r, "PY_Row_ID")])
+write_block(fj, 3, fj_rows)
+fj.freeze_panes = "A4"
 
-ws3 = output_wb[T3]
-for coord, label, value in (("C6", "Materiality", MATERIALITY), ("C7", "Threshold", THRESHOLD_VALUE),
-                            ("C8", "Investigate %", THRESHOLD_PERCENTAGE), ("C9", "Investigate multiple", INVESTIGATE_MULTIPLE)):
-    add_check(T3, f"Parameter {coord} - {label}", value, merged_aware_value(ws3, coord), tol=PARAM_TOLERANCE)
+for sheet in dq_wb.worksheets:
+    sheet.sheet_view.showGridLines = False
+    sheet.column_dimensions["A"].width = 52
+    for col in "BCDEFGH": sheet.column_dimensions[col].width = 24
 
-# ---- Cross-tab consistency
-add_check("Cross-tab", "Tab 1/2 visible rows vs Tab 3 non-greyed rows", inc["count"], t3w["active"], soft=True,
-          comment="Tab 3 greys on test flag only; Tab 1/2 also need non-zero % of consolidated balance")
+cp.openpyxl.write(dq_wb, DQ_PATH, register=True)
 
-ws3a, ws3b = output_wb[SHEET_3A], output_wb[SHEET_3B]
-blocks_3a = sum(1 for r in range(coordinate_to_tuple(ANCHOR_CELL)[0], ws3a.max_row + 1)
-                if normalize_text(ws3a.cell(row=r, column=2).value) == "account")
-accts_3b = sum(1 for c in range(COL_DATA_START, ws3b.max_column + 1) if has_name(ws3b.cell(row=ROW_ACCT_HEADER, column=c).value))
-add_check(SHEET_3A, "Account blocks written = accounts over 1x materiality", len(residual_rows), blocks_3a)
-add_check(SHEET_3A, "Account blocks vs Tab 3 'Investigate? #2 = Yes'", inv2_expected, blocks_3a, soft=True,
-          comment="3a selection also needs non-zero % and test flag 'No'")
-add_check(SHEET_3B, "Account groups written = Tab-3b filter result", len(_filter_tab3b(residual_cy_py, THRESHOLD_VALUE)), accts_3b)
-add_check(SHEET_3B, "Account groups vs Tab 3 'Investigate? #1 = Yes'", inv1_expected, accts_3b, soft=True,
-          comment="Tab 3 blanks % when PY = 0; 3b filter does not")
-
-status_counts = Counter(c[6] for c in checks)
-print("Validation:", dict(status_counts))
-for c in checks:
-    if c[6] != "PASS": print(f"  [{c[6]}] {c[1]} | {c[2]} | expected={c[3]} actual={c[4]} diff={c[5]}")
+n_bad = sum(row[-1] == "DIFF" for rows in [*recon_tabs.values(), join_checks] for row in rows[1:])
+print(f"DQ file written: {DQ_PATH} | DIFF rows: {n_bad}")
 
 # COMMAND ----------
-
-# DBTITLE 1,Build validation workbook
-V_BLACK, V_WHITE = "000000", "FFFFFF"
-thin_side = Side(style="thin", color=V_BLACK)
-table_border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
-BLACK_HEADER_FILL, WHITE_BODY_FILL = PatternFill(fill_type="solid", fgColor=V_BLACK), PatternFill(fill_type="solid", fgColor=V_WHITE)
-STATUS_FILLS = {"PASS": PatternFill(fill_type="solid", fgColor="C6EFCE"),
-                "FAIL": PatternFill(fill_type="solid", fgColor="FFCBCB"),
-                "REVIEW": PatternFill(fill_type="solid", fgColor="FFEB9C")}
-title_font, section_font = Font(name="Arial", size=12, italic=True, underline="single"), Font(name="Arial", size=10, bold=True)
-header_font, body_font = Font(name="Arial", size=10, bold=True, color=V_WHITE), Font(name="Arial", size=10, color=V_BLACK)
-BOLD_FONT = Font(name="Arial", size=10, bold=True, color=V_BLACK)
-left_alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-center_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-right_alignment = Alignment(horizontal="right", vertical="center")
-V_MONEY_FORMAT, V_COUNT_FORMAT = '$#,##0.00;($#,##0.00);-', '#,##0'
-
-def excel_value(value):
-    return float(value) if isinstance(value, Decimal) else value
-
-def write_row(worksheet, row_number, values, header=False, body_fill=None):
-    fill = body_fill or WHITE_BODY_FILL
-    for column_number, raw_value in enumerate(values, start=1):
-        value = excel_value(raw_value)
-        cell = worksheet.cell(row=row_number, column=column_number, value=value)
-        cell.border = table_border
-        if header: cell.fill, cell.font, cell.alignment = copy(BLACK_HEADER_FILL), header_font, center_alignment
-        else:
-            cell.fill, cell.font = copy(fill), body_font
-            cell.alignment = right_alignment if isinstance(value, (int, float)) and not isinstance(value, bool) else left_alignment
-        if isinstance(value, int) and not isinstance(value, bool): cell.number_format = V_COUNT_FORMAT
-        elif isinstance(value, float): cell.number_format = V_MONEY_FORMAT
-
-def write_block(worksheet, start_row, rows, body_fill=None):
-    for row_offset, values in enumerate(rows):
-        write_row(worksheet, start_row + row_offset, values, header=row_offset == 0, body_fill=body_fill)
-
-def add_excel_table(worksheet, table_name, first_row, last_row, last_column):
-    if last_row >= first_row:
-        worksheet.add_table(Table(displayName=table_name, ref=f"A{first_row}:{last_column}{last_row}"))
-
-def write_recon(worksheet, start_row, title, headers, rows):
-    # rows = (label, values, style); style: "total" -> bold, "var" -> green if all ~0 else red
-    worksheet.cell(row=start_row, column=1, value=title).font = copy(section_font)
-    write_row(worksheet, start_row + 1, headers, header=True)
-    for row_number, (label, values, style) in enumerate(rows, start=start_row + 2):
-        write_row(worksheet, row_number, [label] + list(values))
-        cells = [worksheet.cell(row=row_number, column=c) for c in range(1, len(headers) + 1)]
-        if style == "total":
-            for cell in cells: cell.font = copy(BOLD_FONT)
-        elif style == "var":
-            ok = all(v is None or abs(dec(v)) <= TOLERANCE for v in values)
-            for cell in cells: cell.fill, cell.font = copy(STATUS_FILLS["PASS" if ok else "FAIL"]), copy(BOLD_FONT)
-    return start_row + len(rows) + 3
-
-workbook = Workbook()
-summary_ws = workbook.active
-summary_ws.title = "Validation Summary"
-t12_ws = workbook.create_sheet("Tab 1 & 2 Recon")
-t3_ws = workbook.create_sheet("Tab 3 CY vs PY Recon")
-excl_ws = workbook.create_sheet("Excluded Items")
-full_join_ws = workbook.create_sheet("Full Outer Join")
-
-# ---------- Validation Summary (check log)
-summary_ws["A1"] = "Data Validation & Data Quality Report"
-summary_ws["A1"].font = copy(title_font)
-summary_ws["A2"] = f"Excel under test: {OUTPUT_PATH}  |  read mode: {wb_source}"
-summary_ws["A3"] = (f"Checks: {len(checks)}   PASS: {status_counts.get('PASS', 0)}   "
-                    f"REVIEW: {status_counts.get('REVIEW', 0)}   FAIL: {status_counts.get('FAIL', 0)}")
-summary_ws["A3"].font = copy(BOLD_FONT)
-write_block(summary_ws, 5, [["#", "Area", "Check", "Expected", "Actual", "Difference", "Status", "Comment"]] + checks)
-for row_number, c in enumerate(checks, start=6):
-    summary_ws.cell(row=row_number, column=7).fill = copy(STATUS_FILLS[c[6]])
-    summary_ws.cell(row=row_number, column=7).font = copy(BOLD_FONT)
-    summary_ws.cell(row=row_number, column=7).alignment = center_alignment
-summary_ws.auto_filter.ref = f"A5:H{5 + len(checks)}"
-summary_ws.freeze_panes = "A6"
-for col, w in {"A": 6, "B": 28, "C": 58, "D": 20, "E": 20, "F": 18, "G": 11, "H": 70}.items():
-    summary_ws.column_dimensions[col].width = w
-summary_ws.row_dimensions[5].height = 30
-
-# ---------- Tab 1 & 2:
