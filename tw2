@@ -1,133 +1,2411 @@
+# DBTITLE 1,Utility & Constants for Automation
+from __future__ import annotations  # Defers type-hint evaluation and supports modern union annotations.
+
+import os  # Creates output folders and builds output file paths.
+import re  # Sanitizes account-group names for valid files and worksheet names.
+from typing import Any  # Allows generic Excel cell values in helper function type hints.
+
+import pandas as pd  # Filters, validates, and transforms trial-balance source data.
+from openpyxl import load_workbook  # Loads the Excel template outside a managed CP runtime.
+from openpyxl.chart import BarChart, PieChart, Reference  # Builds charts from worksheet cell ranges.
+from openpyxl.chart.axis import ChartLines  # Configures chart gridlines.
+from openpyxl.chart.data_source import NumFmt  # Applies display formats to chart data labels.
+from openpyxl.chart.label import DataLabelList  # Controls values/percentages displayed on charts.
+from openpyxl.chart.legend import Legend  # Controls chart legend placement and behavior.
+from openpyxl.chart.series import DataPoint, SeriesLabel  # Styles pie slices and names bar-chart series.
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side  # Defines reusable Excel formatting.
+from openpyxl.utils import column_index_from_string  # Converts anchors such as "H55" into column indexes.
+from openpyxl.worksheet.properties import Outline  # Controls grouped and collapsed detail rows.
+
+
+# =============================================================================
+# ONE CENTRAL CONFIGURATION BLOCK
+# =============================================================================
+
+REPORT_CONFIG = {
+    "workbook": {  # Controls template selection, output handling, and worksheet naming.
+        "template_path": (
+            "User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/"
+            "Broadridge_-_Risk_Assessment.zip/"
+            "Risk_Assessment_FY_26_Template_Copy1.xlsx"
+        ),  # Points to the preformatted workbook copied for each account-group report.
+        "output_directory": OUTPUT_DIRECTORY,  # Uses the runtime-provided folder for generated workbooks.
+        "company_name": "Broadridge Financial Solutions",  # Populates the company header on each output sheet.
+        "delete_template_sheets": True,  # Removes original template tabs after their copies are created.
+        "sheet_titles": {  # Maps logical sheet types to header text.
+            "summary": "Summary",
+            "analysis": "Analysis",
+        },
+        "template_sheets": {  # Maps logical sheet types to the template tabs that must be copied.
+            "summary": "1.Summary - Cash",
+            "analysis": "2.Analysis - Cash",
+            "tickmarks": "3.Tickmarks",
+        },
+    },
+
+    "materiality": {  # Supplies materiality information for headers, tables, and materiality-multiple calculations.
+        "mat_ref": "XXXXX",  # Identifies the source/reference for the materiality amount.
+        "date_label": "June 30, 2026",  # Displays the report date consistently across both sheets.
+        "materiality": 63_370_000,  # Stores overall materiality in dollars before downstream conversion to millions.
+        "perf_mat": 50_696_000,  # Stores performance materiality for the materiality information box.
+        "ctt": 3_168_500,  # Stores the clearly trivial threshold for the materiality information box.
+    },
+
+    "data": {  # Defines the source-data schema and report population.
+        "account_group_column": "Account Grouping",  # Source field used to filter one report per account group.
+        "group_column": "Groups",  # Source field used to aggregate account rows into reporting groups.
+        "account_column": "Account",  # Source field used for account-level detail rows.
+
+        "balance_columns": [  # Raw balance fields that must be present and converted to numeric values.
+            "06/30/2026",
+            "09/30/2025",
+            "06/30/2025",
+            "09/30/2024",
+        ],
+
+        "fluctuation_columns": [  # Precalculated source fluctuation fields included in validation and numeric coercion.
+            "09/30/2025 VS 06/30/2025",
+            "09/30/2025 VS 09/30/2024",
+            "06/30/2026 VS 06/30/2025",
+        ],
+
+        "account_groups": [  # The executor loops through this list and creates one workbook per account group.
+            "Cash & Cash Equivalents"
+            ,"Regulated Cash","Accounts Receivable - Trade - Gross","Accounts Receivable Unbilled","Prepaid Expenses","Intangibles - additions","Intangibles - amortization","Internal Use Software - additions","Internal Use Software - amortization","Internal Use Software - UBS Retirements","Unbilled Contract Assets","LT Digital Assets","Warrant Assets","Fair Value Investment in CNTN","DCCA/ECCC - Additions","DCCA/ECCC - Amortization","Accounts Payable","Accrued Bonus","Accrued Compensation","Accrued Interest - Debt","Matrix Admin Fees","Accrued Broker Fees","Dividend Payable","Customer Deposits","Accrued Expense Miscellaneous","ST Contract Liabilities","Short Term Borrowing","Long Term Contract Liabilities","Revolver & Bond Payable","Purchased Term License Liability","SORP/ERSP","FIN 48 Taxes","LT Accrued Earnouts - CQG","Cumulative Translation Adjustment","Net Investment Hedge","Retained Earnings","Treasury Stock","APIC","11001-Global Post Trade-Revenue","11002-Enterprise Solutions & Data-Revenue","11003-Global Trading-Revenue","L1210-Investment Management-Revenue","L1220-Wealth Management-Revenue","L2100-BBD-Revenue","L2200-BRCC-Revenue","L2400-Issuer-Revenue","L2500-MFRS-Revenue","Term License-Revenue","11001-Global Post Trade-COR","11002-Enterprise Solutions & Data-COR","11003-Global Trading-COR","L1210-Investment Management-COR","L1220-Wealth Management-COR","L2100-BBD-COR","L2200-BRCC-COR","L2400-Issuer-COR","L2500-MFRS-COR","Gain/Loss - Digital Assets","Interest Expense","SG&A - Payroll","SG&A - Fringe","SG&A - Bonus","SG&A - Legal & Professional Services","SG&A - Data Centre Expenses","SG&A - Hardware & Software Expense"
+        ],
+
+        "group_collapse_threshold": 4,  # Controls when account-level detail is grouped/collapsed in the summary outline.
+        "visible_detail_rows": 4,  # Retains this many detail rows visibly expanded when a group is collapsed.
+    },
+
+    # Every reporting period is defined once here.
+    # Tables and charts reference these keys instead of repeating column names.
+    "periods": {  # Separates source-column names from display labels used in different report sections.
+        "Current_Testing_Period": {
+            "column": "06/30/2026",  # Exact source-data column used for this reporting period.
+            "labels": {  # Allows the same period to display differently by report component.
+                "sheet1": "06/30/2026",
+                "sheet2": "06/30/2026",
+                "materiality": "06/30/2026",
+                "chart": "06/30/2026",
+            },
+        },
+
+        "Current_Testing_First_Period": {
+            "column": "09/30/2025",
+            "labels": {
+                "sheet1": "09/30/2025",
+                "sheet2": "09/30/2025",
+                "materiality": "9/30/2025",  # Uses a shortened date format in materiality tables.
+                "chart": "09/30/2025",
+            },
+        },
+
+        "PY_Current_Testing_Period": {
+            "column": "06/30/2025",
+            "labels": {
+                "sheet1": "06/30/2025",
+                "sheet2": "06/30/2025",
+                "materiality": "6/30/2025",  # Uses a shortened date format in materiality tables.
+                "chart": "06/30/2025",
+            },
+        },
+
+        "PY_Testing_First_Period": {
+            "column": "09/30/2024",
+            "labels": {
+                "sheet1": "09/30/2024",
+                "sheet2": "09/30/2024",
+                "materiality": "9/30/2024",  # Uses a shortened date format in materiality tables.
+                "chart": "09/30/2024",
+            },
+        },
+    },
+
+    "layout": {  # Centralizes fixed worksheet coordinates while table row placement remains dynamic.
+        "comparison_table": {  # Defines the fixed columns used by all comparison-table writers.
+            "label_column": 2,  # Column B contains group/account labels.
+            "current_column": 3,  # Column C contains the current-period value.
+            "prior_column": 4,  # Column D contains the prior-period value.
+            "fluctuation_amount_column": 5,  # Column E contains the dollar fluctuation.
+            "fluctuation_percent_column": 6,  # Column F contains the percentage fluctuation.
+            "carrying_value_start_column": 3,  # Starts the merged "Carrying Value" header across C:D.
+            "carrying_value_end_column": 4,  # Ends the merged "Carrying Value" header across C:D.
+            "fluctuation_start_column": 5,  # Starts the merged "Fluctuation" header across E:F.
+            "fluctuation_end_column": 6,  # Ends the merged "Fluctuation" header across E:F.
+        },
+
+        "sheet1_detail": {  # Sets the initial fixed position of Sheet 1 detail output.
+            "header_row": 9,  # Initial detail-table header row; subsequent sections use the evolving row pointer.
+            "first_data_row": 10,  # First row available for account/group detail beneath the header.
+            "label_column": 2,  # Column B contains Sheet 1 row labels.
+            "balance_start_column": 3,  # Balance periods begin in column C.
+            "fluctuation_start_column": 8,  # Fluctuation columns begin in column H after balance columns/spacers.
+        },
+
+        "materiality_box": {  # Fixes the materiality box location on each report sheet.
+            "start_row_sheet1": 7,  # Sheet 1 materiality box begins before the detail-table header.
+            "start_row_sheet2": 7,  # Sheet 2 materiality box begins before analysis tables.
+        },
+
+        "background": {  # Defines the preformatted range filled with a white background.
+            "sheet1_columns": 15,  # Applies Sheet 1 background styling through column O.
+            "sheet2_rows": 350,  # Applies Sheet 2 background styling through row 350.
+            "sheet2_columns": 30,  # Applies Sheet 2 background styling through column AD.
+        },
+    },
+
+    "sheet1": {  # Controls Sheet 1 summary/detail content after the initial table is written.
+        "year_end_update_title": "Year End Update",  # Heading written before the sequential Year End Update tables.
+
+        "comparison_table": {  # Table is written after the Year End Update heading using the current dynamic row.
+            "title": "Type of Currencies",
+            "row_label": "Type of currencies",
+            "label_key": "sheet1",  # Selects Sheet 1-specific period labels from the central period map.
+            "current_period": "Current_Testing_Period",  # Resolves to the current comparison column.
+            "prior_period": "PY_Current_Testing_Period",  # Resolves to the prior comparison column.
+            "assets_m": {  # Holds total-assets values in millions for comparison-table ratio calculations.
+                "current": None,
+                "prior": None,
+            },
+        },
+
+        "materiality_multiple": {  # Table follows the comparison table using its returned next-row position.
+            "title": "Materiality Multiple",
+            "row_label": "Type of currencies",
+            "label_key": "materiality",  # Selects materiality-table display labels.
+            "periods": [  # Determines which periods appear as materiality-multiple columns.
+                "Current_Testing_Period",
+                "PY_Current_Testing_Period",
+            ],
+            "include_total": False,  # Excludes an aggregate total row from this Sheet 1 table.
+            "include_commentary": False,  # Excludes the merged commentary column from this Sheet 1 table.
+        },
+
+        # The source script does not create Sheet 1 charts.
+        # Add chart definitions here later if required.
+        "charts": {
+            "enabled": False,  # Prevents the chart writer from adding charts to Sheet 1.
+        },
+    },
+
+    "sheet2": {  # Controls the Analysis worksheet's tables, materiality multiples, and charts.
+        "figures_label": "Figures in $ M",  # Documents that Sheet 2 numerical values are displayed in millions.
+        "materiality_start_row": 7,  # Starts Sheet 2 content directly after the materiality box.
+
+        "table_order": [  # The writer loops through this order and dynamically advances the row after each table.
+            "table_1",
+            "table_1_1",
+        ],
+
+        "tables": {
+            "table_1": {
+                "title": "Table 1: {acct_group} Summary",  # Inserts the active account group at write time.
+                "row_label": "Type of accounts",
+                "label_key": "sheet2",  # Selects Sheet 2-specific period labels.
+                "current_period": "Current_Testing_First_Period",
+                "prior_period": "PY_Current_Testing_Period",
+                "assets_m": {  # Supplies total-assets values in millions for ratio and fluctuation calculations.
+                    "current": None,
+                    "prior": None,
+                },
+            },
+
+            "table_1_1": {
+                "title": "Table 1.1",
+                "row_label": "Type of accounts",
+                "label_key": "sheet2",
+                "current_period": "Current_Testing_First_Period",
+                "prior_period": "PY_Testing_First_Period",
+                "assets_m": {
+                    "current": None,
+                    "prior": None,
+                },
+            },
+        },
+
+        "materiality_multiple": {  # Writes a multi-period analysis table after the ordered comparison tables.
+            "title": "Table 2: Materiality Multiple",
+            "row_label": "Type of accounts",
+            "label_key": "materiality",
+            "periods": [
+                "Current_Testing_First_Period",
+                "PY_Current_Testing_Period",
+                "PY_Testing_First_Period",
+            ],
+            "include_total": True,  # Adds an aggregate account-group total before individual group rows.
+            "include_commentary": True,  # Adds a merged commentary column beside the calculated ratios.
+            "commentary_label": "Commentary",
+        },
+
+        "charts": {  # Controls all Analysis-sheet visualizations.
+            "enabled": True,  # Enables the Sheet 2 chart-writing routine.
+
+            "pie": {
+                "enabled": True,  # Enables pie charts for configured table/period combinations.
+                "width": 12,  # Sets pie-chart width in Excel chart units.
+                "height": 10,  # Sets pie-chart height in Excel chart units.
+                "legend_position": "r",  # Places the legend to the right of each pie chart.
+                "title_label_key": "chart",  # Selects chart-formatted period labels from the period map.
+                "sources": [  # Maps each pie chart to a table range, value side, and worksheet anchor.
+                    {
+                        "table": "table_1",
+                        "value": "current",  # Uses the configured current-period column from Table 1.
+                        "anchor": "H2",  # Places the first pie chart at cell H2.
+                    },
+                    {
+                        "table": "table_1",
+                        "value": "prior",  # Uses the configured prior-period column from Table 1.
+                        "anchor": "P2",  # Places the second pie chart at cell P2.
+                    },
+                    {
+                        "table": "table_1_1",
+                        "value": "prior",  # Uses the configured prior-period column from Table 1.1.
+                        "anchor": "H25",  # Places the third pie chart at cell H25.
+                    },
+                ],
+            },
+
+            "bar": {
+                "enabled": True,  # Enables the multi-period clustered bar chart.
+                "title": "{acct_group} - Carrying Value by Period",  # Inserts the active account group in the chart title.
+                "title_anchor": "H55",  # Fixes the bar-chart title box location.
+                "title_end_column": "N",  # Merges the title box horizontally through column N.
+                "chart_offset_rows": 2,  # Positions the chart two rows below its title box.
+                "width": 25,  # Sets chart width in Excel chart units.
+                "height": 15,  # Sets chart height in Excel chart units.
+                "gap_width": 219,  # Controls spacing between clustered category groups.
+                "overlap": -100,  # Keeps the series fully separated within each category.
+                "legend_position": "b",  # Places the legend below the bar chart.
+                "y_axis_number_format": "#,##0.0",  # Displays axis values in millions with one decimal place.
+                "y_axis_min": 0,  # Forces the chart axis to start at zero.
+                "y_axis_max": 600,  # Caps the chart axis at the configured maximum.
+                "y_axis_major_unit": 100,  # Sets major gridline intervals on the chart axis.
+                "data_label_format": "#,##0.00",  # Formats bar labels independently of worksheet cell formatting.
+
+                "category_table": "table_1",  # Uses Table 1 group names as shared chart categories.
+
+                "series": [  # Maps each bar series to its source table, value side, and display color.
+                    {
+                        "table": "table_1",
+                        "value": "current",
+                        "color": "012169",  # Applies dark blue to the current Table 1 series.
+                    },
+                    {
+                        "table": "table_1",
+                        "value": "prior",
+                        "color": "86BC25",  # Applies Deloitte green to the prior Table 1 series.
+                    },
+                    {
+                        "table": "table_1_1",
+                        "value": "prior",
+                        "color": "2E7FAF",  # Applies medium blue to the prior Table 1.1 series.
+                    },
+                ],
+            },
+        },
+    },
+
+    "formatting": {  # Centralizes number formats and approved chart colors.
+        "million_format": "#,##0.0",  # Displays dollar values in millions with one decimal place.
+        "percent_format": "0.0%",  # Displays row-level fluctuation percentages with one decimal place.
+        "percent_two_decimal_format": "0.00%",  # Displays total/ratio percentages with two decimal places.
+        "comma_format": "#,##0",  # Displays whole-number values with thousands separators.
+
+        "approved_colors": [  # Pie-chart slices cycle through this palette when there are more groups than colors.
+            "C8D96F",
+            "046A38",
+            "D0E9DA",
+            "9DC3B4",
+            "43B39A",
+            "007B74",
+            "005151",
+            "003D33",
+            "A7C9E0",
+            "2E7FAF",
+            "012169",
+            "BBBCBC",
+            "53565A",
+        ],
+    },
+}
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Helper Functions
+# =============================================================================
+# STYLE DEFINITIONS
+# =============================================================================
+
+_thin = Side(style="thin")
+_med = Side(style="medium")
+_none = Side(style=None)
+
+THIN_ALL = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
+THIN_TB = Border(left=_none, right=_none, top=_thin, bottom=_thin)
+MED_BOX = Border(left=_med, right=_med, top=_med, bottom=_med)
+MED_TB = Border(left=_none, right=_none, top=_med, bottom=_med)
+
+BOLD = Font(name="Calibri", bold=True, size=9)
+NORMAL = Font(name="Calibri", bold=False, size=9)
+BOLD_11 = Font(name="Calibri", bold=True, size=11)
+HDR_FONT = Font(name="Calibri", bold=True, size=9, underline="single")
+ITALIC = Font(name="Calibri", bold=False, size=9, italic=True)
+BOLD_ITALIC = Font(name="Calibri", bold=True, size=9, italic=True)
+
+RIGHT = Alignment(horizontal="right", vertical="center")
+CENTER = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT = Alignment(horizontal="left", vertical="center")
+LEFT_WRAP = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+WHITE_FILL = PatternFill(
+    start_color="FFFFFF",
+    end_color="FFFFFF",
+    fill_type="solid",
+)
+
+
+# =============================================================================
+# CONFIGURATION HELPERS
+# =============================================================================
+
+def data_config() -> dict:
+    """Return the central data configuration."""
+    return REPORT_CONFIG["data"]
+
+
+def workbook_config() -> dict:
+    """Return workbook paths, sheet names, and template settings."""
+    return REPORT_CONFIG["workbook"]
+
+
+def materiality_config() -> dict:
+    """Return configured materiality values and reporting date."""
+    return REPORT_CONFIG["materiality"]
+
+
+def layout_config() -> dict:
+    """Return fixed worksheet layout settings."""
+    return REPORT_CONFIG["layout"]
+
+
+def period_config(period_id: str) -> dict:
+    """Return configuration for a logical reporting period."""
+    periods = REPORT_CONFIG["periods"]
+
+    if period_id not in periods:
+        raise KeyError(f"Unknown reporting period key: '{period_id}'.")
+
+    return periods[period_id]
+
+
+def period_column(period_id: str) -> str:
+    """Return the source-data column for a logical reporting period."""
+    return period_config(period_id)["column"]
+
+
+def period_label(period_id: str, label_key: str) -> str:
+    """Return the display label for a period and report component."""
+    cfg = period_config(period_id)
+    labels = cfg.get("labels", {})
+    return labels.get(label_key, cfg["column"])
+
+
+def balance_columns() -> list[str]:
+    """Return configured balance columns."""
+    return list(data_config()["balance_columns"])
+
+
+def fluctuation_columns() -> list[str]:
+    """Return configured fluctuation columns."""
+    return list(data_config()["fluctuation_columns"])
+
+
+def numeric_columns() -> list[str]:
+    """Return all source columns that require numeric conversion."""
+    return balance_columns() + fluctuation_columns()
+
+
+def validate_config() -> None:
+    """Validate data, period, table, and chart references before processing."""
+    data_cfg = data_config()
+    periods = REPORT_CONFIG["periods"]
+
+    for required_key in [
+        "account_group_column",
+        "group_column",
+        "account_column",
+        "balance_columns",
+        "fluctuation_columns",
+    ]:
+        if required_key not in data_cfg:
+            raise KeyError(f"Missing data configuration: {required_key}")
+
+    for period_id, period in periods.items():
+        if not period.get("column"):
+            raise ValueError(f"Period '{period_id}' has no source column.")
+
+    all_tables = {
+        "sheet1.comparison_table": REPORT_CONFIG["sheet1"]["comparison_table"],
+        "sheet1.materiality_multiple": REPORT_CONFIG["sheet1"][
+            "materiality_multiple"
+        ],
+    }
+
+    for table_id, table_cfg in REPORT_CONFIG["sheet2"]["tables"].items():
+        all_tables[f"sheet2.{table_id}"] = table_cfg
+
+    all_tables["sheet2.materiality_multiple"] = REPORT_CONFIG["sheet2"][
+        "materiality_multiple"
+    ]
+
+    for table_name, table_cfg in all_tables.items():
+        if "current_period" in table_cfg:
+            for key in ["current_period", "prior_period"]:
+                period_id = table_cfg[key]
+
+                if period_id not in periods:
+                    raise KeyError(
+                        f"{table_name} references missing period '{period_id}'."
+                    )
+
+        for period_id in table_cfg.get("periods", []):
+            if period_id not in periods:
+                raise KeyError(
+                    f"{table_name} references missing period '{period_id}'."
+                )
+
+    chart_cfg = REPORT_CONFIG["sheet2"]["charts"]
+
+    for source in chart_cfg.get("pie", {}).get("sources", []):
+        if source["table"] not in REPORT_CONFIG["sheet2"]["tables"]:
+            raise KeyError(f"Pie chart references unknown table: {source['table']}")
+
+    for series in chart_cfg.get("bar", {}).get("series", []):
+        if series["table"] not in REPORT_CONFIG["sheet2"]["tables"]:
+            raise KeyError(f"Bar chart references unknown table: {series['table']}")
+
+
+# =============================================================================
+# WORKBOOK HELPERS
+# =============================================================================
+
+def make_output_path(acct_group: str) -> str:
+    """Create the output workbook path for an account group."""
+    output_dir = workbook_config()["output_directory"]
+
+    # Remove filename-unsafe characters and normalize spaces for the output filename.
+    clean_name = re.sub(r"[^\w\s-]", "", acct_group).strip()
+    clean_name = re.sub(r"\s+", "_", clean_name).strip("_")
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    return os.path.join(
+        output_dir,
+        f"Risk_Assessment_{clean_name}.xlsx",
+    )
+
+
+def make_sheet_name(acct_group: str, suffix: str) -> str:
+    """Create an Excel-safe worksheet name within Excel's 31-character limit."""
+    # Remove characters that Excel does not permit in worksheet names.
+    clean_name = re.sub(r"[\[\]:*?/\\]", "", acct_group).strip()
+
+    # Reserve space for the separator and suffix before truncating the account group.
+    max_name_length = 31 - len(suffix) - 1
+
+    return f"{clean_name[:max_name_length]}-{suffix}"
+
+
+def copy_sheet_from_template(wb, template_name: str, new_name: str):
+    """Copy a template worksheet and assign it a new name."""
+    if template_name not in wb.sheetnames:
+        raise KeyError(
+            f"Template worksheet '{template_name}' was not found. "
+            f"Available sheets: {wb.sheetnames}"
+        )
+
+    if new_name in wb.sheetnames:
+        return wb[new_name]
+
+    new_ws = wb.copy_worksheet(wb[template_name])
+    new_ws.title = new_name
+    return new_ws
+
+
+def load_template_workbook(template_path: str):
+    """Load a workbook using the managed cp.openpyxl interface."""
+    return cp.openpyxl.read(template_path)
+
+
+def save_output_workbook(wb, output_path: str) -> None:
+    """Save a workbook through the managed environment or standard openpyxl."""
+    cp.openpyxl.write(wb, output_path, register=True)
+    return
+
+
+# =============================================================================
+# CELL AND FORMATTING HELPERS
+# =============================================================================
+
+def write_cell(
+    ws,
+    row: int,
+    col: int,
+    value: Any = None,
+    font=None,
+    border=None,
+    fmt: str | None = None,
+    align=None,
+    fill=None,
+):
+    """Write a value to a cell and apply any supplied formatting."""
+    cell = ws.cell(row=row, column=col, value=value)
+
+    if font is not None:
+        cell.font = font
+
+    if border is not None:
+        cell.border = border
+
+    if fmt is not None:
+        cell.number_format = fmt
+
+    if align is not None:
+        cell.alignment = align
+
+    if fill is not None:
+        cell.fill = fill
+
+    return cell
+
+
+def write_merged_box(
+    ws,
+    r1: int,
+    c1: int,
+    r2: int,
+    c2: int,
+    value: Any,
+    font,
+    border,
+    align,
+    fill=None,
+):
+    """Merge a cell range, write its value, and apply box formatting."""
+    ws.merge_cells(
+        start_row=r1,
+        start_column=c1,
+        end_row=r2,
+        end_column=c2,
+    )
+
+    write_cell(
+        ws,
+        r1,
+        c1,
+        value,
+        font=font,
+        align=align,
+        fill=fill,
+    )
+
+    for row in range(r1, r2 + 1):
+        for col in range(c1, c2 + 1):
+            ws.cell(row=row, column=col).border = border
+
+            if fill is not None:
+                ws.cell(row=row, column=col).fill = fill
+
+
+def apply_white_background(ws, n_rows: int, n_cols: int) -> None:
+    """Apply a white fill to the configured worksheet area."""
+    for row in range(1, n_rows + 1):
+        for col in range(1, n_cols + 1):
+            ws.cell(row=row, column=col).fill = WHITE_FILL
+
+
+def parse_anchor(anchor: str) -> tuple[str, int]:
+    """Split an Excel anchor into column letters and row number."""
+    # Convert the anchor to a consistent format before validation.
+    match = re.fullmatch(r"([A-Z]+)(\d+)", anchor.upper())
+
+    if not match:
+        raise ValueError(f"Invalid worksheet anchor: '{anchor}'.")
+
+    return match.group(1), int(match.group(2))
+
+
+def offset_anchor_rows(anchor: str, row_offset: int) -> str:
+    """Move an Excel anchor vertically by the specified row offset."""
+    column_letters, row_number = parse_anchor(anchor)
+
+    # Preserve the column and apply the offset only to the row number.
+    return f"{column_letters}{row_number + row_offset}"
+
+
+# =============================================================================
+# DATA PREPARATION
+# =============================================================================
+
+def prepare_data(
+    df_full: pd.DataFrame,
+    acct_group_value: str,
+) -> pd.DataFrame:
+    """Filter data for one account group and standardize numeric fields."""
+    data_cfg = data_config()
+    account_group_col = data_cfg["account_group_column"]
+
+    required_columns = [
+        account_group_col,
+        data_cfg["group_column"],
+        data_cfg["account_column"],
+        *numeric_columns(),
+    ]
+
+    missing_columns = [
+        column for column in required_columns if column not in df_full.columns
+    ]
+
+    if missing_columns:
+        raise KeyError(
+            "The input data is missing these required columns: "
+            f"{missing_columns}"
+        )
+
+    # Restrict the full dataset to the account group currently being reported.
+    df = df_full[
+        df_full[account_group_col] == acct_group_value
+    ].copy()
+
+    if df.empty:
+        raise ValueError(
+            f"No rows where {account_group_col} = '{acct_group_value}'."
+        )
+
+    # Convert balances and fluctuations to numeric values for calculations.
+    df[numeric_columns()] = df[numeric_columns()].apply(
+        pd.to_numeric,
+        errors="coerce",
+    )
+
+    # Replace invalid, blank, or nonnumeric source values with zero.
+    df[numeric_columns()] = df[numeric_columns()].fillna(0)
+
+    return df
+
+
+# =============================================================================
+# COMMON SHEET COMPONENTS
+# =============================================================================
+
+def write_sheet_header(
+    ws,
+    acct_group: str,
+    sheet_type: str,
+) -> None:
+    """Write the company, account-group, report-type, and date headers."""
+    titles = workbook_config()["sheet_titles"]
+    key = sheet_type.strip().lower()
+
+    if key not in titles:
+        raise ValueError(
+            f"Unsupported sheet type '{sheet_type}'. "
+            f"Expected one of: {list(titles)}."
+        )
+
+    for row in range(2, 6):
+        ws.cell(row=row, column=2).value = None
+
+    write_cell(
+        ws,
+        2,
+        2,
+        workbook_config()["company_name"],
+        font=BOLD,
+        align=LEFT,
+    )
+
+    write_cell(
+        ws,
+        3,
+        2,
+        f"{acct_group} GRA Analytics- {titles[key]}",
+        font=BOLD,
+        align=LEFT,
+    )
+
+    write_cell(
+        ws,
+        4,
+        2,
+        materiality_config()["date_label"],
+        font=NORMAL,
+        align=LEFT,
+    )
+
+
+def write_materiality_box(ws, row: int) -> int:
+    """Write the materiality box and return the next available worksheet row."""
+    cfg = materiality_config()
+
+    write_cell(
+        ws,
+        row,
+        2,
+        "Materiality (As taken from the Materiality workspace in Omnia)",
+        font=BOLD,
+        border=THIN_ALL,
+        align=LEFT,
+    )
+
+    write_cell(
+        ws,
+        row,
+        3,
+        cfg["date_label"],
+        font=BOLD,
+        border=THIN_ALL,
+        align=CENTER,
+    )
+
+    # Move below the section header before writing the materiality measures.
+    row += 1
+
+    labels_values = [
+        ("Materiality", cfg["materiality"]),
+        ("Performance Materiality", cfg["perf_mat"]),
+        ("CTT", cfg["ctt"]),
+    ]
+
+    for label, value in labels_values:
+        write_cell(
+            ws,
+            row,
+            2,
+            label,
+            font=NORMAL,
+            border=THIN_ALL,
+            align=LEFT,
+        )
+
+        write_cell(
+            ws,
+            row,
+            3,
+            value,
+            font=NORMAL,
+            border=THIN_ALL,
+            fmt=REPORT_CONFIG["formatting"]["comma_format"],
+            align=RIGHT,
+        )
+
+        # Advance the row pointer so each measure is written on its own row.
+        row += 1
+
+    # Return the next free row after one blank spacer row.
+    return row + 1
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Sheet 1 Prepration
+from openpyxl.utils import get_column_letter
+
+
+# =============================================================================
+# SHEET 1 â€” SUMMARY
+# =============================================================================
+
+def write_sheet1_summary(
+    ws,
+    df: pd.DataFrame,
+    acct_group: str,
+) -> dict:
+    """Write the Sheet 1 summary, comparison, and materiality tables."""
+
+    layout = layout_config()
+    detail_layout = layout["sheet1_detail"]
+    data_cfg = data_config()
+
+    apply_white_background(
+        ws,
+        n_rows=len(df) + 100,
+        n_cols=layout["background"]["sheet1_columns"],
+    )
+
+    ws.sheet_properties.outlinePr = Outline(
+        summaryBelow=True,
+        summaryRight=False,
+    )
+
+    write_sheet_header(ws, acct_group, "summary")
+
+    header_row = detail_layout["header_row"]
+    label_column = detail_layout["label_column"]
+    balance_start_column = detail_layout["balance_start_column"]
+    fluctuation_start_column = detail_layout["fluctuation_start_column"]
+
+    for index, column_name in enumerate(balance_columns()):
+        write_cell(
+            ws,
+            header_row,
+            balance_start_column + index,
+            column_name,
+            font=HDR_FONT,
+            align=RIGHT,
+        )
+
+    for index, column_name in enumerate(fluctuation_columns()):
+        write_cell(
+            ws,
+            header_row,
+            fluctuation_start_column + index,
+            column_name,
+            font=HDR_FONT,
+            align=RIGHT,
+        )
+
+    row = detail_layout["first_data_row"]
+    group_totals = {}
+
+    group_column = data_cfg["group_column"]
+    account_column = data_cfg["account_column"]
+
+    # Preserve the source order while processing each reporting group.
+    for group_name, df_group in df.groupby(group_column, sort=False):
+        write_cell(
+            ws,
+            row,
+            label_column,
+            group_name,
+            font=BOLD,
+            align=LEFT,
+        )
+
+        row += 1
+        first_detail_row = row
+
+        for _, source_row in df_group.iterrows():
+            write_cell(
+                ws,
+                row,
+                label_column,
+                source_row[account_column],
+                font=NORMAL,
+                align=LEFT,
+            )
+
+            for index, column_name in enumerate(balance_columns()):
+                write_cell(
+                    ws,
+                    row,
+                    balance_start_column + index,
+                    source_row[column_name],
+                    font=NORMAL,
+                    fmt=REPORT_CONFIG["formatting"]["million_format"],
+                    align=RIGHT,
+                )
+
+            for index, column_name in enumerate(fluctuation_columns()):
+                write_cell(
+                    ws,
+                    row,
+                    fluctuation_start_column + index,
+                    source_row[column_name],
+                    font=NORMAL,
+                    fmt=REPORT_CONFIG["formatting"]["million_format"],
+                    align=RIGHT,
+                )
+
+            row += 1
+
+        last_detail_row = row - 1
+
+        # Aggregate every numeric source column to create the group subtotal.
+        subtotals = {
+            column_name: df_group[column_name].sum()
+            for column_name in numeric_columns()
+        }
+
+        group_totals[group_name] = subtotals
+
+        write_cell(
+            ws,
+            row,
+            label_column,
+            f"Total {group_name}",
+            font=BOLD,
+            border=THIN_TB,
+            align=LEFT,
+        )
+
+        for index, column_name in enumerate(balance_columns()):
+            write_cell(
+                ws,
+                row,
+                balance_start_column + index,
+                subtotals[column_name],
+                font=BOLD,
+                border=THIN_TB,
+                fmt=REPORT_CONFIG["formatting"]["million_format"],
+                align=RIGHT,
+            )
+
+        for index, column_name in enumerate(fluctuation_columns()):
+            write_cell(
+                ws,
+                row,
+                fluctuation_start_column + index,
+                subtotals[column_name],
+                font=BOLD,
+                border=THIN_TB,
+                fmt=REPORT_CONFIG["formatting"]["million_format"],
+                align=RIGHT,
+            )
+
+        row += 1
+
+        detail_count = last_detail_row - first_detail_row + 1
+        collapse_threshold = data_cfg["group_collapse_threshold"]
+        visible_rows = data_cfg["visible_detail_rows"]
+
+        # Hide excess account detail while leaving the configured number visible.
+        if detail_count > collapse_threshold:
+            for detail_row in range(
+                first_detail_row,
+                min(first_detail_row + visible_rows, last_detail_row + 1),
+            ):
+                ws.row_dimensions[detail_row].outline_level = 0
+                ws.row_dimensions[detail_row].hidden = False
+
+            for detail_row in range(
+                first_detail_row + visible_rows,
+                last_detail_row + 1,
+            ):
+                ws.row_dimensions[detail_row].outline_level = 1
+                ws.row_dimensions[detail_row].hidden = True
+
+    # Aggregate the complete filtered dataset for the account-group grand total.
+    grand_totals = {
+        column_name: df[column_name].sum()
+        for column_name in numeric_columns()
+    }
+
+    write_cell(
+        ws,
+        row,
+        label_column,
+        f"Total {acct_group}",
+        font=BOLD,
+        border=MED_TB,
+        align=LEFT,
+    )
+
+    for index, column_name in enumerate(balance_columns()):
+        write_cell(
+            ws,
+            row,
+            balance_start_column + index,
+            grand_totals[column_name],
+            font=BOLD,
+            border=MED_TB,
+            fmt=REPORT_CONFIG["formatting"]["million_format"],
+            align=RIGHT,
+        )
+
+    for index, column_name in enumerate(fluctuation_columns()):
+        write_cell(
+            ws,
+            row,
+            fluctuation_start_column + index,
+            grand_totals[column_name],
+            font=BOLD,
+            border=MED_TB,
+            fmt=REPORT_CONFIG["formatting"]["million_format"],
+            align=RIGHT,
+        )
+
+    row += 2
+
+    write_merged_box(
+        ws,
+        row,
+        2,
+        row,
+        9,
+        REPORT_CONFIG["sheet1"]["year_end_update_title"],
+        font=BOLD_11,
+        border=MED_BOX,
+        align=CENTER,
+    )
+
+    # Advance the shared row pointer so all following tables start below the heading.
+    row += 2
+
+    row = write_materiality_box(ws, row)
+
+    comparison_cfg = REPORT_CONFIG["sheet1"]["comparison_table"]
+
+    write_cell(
+        ws,
+        row,
+        2,
+        comparison_cfg["title"],
+        font=BOLD_ITALIC,
+        align=LEFT,
+    )
+
+    row += 2
+
+    # The comparison-table function returns the next available dynamic row.
+    row, _, _ = write_comparison_table(
+        ws=ws,
+        row=row,
+        group_totals=group_totals,
+        table_cfg=comparison_cfg,
+        acct_group=acct_group,
+    )
+
+    # The materiality table begins after the comparison table's returned row.
+    row = write_materiality_multiple_table(
+        ws=ws,
+        row=row,
+        group_totals=group_totals,
+        table_cfg=REPORT_CONFIG["sheet1"]["materiality_multiple"],
+        acct_group=acct_group,
+    )
+
+    return group_totals
+
+
+# =============================================================================
+# COMPARISON TABLES
+# =============================================================================
+
+def write_comparison_table(
+    ws,
+    row: int,
+    group_totals: dict,
+    table_cfg: dict,
+    acct_group: str,
+) -> tuple[int, int, int]:
+    """Write a carrying-value comparison table and return its next available row."""
+
+    formatting = REPORT_CONFIG["formatting"]
+    table_layout = layout_config()["comparison_table"]
+
+    # Convert configured numeric columns into Excel letters for formula construction.
+    cur_col = get_column_letter(table_layout["current_column"])
+    pri_col = get_column_letter(table_layout["prior_column"])
+    fluc_amt_col = get_column_letter(
+        table_layout["fluctuation_amount_column"]
+    )
+    fluc_pct_col = get_column_letter(
+        table_layout["fluctuation_percent_column"]
+    )
+
+    current_period_id = table_cfg["current_period"]
+    prior_period_id = table_cfg["prior_period"]
+
+    current_period = period_config(current_period_id)
+    prior_period = period_config(prior_period_id)
+
+    current_column = current_period["column"]
+    prior_column = prior_period["column"]
+
+    label_key = table_cfg["label_key"]
+    current_label = period_label(current_period_id, label_key)
+    prior_label = period_label(prior_period_id, label_key)
+
+    title = table_cfg["title"].format(acct_group=acct_group)
+
+    if table_cfg.get("title_already_written") is not True:
+        write_cell(
+            ws,
+            row,
+            table_layout["label_column"],
+            title,
+            font=BOLD_ITALIC,
+            align=LEFT,
+        )
+
+        row += 2
+
+    write_cell(
+        ws,
+        row,
+        table_layout["label_column"],
+        None,
+        border=MED_BOX,
+    )
+
+    write_merged_box(
+        ws,
+        row,
+        table_layout["carrying_value_start_column"],
+        row,
+        table_layout["carrying_value_end_column"],
+        "Carrying Value",
+        font=BOLD,
+        border=MED_BOX,
+        align=CENTER,
+    )
+
+    write_merged_box(
+        ws,
+        row,
+        table_layout["fluctuation_start_column"],
+        row,
+        table_layout["fluctuation_end_column"],
+        "Fluctuation",
+        font=BOLD,
+        border=MED_BOX,
+        align=CENTER,
+    )
+
+    row += 1
+
+    headers = [
+        table_cfg["row_label"],
+        current_label,
+        prior_label,
+        "$",
+        "%",
+    ]
+
+    header_columns = [
+        table_layout["label_column"],
+        table_layout["current_column"],
+        table_layout["prior_column"],
+        table_layout["fluctuation_amount_column"],
+        table_layout["fluctuation_percent_column"],
+    ]
+
+    for column, header in zip(header_columns, headers):
+        write_cell(
+            ws,
+            row,
+            column,
+            header,
+            font=HDR_FONT,
+            border=THIN_ALL,
+            align=LEFT if column == table_layout["label_column"] else CENTER,
+        )
+
+    row += 1
+    group_row_start = row
+
+    for group_name, totals in group_totals.items():
+        # Convert source values from dollars to millions for display.
+        current_value = totals.get(current_column, 0.0) / 1e6
+        prior_value = totals.get(prior_column, 0.0) / 1e6
+
+        write_cell(
+            ws,
+            row,
+            table_layout["label_column"],
+            group_name,
+            font=NORMAL,
+            border=THIN_ALL,
+            align=LEFT,
+        )
+
+        write_cell(
+            ws,
+            row,
+            table_layout["current_column"],
+            current_value,
+            font=NORMAL,
+            border=THIN_ALL,
+            fmt=formatting["million_format"],
+            align=RIGHT,
+        )
+
+        write_cell(
+            ws,
+            row,
+            table_layout["prior_column"],
+            prior_value,
+            font=NORMAL,
+            border=THIN_ALL,
+            fmt=formatting["million_format"],
+            align=RIGHT,
+        )
+
+        # Calculate dollar fluctuation as current carrying value minus prior carrying value.
+        write_cell(
+            ws,
+            row,
+            table_layout["fluctuation_amount_column"],
+            f"={cur_col}{row}-{pri_col}{row}",
+            font=NORMAL,
+            border=THIN_ALL,
+            fmt=formatting["million_format"],
+            align=RIGHT,
+        )
+
+        # Calculate percentage fluctuation as dollar fluctuation divided by prior value.
+        write_cell(
+            ws,
+            row,
+            table_layout["fluctuation_percent_column"],
+            f'=IFERROR({fluc_amt_col}{row}/{pri_col}{row},"")',
+            font=NORMAL,
+            border=THIN_ALL,
+            fmt=formatting["percent_format"],
+            align=RIGHT,
+        )
+
+        row += 1
+
+    group_row_end = row - 1
+    total_acct_group_row = row
+
+    write_cell(
+        ws,
+        row,
+        table_layout["label_column"],
+        f"      Total {acct_group}",
+        font=BOLD,
+        border=THIN_ALL,
+        align=LEFT,
+    )
+
+    # Sum the group-level current values to calculate the account-group total.
+    write_cell(
+        ws,
+        row,
+        table_layout["current_column"],
+        f"=SUM({cur_col}{group_row_start}:{cur_col}{group_row_end})",
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    # Sum the group-level prior values to calculate the account-group total.
+    write_cell(
+        ws,
+        row,
+        table_layout["prior_column"],
+        f"=SUM({pri_col}{group_row_start}:{pri_col}{group_row_end})",
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    # Calculate total-dollar fluctuation from the total current and prior values.
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_amount_column"],
+        f"={cur_col}{row}-{pri_col}{row}",
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    # Calculate total percentage fluctuation using the total prior value as denominator.
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_percent_column"],
+        f'=IFERROR({fluc_amt_col}{row}/{pri_col}{row},"")',
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["percent_two_decimal_format"],
+        align=RIGHT,
+    )
+
+    row += 1
+    total_row = row
+
+    write_cell(
+        ws,
+        row,
+        table_layout["label_column"],
+        "Total",
+        font=BOLD,
+        border=THIN_ALL,
+        align=LEFT,
+    )
+
+    write_cell(
+        ws,
+        row,
+        table_layout["current_column"],
+        None,
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    write_cell(
+        ws,
+        row,
+        table_layout["prior_column"],
+        None,
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    # Calculate the total-row dollar fluctuation after the user enters current and prior values.
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_amount_column"],
+        f'=IFERROR({cur_col}{row}-{pri_col}{row},"")',
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["million_format"],
+        align=RIGHT,
+    )
+
+    # Calculate the total-row percentage fluctuation using the entered prior value.
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_percent_column"],
+        f'=IFERROR({fluc_amt_col}{row}/{pri_col}{row},"")',
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["percent_two_decimal_format"],
+        align=RIGHT,
+    )
+
+    row += 1
+
+    write_cell(
+        ws,
+        row,
+        table_layout["label_column"],
+        "%",
+        font=BOLD,
+        border=THIN_ALL,
+        align=LEFT,
+    )
+
+    # Calculate the account-group current percentage of the manually entered total.
+    write_cell(
+        ws,
+        row,
+        table_layout["current_column"],
+        f'=IFERROR({cur_col}{total_acct_group_row}/{cur_col}{total_row},"")',
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["percent_two_decimal_format"],
+        align=CENTER,
+    )
+
+    # Calculate the account-group prior percentage of the manually entered total.
+    write_cell(
+        ws,
+        row,
+        table_layout["prior_column"],
+        f'=IFERROR({pri_col}{total_acct_group_row}/{pri_col}{total_row},"")',
+        font=BOLD,
+        border=THIN_ALL,
+        fmt=formatting["percent_two_decimal_format"],
+        align=CENTER,
+    )
+
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_amount_column"],
+        None,
+        font=BOLD,
+        border=THIN_ALL,
+        align=CENTER,
+    )
+
+    write_cell(
+        ws,
+        row,
+        table_layout["fluctuation_percent_column"],
+        None,
+        font=BOLD,
+        border=THIN_ALL,
+        align=CENTER,
+    )
+
+    # Return the next available row and the group-data range used by chart logic.
+    return row + 2, group_row_start, group_row_end
+
+
+# =============================================================================
+# MATERIALITY MULTIPLE TABLES
+# =============================================================================
+
+def write_materiality_multiple_table(
+    ws,
+    row: int,
+    group_totals: dict,
+    table_cfg: dict,
+    acct_group: str,
+) -> int:
+    """Write a materiality-multiple table and return its next available row."""
+
+    formatting = REPORT_CONFIG["formatting"]
+
+    # Convert materiality from dollars to millions to match table values.
+    materiality_millions = materiality_config()["materiality"] / 1e6
+
+    if materiality_millions == 0:
+        raise ValueError("Materiality cannot be zero.")
+
+    start_column = 2
+    label_column = start_column
+    period_start_column = start_column + 1
+
+    periods = table_cfg["periods"]
+    label_key = table_cfg["label_key"]
+
+    write_cell(
+        ws,
+        row,
+        label_column,
+        table_cfg["title"],
+        font=BOLD_ITALIC,
+        align=LEFT,
+    )
+
+    row += 2
+
+    headers = [
+        table_cfg["row_label"],
+        *[
+            period_label(period_id, label_key)
+            for period_id in periods
+        ],
+    ]
+
+    include_commentary = table_cfg.get("include_commentary", False)
+
+    if include_commentary:
+        headers.append(table_cfg.get("commentary_label", "Commentary"))
+
+    for index, header in enumerate(headers):
+        write_cell(
+            ws,
+            row,
+            start_column + index,
+            header,
+            font=HDR_FONT,
+            border=THIN_ALL,
+            align=LEFT if index == 0 else CENTER,
+        )
+
+    row += 1
+    data_start_row = row
+
+    # Resolve each logical period to its source-data column once for reuse.
+    period_columns = {
+        period_id: period_column(period_id)
+        for period_id in periods
+    }
+
+    if table_cfg.get("include_total", False):
+        total_values = []
+
+        for period_id in periods:
+            source_column = period_columns[period_id]
+
+            # Aggregate the selected source column across all reporting groups.
+            period_total = sum(
+                totals.get(source_column, 0.0)
+                for totals in group_totals.values()
+            )
+
+            # Convert the aggregated dollar value to millions.
+            period_total_millions = period_total / 1e6
+
+            # Express the period total as a multiple of materiality.
+            total_value = period_total_millions / materiality_millions
+
+            total_values.append(total_value)
+
+        write_cell(
+            ws,
+            row,
+            label_column,
+            table_cfg.get(
+                "total_label_template",
+                "Total {acct_group}",
+            ).format(acct_group=acct_group),
+            font=BOLD,
+            border=THIN_ALL,
+            align=LEFT,
+        )
+
+        for index, value in enumerate(total_values):
+            write_cell(
+                ws,
+                row,
+                period_start_column + index,
+                value,
+                font=BOLD,
+                border=THIN_ALL,
+                fmt=formatting["million_format"],
+                align=RIGHT,
+            )
+
+        if include_commentary:
+            write_cell(
+                ws,
+                row,
+                period_start_column + len(periods),
+                None,
+                font=BOLD,
+                border=THIN_ALL,
+                align=LEFT_WRAP,
+            )
+
+        row += 1
+
+    for group_name, totals in group_totals.items():
+        write_cell(
+            ws,
+            row,
+            label_column,
+            group_name,
+            font=NORMAL,
+            border=THIN_ALL,
+            align=LEFT,
+        )
+
+        for index, period_id in enumerate(periods):
+            source_column = period_columns[period_id]
+
+            # Retrieve the group's source balance for the selected period.
+            period_value = totals.get(source_column, 0.0)
+
+            # Convert the balance from dollars to millions.
+            period_value_millions = period_value / 1e6
+
+            # Divide by materiality in millions to calculate the multiple.
+            value = period_value_millions / materiality_millions
+
+            write_cell(
+                ws,
+                row,
+                period_start_column + index,
+                value,
+                font=NORMAL,
+                border=THIN_ALL,
+                fmt=formatting["million_format"],
+                align=RIGHT,
+            )
+
+        if include_commentary:
+            write_cell(
+                ws,
+                row,
+                period_start_column + len(periods),
+                None,
+                font=NORMAL,
+                border=THIN_ALL,
+                align=LEFT_WRAP,
+            )
+
+        row += 1
+
+    if include_commentary and row > data_start_row:
+        commentary_column = period_start_column + len(periods)
+
+        # Merge the commentary area vertically across the table's data rows.
+        write_merged_box(
+            ws,
+            data_start_row,
+            commentary_column,
+            row - 1,
+            commentary_column,
+            "",
+            font=NORMAL,
+            border=THIN_ALL,
+            align=LEFT_WRAP,
+        )
+
+    # Leave a blank spacer before the next dynamically positioned section.
+    return row + 2
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Sheet 2 Prepration
+# filename: sheet2-analysis-and-charts.py | Code Generated by Sidekick is for learning and experimentation purposes only.
+
+from openpyxl.utils import get_column_letter
+
+
+# =============================================================================
+# SHEET 2 â€” ANALYSIS
+# =============================================================================
+
+def write_sheet2_analysis(
+    ws,
+    group_totals: dict,
+    acct_group: str,
+) -> None:
+    """Write the Sheet 2 analysis tables and configured charts."""
+
+    sheet2_cfg = REPORT_CONFIG["sheet2"]
+    background_cfg = layout_config()["background"]
+
+    apply_white_background(
+        ws,
+        n_rows=background_cfg["sheet2_rows"],
+        n_cols=background_cfg["sheet2_columns"],
+    )
+
+    write_sheet_header(ws, acct_group, "analysis")
+
+    row = write_materiality_box(
+        ws,
+        sheet2_cfg["materiality_start_row"],
+    )
+
+    write_cell(
+        ws,
+        row,
+        2,
+        sheet2_cfg["figures_label"],
+        font=ITALIC,
+        align=LEFT,
+    )
+
+    row += 2
+    table_ranges = {}
+
+    for table_id in sheet2_cfg["table_order"]:
+        table_cfg = sheet2_cfg["tables"][table_id]
+
+        row, start_row, end_row = write_comparison_table(
+            ws=ws,
+            row=row,
+            group_totals=group_totals,
+            table_cfg=table_cfg,
+            acct_group=acct_group,
+        )
+
+        # Store the dynamically generated data range for later chart construction.
+        table_ranges[table_id] = {
+            "start_row": start_row,
+            "end_row": end_row,
+        }
+
+    # Start the materiality table after the final comparison table.
+    row = write_materiality_multiple_table(
+        ws=ws,
+        row=row,
+        group_totals=group_totals,
+        table_cfg=sheet2_cfg["materiality_multiple"],
+        acct_group=acct_group,
+    )
+
+    write_sheet2_charts(
+        ws=ws,
+        acct_group=acct_group,
+        table_ranges=table_ranges,
+    )
+
+
+# =============================================================================
+# CHARTS
+# =============================================================================
+
+def value_column_for_side(value_side: str) -> int:
+    """Return the worksheet column for the current or prior chart value."""
+    table_layout = layout_config()["comparison_table"]
+
+    value_columns = {
+        "current": table_layout["current_column"],
+        "prior": table_layout["prior_column"],
+    }
+
+    if value_side not in value_columns:
+        raise KeyError(
+            f"Chart value must be 'current' or 'prior', not '{value_side}'."
+        )
+
+    return value_columns[value_side]
+
+
+def period_id_for_table_side(
+    table_cfg: dict,
+    value_side: str,
+) -> str:
+    """Return the configured period ID for a table's current or prior value."""
+    key = f"{value_side}_period"
+
+    if key not in table_cfg:
+        raise KeyError(
+            f"Table configuration does not contain '{key}'."
+        )
+
+    return table_cfg[key]
+
+
+def build_pie_chart(
+    ws,
+    title: str,
+    start_row: int,
+    end_row: int,
+    value_column: int,
+    pie_cfg: dict,
+) -> PieChart:
+    """Build a pie chart from a dynamically identified table range."""
+
+    chart = PieChart()
+    chart.title = title
+    chart.width = pie_cfg.get("width", 12)
+    chart.height = pie_cfg.get("height", 10)
+
+    data_labels = DataLabelList()
+    data_labels.showPercent = True
+    data_labels.showVal = False
+    data_labels.showCatName = False
+    data_labels.showSerName = False
+    data_labels.showLegendKey = False
+    data_labels.showLeaderLines = False
+    data_labels.numFmt = NumFmt(
+        formatCode="0%",
+        sourceLinked=False,
+    )
+    data_labels.position = "ctr"
+
+    chart.dataLabels = data_labels
+
+    chart.legend = Legend()
+    chart.legend.position = pie_cfg.get("legend_position", "r")
+    chart.legend.overlay = False
+
+    # Build the pie-series data reference from the table's selected value column.
+    data = Reference(
+        ws,
+        min_col=value_column,
+        min_row=start_row,
+        max_row=end_row,
+    )
+
+    # Build the category reference from the table's group-label column.
+    categories = Reference(
+        ws,
+        min_col=layout_config()["comparison_table"]["label_column"],
+        min_row=start_row,
+        max_row=end_row,
+    )
+
+    chart.add_data(
+        data,
+        titles_from_data=False,
+    )
+
+    chart.set_categories(categories)
+
+    if chart.series:
+        series = chart.series[0]
+        approved_colors = REPORT_CONFIG["formatting"]["approved_colors"]
+
+        # Calculate the number of pie slices from the dynamically captured table rows.
+        number_of_slices = end_row - start_row + 1
+
+        for index in range(number_of_slices):
+            point = DataPoint(idx=index)
+
+            # Cycle through the approved palette when slices exceed the color count.
+            point.graphicalProperties.solidFill = (
+                approved_colors[index % len(approved_colors)]
+            )
+
+            series.dPt.append(point)
+
+    return chart
+
+
+def build_bar_chart(
+    ws,
+    table_ranges: dict,
+    bar_cfg: dict,
+) -> BarChart:
+    """Build a clustered bar chart from configured comparison-table ranges."""
+
+    chart = BarChart()
+
+    chart.type = "col"
+    chart.grouping = "clustered"
+    chart.width = bar_cfg.get("width", 25)
+    chart.height = bar_cfg.get("height", 15)
+    chart.gapWidth = bar_cfg.get("gap_width", 219)
+    chart.overlap = bar_cfg.get("overlap", -100)
+
+    chart.legend = Legend()
+    chart.legend.position = bar_cfg.get("legend_position", "b")
+    chart.legend.overlay = False
+
+    chart.y_axis.title = None
+    chart.y_axis.numFmt = bar_cfg.get(
+        "y_axis_number_format",
+        "#,##0.0",
+    )
+    chart.y_axis.majorGridlines = ChartLines()
+    chart.y_axis.scaling.min = bar_cfg.get("y_axis_min", 0)
+    chart.y_axis.scaling.max = bar_cfg.get("y_axis_max", 600)
+    chart.y_axis.majorUnit = bar_cfg.get("y_axis_major_unit", 100)
+
+    chart.x_axis.title = None
+    chart.x_axis.tickLblPos = "high"
+    chart.x_axis.noMultiLvlLbl = 0
+
+    sheet2_tables = REPORT_CONFIG["sheet2"]["tables"]
+    table_layout = layout_config()["comparison_table"]
+
+    category_table_id = bar_cfg["category_table"]
+    category_range = table_ranges[category_table_id]
+
+    # Use the category table's dynamically captured group rows as chart categories.
+    categories = Reference(
+        ws,
+        min_col=table_layout["label_column"],
+        min_row=category_range["start_row"],
+        max_row=category_range["end_row"],
+    )
+
+    for series_cfg in bar_cfg["series"]:
+        table_id = series_cfg["table"]
+        value_side = series_cfg["value"]
+
+        table_cfg = sheet2_tables[table_id]
+        table_range = table_ranges[table_id]
+
+        # Build each series from the configured current or prior value column.
+        data = Reference(
+            ws,
+            min_col=value_column_for_side(value_side),
+            min_row=table_range["start_row"],
+            max_row=table_range["end_row"],
+        )
+
+        chart.add_data(
+            data,
+            titles_from_data=False,
+        )
+
+        series = chart.series[-1]
+
+        # Resolve the logical period so the chart legend uses the correct display label.
+        period_id = period_id_for_table_side(
+            table_cfg,
+            value_side,
+        )
+
+        series.title = SeriesLabel(
+            v=period_label(
+                period_id,
+                "chart",
+            )
+        )
+
+        data_labels = DataLabelList()
+        data_labels.showVal = True
+        data_labels.showCatName = False
+        data_labels.showSerName = False
+        data_labels.showLegendKey = False
+        data_labels.position = "outEnd"
+        data_labels.numFmt = NumFmt(
+            formatCode=bar_cfg.get(
+                "data_label_format",
+                "#,##0.00",
+            ),
+            sourceLinked=False,
+        )
+
+        series.dLbls = data_labels
+
+        color = series_cfg.get("color")
+
+        if color:
+            # Apply the configured color to both the bar fill and outline.
+            series.graphicalProperties.solidFill = color
+            series.graphicalProperties.line.solidFill = color
+
+    chart.set_categories(categories)
+
+    return chart
+
+
+def write_sheet2_charts(
+    ws,
+    acct_group: str,
+    table_ranges: dict,
+) -> None:
+    """Create and position the configured Sheet 2 pie and bar charts."""
+
+    chart_cfg = REPORT_CONFIG["sheet2"]["charts"]
+
+    if not chart_cfg.get("enabled", False):
+        return
+
+    sheet2_tables = REPORT_CONFIG["sheet2"]["tables"]
+    pie_cfg = chart_cfg.get("pie", {})
+
+    if pie_cfg.get("enabled", False):
+        for figure_number, source in enumerate(
+            pie_cfg.get("sources", []),
+            start=1,
+        ):
+            table_id = source["table"]
+            value_side = source["value"]
+            table_cfg = sheet2_tables[table_id]
+            table_range = table_ranges[table_id]
+
+            period_id = period_id_for_table_side(
+                table_cfg,
+                value_side,
+            )
+
+            label = period_label(
+                period_id,
+                pie_cfg.get("title_label_key", "chart"),
+            )
+
+            title = source.get(
+                "title",
+                "Figure {figure}: {label}",
+            ).format(
+                figure=figure_number,
+                label=label,
+            )
+
+            # Build the pie chart using the table range generated during table writing.
+            chart = build_pie_chart(
+                ws=ws,
+                title=title,
+                start_row=table_range["start_row"],
+                end_row=table_range["end_row"],
+                value_column=value_column_for_side(value_side),
+                pie_cfg=pie_cfg,
+            )
+
+            # Place the chart at the configured worksheet anchor.
+            ws.add_chart(
+                chart,
+                source["anchor"],
+            )
+
+    bar_cfg = chart_cfg.get("bar", {})
+
+    if bar_cfg.get("enabled", False):
+        title_anchor = bar_cfg["title_anchor"]
+        title_column_letters, title_row = parse_anchor(title_anchor)
+
+        # Convert the configured title anchors into numeric worksheet columns.
+        title_start_column = column_index_from_string(
+            title_column_letters
+        )
+        title_end_column = column_index_from_string(
+            bar_cfg["title_end_column"]
+        )
+
+        write_merged_box(
+            ws,
+            title_row,
+            title_start_column,
+            title_row,
+            title_end_column,
+            bar_cfg["title"].format(acct_group=acct_group),
+            font=BOLD_11,
+            border=THIN_ALL,
+            align=CENTER,
+            fill=WHITE_FILL,
+        )
+
+        ws.row_dimensions[title_row].height = 20
+
+        bar_chart = build_bar_chart(
+            ws=ws,
+            table_ranges=table_ranges,
+            bar_cfg=bar_cfg,
+        )
+
+        # Offset the chart below its title using the configured number of rows.
+        chart_anchor = offset_anchor_rows(
+            title_anchor,
+            bar_cfg.get("chart_offset_rows", 2),
+        )
+
+        ws.add_chart(
+            bar_chart,
+            chart_anchor,
+        )
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Main Executer
+# =============================================================================
+# MAIN EXECUTOR
+# =============================================================================
+
+def get_source_dataframe(
+    df_full: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Return the source data from an argument or the configured TB_Final object."""
+
+    if df_full is not None:
+        return df_full
+
+    # Retrieve TB_Final from the runtime when no dataframe was passed explicitly.
+    tb_final = globals().get("TB_Final")
+
+    if tb_final is None:
+        raise RuntimeError(
+            "No dataframe was supplied and TB_Final was not found. "
+            "Pass df_full to run(df_full), or provide TB_Final."
+        )
+
+    # Convert managed Spark-style data into pandas before report processing.
+    if hasattr(tb_final, "toPandas"):
+        return tb_final.toPandas()
+
+    if isinstance(tb_final, pd.DataFrame):
+        return tb_final.copy()
+
+    raise TypeError(
+        "TB_Final must be a pandas DataFrame or expose toPandas()."
+    )
+
+
+def run(
+    df_full: pd.DataFrame | None = None,
+) -> None:
+    """Generate one risk-assessment workbook for each configured account group."""
+
+    # Validate all period, table, chart, and source-column references before processing.
+    validate_config()
+
+    print("=" * 70)
+    print("Preparing source data...")
+
+    # Resolve the source once so every account group uses the same input dataset.
+    source_df = get_source_dataframe(df_full)
+
+    print("=" * 70)
+
+    account_groups = data_config()["account_groups"]
+    template_path = workbook_config()["template_path"]
+    template_sheets = workbook_config()["template_sheets"]
+
+    # Process each configured account group independently.
+    for acct_group in account_groups:
+        print(f"\nProcessing: '{acct_group}'")
+
+        try:
+            # Filter and standardize the source data for the current account group.
+            df = prepare_data(
+                df_full=source_df,
+                acct_group_value=acct_group,
+            )
+
+            # Load a fresh template so each account group receives an independent workbook.
+            wb = load_template_workbook(template_path)
+
+            # Create account-group-specific copies of the summary and analysis templates.
+            ws_summary = copy_sheet_from_template(
+                wb,
+                template_sheets["summary"],
+                make_sheet_name(acct_group, "Sum"),
+            )
+
+            ws_analysis = copy_sheet_from_template(
+                wb,
+                template_sheets["analysis"],
+                make_sheet_name(acct_group, "Ana"),
+            )
+
+            # Preserve a separate tickmarks worksheet for the generated workbook.
+            copy_sheet_from_template(
+                wb,
+                template_sheets["tickmarks"],
+                make_sheet_name(acct_group, "Tick"),
+            )
+
+            # Build Sheet 1 first because it returns the group totals used by Sheet 2.
+            group_totals = write_sheet1_summary(
+                ws=ws_summary,
+                df=df,
+                acct_group=acct_group,
+            )
+
+            # Build Sheet 2 using the group totals calculated on Sheet 1.
+            write_sheet2_analysis(
+                ws=ws_analysis,
+                group_totals=group_totals,
+                acct_group=acct_group,
+            )
+
+            if workbook_config()["delete_template_sheets"]:
+                # Remove only the original template tabs after copied report tabs are complete.
+                for template_sheet_name in template_sheets.values():
+                    if template_sheet_name in wb.sheetnames:
+                        del wb[template_sheet_name]
+
+            output_path = make_output_path(acct_group)
+
+            # Save the completed workbook to the account-group-specific output path.
+            save_output_workbook(
+                wb=wb,
+                output_path=output_path,
+            )
+
+            print(f"SUCCEEDED: {acct_group}")
+            print(f"Output: {output_path}")
+
+        except Exception as exc:
+            # Continue processing remaining account groups if one group fails.
+            print(f"FAILED on '{acct_group}': {exc}")
+
+
+run()
+
+
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC # SECTION 12 - Data Validation & DQ (separate file: dq_validation.xlsx)
-# MAGIC ### =====================================================================
-# MAGIC  Raw vs Excluded (greyed) vs Written, for Tab 1 and Tab 2, plus raw DQ checks and
-# MAGIC  the CY/PY full outer join. Run AFTER Sections 10-11 (reads OUTPUT_PATH back, reuses
-# MAGIC  Section 11 helpers/vars: cy_records, py_account_records, residual_records, write_block ...).
-# MAGIC ### =====================================================================
+# MAGIC ### Validation
 
 # COMMAND ----------
 
-from collections import Counter
+# ============ VALIDATION: RAW vs FINAL PARQUET ============
 
-DQ_PATH = f"{OUTPUT_DIRECTORY}/dq_validation.xlsx"
-HDR_ROW, FIRST_COL, TOL = 12, 2, Decimal("0.01")   # table anchor B12, same as writer
-DETAIL_LABELS = {ENTITY_PERCENT_DETAIL_LABEL, ENTITY_MULTIPLE_DETAIL_LABEL}
-RECON_COLS = [c for c in GL_NUMERIC_COLUMNS_CY if c != PERCENTAGE_COLUMN_NAME]   # % col is rewritten as fraction, skip
+import pandas as pd
+from pathlib import Path
+from functools import reduce
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+from openpyxl.utils import get_column_letter
+from pyspark.sql import functions as F
 
-raw_cy = records_from(raw_tb_CY)   # exact frame the Tab 1/2 writer consumed (not the greyed copy)
+# ---------- CONFIG (only edit here) ----------
+BASE       = "06/30/2026"
+FINAL_DF   = read(Path(OUTPUT_DIRECTORY) / "TB_Final.parquet")
+VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
+KEY, TOL   = "Account", 0.01
 
-def status(*checks): return "OK" if all(checks) else "DIFF"
 
-def tally(recs, cols):
-    # row count + per-column Decimal sums (None / grey / blank -> 0)
-    return {"Row count": len(recs),
-            **{c: sum((to_decimal(r.get(c)) or Decimal(0) for r in recs), Decimal(0)) for c in cols}}
+def _keep_col(df, col, drop=("",)):
+    conditions = F.col(col).isNull()
+    if drop:
+        conditions = conditions | F.col(col).isin(list(drop))
+    df = df.filter(~conditions)
+    return df.withColumnRenamed(col, KEY).withColumn(KEY, F.upper(F.col(KEY)))
 
-def read_written(sheet):
-    # Read the saved workbook back. Tag each row grey/not by Consolidated cell fill.
-    wb = cp.openpyxl.read(OUTPUT_PATH, data_only=False)
-    try:
-        rows = list(wb[sheet].iter_rows(min_row=HDR_ROW, min_col=FIRST_COL))
-    finally:
-        wb.close()
-    hdr = [c.value for c in rows[0]]
-    ci = hdr.index("Consolidated")
-    out = []
-    for r in rows[1:]:
-        rec = dict(zip(hdr, (c.value for c in r)))
-        if rec.get("Account") in (None, ""): continue
-        rec["_grey"] = r[ci].fill.fgColor.rgb == GREY_OUT_FILL
-        out.append(rec)
-    return out
 
-RECON_HDR = ["Metric", "Raw", "Excluded (grey)", "Included (Raw - Excl)", "Written (visible)", "Diff (Incl - Written)",
-             "Written in grey rows (count = Excl, values = 0)", "Status"]
+def prep_cy0630(df):
+    df = (df.withColumnRenamed("Account", "Description")
+            .withColumnRenamed("Linked TB Account #", "Acct"))
+    df = df.filter(F.col("Acct").isNotNull() & (F.col("Acct") != ""))
+    return df.withColumn(KEY, F.upper(F.concat_ws(": ", "Acct", "Description")))
 
-def recon(sheet, detail_per_row):
-    # detail_per_row: 2 for Tab 1 (% + multiple rows per visible account), 0 for Tab 2
-    w = read_written(sheet)
-    vis = [r for r in w if r["Account"] not in DETAIL_LABELS and not r["_grey"]]
-    gry = [r for r in w if r["_grey"]]
-    n_det = len(w) - len(vis) - len(gry)
-    R, W, G = tally(raw_cy, RECON_COLS), tally(vis, RECON_COLS), tally(gry, RECON_COLS)
-    X = tally([r for r in raw_cy if not is_non_grey_cy_record(r)], RECON_COLS)   # independent visibility rule
 
-    rows = [RECON_HDR]
-    for k in R:
-        inc = R[k] - X[k]
-        diff = inc - W[k]
-        expect_grey = X[k] if k == "Row count" else 0
-        rows.append([k, R[k], X[k], inc, W[k], diff, G[k], status(abs(diff) < TOL, abs(G[k] - expect_grey) < TOL)])
-    exp_det = detail_per_row * (R["Row count"] - X["Row count"])
-    rows.append(["Detail rows", None, None, exp_det, n_det, n_det - exp_det, None, status(n_det == exp_det)])
-    return rows
+SOURCES = {
+    "06/30/2026": dict(path=excel_path_CY_0630,
+                       sheet=["Balance Sheet TB Links", "Income Statement TB Links"], header=1,
+                       cols=Columns_CY_0630, prep=prep_cy0630),
+    "09/30/2025": dict(path=excel_path_CY_0930, sheet=["3) 9.30.2025"], header=8,
+                       cols=Columns_CY_0930, prep=lambda d: _keep_col(d, "BALANCE SHEET")),
+    "06/30/2025": dict(path=excel_path_PY_0630, sheet=["4) 6.30.2025"], header=7,
+                       cols=Columns_PY_0630, prep=lambda d: _keep_col(d, "BALANCE SHEET")),
+    "09/30/2024": dict(path=excel_path_PY_0930, sheet=["TB Report - LE Close USD (Histo"], header=9,
+                       cols=Columns_PY_0930,
+                       prep=lambda d: _keep_col(d, "__UNNAMED__0", ("", "BALANCE SHEET"))),
+}
 
-def dq(recs, label, blue_cells):
-    # (check, count, must_be_zero) -> OK/REVIEW, or INFO when nonzero is expected
-    accts = [str(r.get("Account") or "").strip() for r in recs]
-    dup = sum(v > 1 for v in Counter(a for a in accts if a).values())
-    checks = [("Blank Account rows", accts.count(""), True),
-              ("Null Consolidated", sum(to_decimal(r.get("Consolidated")) is None for r in recs), True),
-              ("Null Untested Balance", sum(to_decimal(r.get("Untested Balance")) is None for r in recs), True),
-              ("Duplicate account names (handled by occurrence #)", dup, False),
-              ("Blue (manual override) cells", blue_cells, False)]
-    return [[label, n, v, ("OK" if v == 0 else "REVIEW") if must0 else "INFO"] for n, v, must0 in checks]
 
-# --- join checks: join lines/totals must tie back to the greyed CY/PY frames ---
-cy_account_records = [r for r in cy_records if is_present(get_field(r, "Account"))]
-join_checks = [["Check", "Source", "Join", "Diff", "Status"]]
-for name, src, jn in (
-    ("CY lines: accounts vs join", len(cy_account_records), common_line_count + cy_only_line_count),
-    ("PY lines: accounts vs join", len(py_account_records), common_line_count + py_only_line_count),
-    ("CY Untested total", sum_field(cy_account_records, "Untested Balance"), cy_untested_total),
-    ("PY Untested total", sum_field(py_account_records, "Untested Balance"), py_untested_total),
-):
-    join_checks.append([name, src, jn, src - jn, status(abs(src - jn) < TOL)])
+def _tot(cols):
+    exprs = [F.coalesce(F.col(c).cast("double"), F.lit(0.0)) for c in cols]
+    return reduce(lambda a, b: a + b, exprs)
 
-# --- write separate file ---
-dq_wb = Workbook()
-ws = dq_wb.active
-ws.title = "DQ Summary"
-ws["A1"], ws["A1"].font = "Data Validation & DQ Report", title_font
 
-write_block(ws, 3, [["Dataset", "Check", "Count", "Status"]]
-            + dq(raw_cy, "Raw CY", len(spark_column_row_pairs_cy))
-            + dq(records_from(raw_tb_PY), "Raw PY", len(spark_column_row_pairs_py)))
-ws["A15"], ws["A15"].font = "Full Outer Join Tie-out", section_font
-write_block(ws, 16, join_checks)
-ws["A23"], ws["A23"].font = "Full Outer Join Line Breakup", section_font
-write_block(ws, 24, [["Full outer-join lines", "Common CY/PY", "PY only", "CY only"],
-                     [full_join_count, common_line_count, py_only_line_count, cy_only_line_count]])
+def _scalar(df, expr):
+    return float(df.agg(F.coalesce(F.sum(expr), F.lit(0.0))).first()[0])
 
-recon_tabs = {"Tab1 Recon": recon(QUANTITATIVE_SHEET, 2), "Tab2 Recon": recon(QUALITATIVE_SHEET, 0)}
-for title, rows in recon_tabs.items():
-    sheet = dq_wb.create_sheet(title)
-    sheet["A1"], sheet["A1"].font = f"{title}: Raw vs Excluded vs Written", title_font
-    write_block(sheet, 3, rows)
-    sheet.freeze_panes = "B4"
 
-fj = dq_wb.create_sheet("Full Outer Join")
-fj_rows = [["Account CY", "CY Untested", "Account PY", "PY Untested", "Match Category", "CY Greyed", "CY Row ID", "PY Row ID"]]
-for r in residual_records:
-    has_cy, has_py = is_present(get_field(r, ACCOUNT_CY_COLUMN)), is_present(get_field(r, ACCOUNT_PY_COLUMN))
-    fj_rows.append([get_field(r, ACCOUNT_CY_COLUMN), to_decimal(get_field(r, CY_BALANCE_COLUMN)),
-                    get_field(r, ACCOUNT_PY_COLUMN), to_decimal(get_field(r, PY_BALANCE_COLUMN)),
-                    "Common CY/PY" if has_cy and has_py else "CY only" if has_cy else "PY only",
-                    get_field(r, "CY_Greyed"), get_field(r, "CY_Row_ID"), get_field(r, "PY_Row_ID")])
-write_block(fj, 3, fj_rows)
-fj.freeze_panes = "A4"
+# 1) raw -> kept -> per-key aggregate
+info, aggs = {}, {}
 
-for sheet in dq_wb.worksheets:
-    sheet.sheet_view.showGridLines = False
-    sheet.column_dimensions["A"].width = 52
-    for col in "BCDEFGH": sheet.column_dimensions[col].width = 24
+for lbl, s in SOURCES.items():
+    raw  = read_excel(s["path"], sheet_name=s["sheet"], header=s["header"],
+                      naming_convention="neutral", trim=True)
+    kept = s["prep"](raw).select(KEY, _tot(s["cols"]).alias("v"))
+    agg  = kept.groupBy(KEY).agg(F.sum("v").alias("v"), F.count("*").alias("n"))
+    aggs[lbl] = agg
 
-cp.openpyxl.write(dq_wb, DQ_PATH, register=True)
+    raw_rows,  raw_total  = raw.count(),  _scalar(raw.select(_tot(s["cols"]).alias("v")), "v")
+    kept_rows, kept_total = kept.count(), _scalar(kept, "v")
 
-n_bad = sum(row[-1] == "DIFF" for rows in [*recon_tabs.values(), join_checks] for row in rows[1:])
-print(f"DQ file written: {DQ_PATH} | DIFF rows: {n_bad}")
+    info[lbl] = dict(raw_rows=raw_rows, raw_total=raw_total,
+                     filtered_out_rows=raw_rows - kept_rows,
+                     filtered_out_total=raw_total - kept_total,
+                     kept_rows=kept_rows, kept_total=kept_total,
+                     distinct_keys=agg.count(), dup_keys=agg.filter("n > 1").count())
+
+
+# 2) included / excluded vs base + compare to final parquet
+base       = aggs[BASE]
+final_rows = FINAL_DF.count()
+final_keys = FINAL_DF.select(KEY).distinct().count()
+summary, detail = [], []
+
+for lbl, agg in aggs.items():
+    inc  = agg if lbl == BASE else agg.join(base.select(KEY), KEY, "left_semi")
+    exc  = agg.join(base.select(KEY), KEY, "left_anti") if lbl != BASE else agg.limit(0)
+    miss = base.join(agg.select(KEY), KEY, "left_anti") if lbl != BASE else base.limit(0)
+
+    inc_total,  exc_total  = _scalar(inc, "v"), _scalar(exc, "v")
+    final_total = _scalar(FINAL_DF, F.col(f"`{lbl}`"))
+    diff = final_total - inc_total
+
+    summary.append({"Source": lbl, **info[lbl],
+        "Included_Keys(in base)"                  : inc.count(),
+        "Included_Total"                           : inc_total,
+        "Excluded_Keys(not in base)"               : exc.count(),
+        "Excluded_Total"                           : exc_total,
+        "Base_Keys_Missing_In_Source(zero-filled)" : miss.count(),
+        "Final_Total"                              : final_total,
+        "Final_minus_Included"                     : diff,
+        "Status": "PASS" if abs(diff) <= TOL and info[lbl]["dup_keys"] == 0 else "FAIL"})
+
+    for reason, d in [("EXCLUDED - in source, not in base", exc),
+                      ("ZERO-FILLED - in base, not in source", miss)]:
+        p = d.select(KEY, "v").toPandas()
+        if len(p):
+            p.insert(0, "Reason", reason); p.insert(0, "Source", lbl)
+            detail.append(p)
+
+
+summary_pd = pd.DataFrame(summary)
+detail_pd  = pd.concat(detail) if detail else pd.DataFrame(columns=["Source", "Reason", KEY, "v"])
+rows_pd    = pd.DataFrame([{
+    "Base_Distinct_Keys" : info[BASE]["distinct_keys"],
+    "Final_Rows"         : final_rows,
+    "Final_Distinct_Keys": final_keys,
+    "Status": "PASS" if final_rows == info[BASE]["distinct_keys"] == final_keys
+              else "FAIL (join fan-out / dup keys)"}])
+
+
+# ============ STEP 3: write excel â€” Summary sheet with stacked tables ============
+
+# Styles
+TITLE_FILL   = PatternFill("solid", fgColor="1F3864")   # dark navy
+TITLE_FONT   = Font(bold=True, color="FFFFFF", size=11)
+HEADER_FILL  = PatternFill("solid", fgColor="2E75B6")   # blue
+HEADER_FONT  = Font(bold=True, color="FFFFFF")
+PASS_FILL    = PatternFill("solid", fgColor="C6EFCE")   # green
+FAIL_FILL    = PatternFill("solid", fgColor="FFC7CE")   # red
+ALT_FILL     = PatternFill("solid", fgColor="EEF3FB")   # light blue-grey for alt rows
+GAP          = 2                                         # blank rows between tables
+
+
+def _write_table(ws, title, pdf, start_row, status_col=None):
+    """Write a titled table into ws starting at start_row. Returns next free row."""
+    cols = list(pdf.columns)
+    n_cols = len(cols)
+
+    # Title row â€” merged across all columns
+    ws.merge_cells(start_row=start_row, start_column=1,
+                   end_row=start_row,   end_column=n_cols)
+    title_cell = ws.cell(row=start_row, column=1, value=title)
+    title_cell.font      = TITLE_FONT
+    title_cell.fill      = TITLE_FILL
+    title_cell.alignment = Alignment(horizontal="left", vertical="center")
+    ws.row_dimensions[start_row].height = 18
+
+    # Header row
+    hdr_row = start_row + 1
+    for ci, col in enumerate(cols, 1):
+        c = ws.cell(row=hdr_row, column=ci, value=col)
+        c.font = HEADER_FONT
+        c.fill = HEADER_FILL
+
+    # Data rows
+    for ri, row in enumerate(pdf.itertuples(index=False), 1):
+        data_row = hdr_row + ri
+        fill = ALT_FILL if ri % 2 == 0 else None
+        for ci, val in enumerate(row, 1):
+            c = ws.cell(row=data_row, column=ci, value=val)
+            if fill:
+                c.fill = fill
+            # PASS / FAIL colouring on status column
+            if status_col and cols[ci - 1] == status_col:
+                if val == "PASS":
+                    c.fill = PASS_FILL
+                    c.font = Font(bold=True, color="276221")
+                elif "FAIL" in str(val):
+                    c.fill = FAIL_FILL
+                    c.font = Font(bold=True, color="9C0006")
+
+    # Auto-fit column widths
+    for ci, col in enumerate(cols, 1):
+        max_len = max(
+            len(str(col)),
+            *(len(str(r)) for r in pdf[col].astype(str))
+        )
+        ws.column_dimensions[get_column_letter(ci)].width = min(max_len + 4, 40)
+
+    return hdr_row + len(pdf) + GAP                      # next table starts here
+
+
+# Slice summary_pd into focused sub-tables
+t_raw      = summary_pd[["Source", "raw_rows", "raw_total"]]
+t_filtered = summary_pd[["Source", "filtered_out_rows", "filtered_out_total"]]
+t_kept     = summary_pd[["Source", "kept_rows", "kept_total", "distinct_keys", "dup_keys"]]
+t_included = summary_pd[["Source", "Included_Keys(in base)", "Included_Total"]]
+t_excluded = summary_pd[["Source", "Excluded_Keys(not in base)", "Excluded_Total",
+                          "Base_Keys_Missing_In_Source(zero-filled)"]]
+t_final    = summary_pd[["Source", "Final_Total", "Final_minus_Included", "Status"]]
+
+wb = Workbook()
+wb.remove(wb.active)
+
+# â”€â”€ Summary sheet with 6 stacked tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ws_sum = wb.create_sheet("Summary")
+ws_sum.sheet_view.showGridLines = False
+cursor = 1
+cursor = _write_table(ws_sum, "RAW",                          t_raw,      cursor)
+cursor = _write_table(ws_sum, "FILTERED OUT",                 t_filtered, cursor)
+cursor = _write_table(ws_sum, "KEPT â€“ Distinct & Dup Keys",   t_kept,     cursor)
+cursor = _write_table(ws_sum, "INCLUDED (in base)",           t_included, cursor)
+cursor = _write_table(ws_sum, "EXCLUDED & BASE KEYS MISSING", t_excluded, cursor)
+cursor = _write_table(ws_sum, "FINAL vs INCLUDED",            t_final,    cursor, status_col="Status")
+
+# â”€â”€ Row_Check sheet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ws_rc = wb.create_sheet("Row_Check")
+_write_table(ws_rc, "ROW & KEY COUNT CHECK", rows_pd, 1, status_col="Status")
+ws_rc.sheet_view.showGridLines = False
+
+# â”€â”€ Included_Excluded_Detail sheet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+ws_det = wb.create_sheet("Included_Excluded_Detail")
+ws_det.append(list(detail_pd.columns))
+for c in ws_det[1]:
+    c.font = HEADER_FONT
+    c.fill = HEADER_FILL
+for r in detail_pd.itertuples(index=False):
+    ws_det.append(list(r))
+ws_det.freeze_panes = "A2"
+
+cp.openpyxl.write(wb, VALID_XLSX, register=True)
+
+display(spark.createDataFrame(summary_pd.astype(str)))
+print(rows_pd.to_string(index=False))
+
 
 # COMMAND ----------
+
