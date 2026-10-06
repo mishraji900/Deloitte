@@ -1,946 +1,332 @@
-# Databricks notebook source
-# DBTITLE 0,Journal Entry Read-In and Mapping
-# MAGIC %md
-# MAGIC # Overview
-# MAGIC ---
-# MAGIC # =====================================================================
-# MAGIC # Broadridge FY27 TB Tieout Automation
-# MAGIC # =====================================================================
-# MAGIC ### Problem Statement
-# MAGIC The current financial statement tie-out process relies heavily on manual effort. The audit team must identify the GL accounts supporting each disclosure line item, apply grouping-code mappings, aggregate balances, and compare the calculated amounts with the financial statements.
-# MAGIC Although ANA-007 supports this process, maintaining grouping-code assignments and updating disclosures remains manual. As the number of disclosures and mapped accounts increases, the process becomes repetitive, time-consuming, and more susceptible to mapping errors, inconsistent updates, and incomplete documentation.
-# MAGIC The proposed tool will automate and standardize the tie-out process using predefined mappings between GL accounts, grouping codes, and financial statement disclosure line items. This will improve efficiency, consistency, accuracy, and traceability.
-# MAGIC
-# MAGIC Process Followed to Resolve the Issue
-# MAGIC - Identify the GL trial balance, grouping codes, financial statement line items, disclosure data, and reporting-period information required for the tie-out.
-# MAGIC - Create and maintain predefined relationships between GL accounts, grouping codes, and financial statement disclosure line items.
-# MAGIC - Import the trial balance and disclosure data, then perform checks for missing fields, invalid grouping codes, duplicate accounts, and inconsistent mappings.
-# MAGIC - Use the approved grouping-code mappings to automatically aggregate GL balances for each financial statement line item.
-# MAGIC - Compare the calculated balances with the amounts presented in the financial statements and identify any differences.
-# MAGIC - Produce a clear list of unmapped accounts, missing disclosure lines, balance variances, and other items requiring investigation.
-# MAGIC - Generate a repeatable tie-out output that includes mappings, calculations, results, exceptions, and review-ready supporting information.
-# MAGIC
-# MAGIC
-# MAGIC # =====================================================================
-# MAGIC
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # 1. Initialize Environment
-# MAGIC ---
-
-# COMMAND ----------
-
-# DBTITLE 1,Initialize
-# MAGIC %run /Workspace/Shared/centralized_analytics/init_cp
-
-# COMMAND ----------
-
-# DBTITLE 1,Install libraries
-# MAGIC %%bash
-# MAGIC pip install \
-# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/pyod.git" \
-# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/cdm_tools.git" \
-# MAGIC     --quiet \
-# MAGIC     --index-url https://pypi.org/simple
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ##### Refer to below PyOD overview and CDM Tools documentations in GitHub.
-# MAGIC
-# MAGIC - [**PyOD**](https://psychic-adventure-prk2wj9.pages.github.io/): Overview in generic data transformations, file operations, and workflows
-# MAGIC - [**CDM Tools**](https://legendary-adventure-o7zy2on.pages.github.io/): Tools for validating and verifying CDM behavior
-
-# COMMAND ----------
-
-# DBTITLE 1,Import methods
-import datetime
-from pathlib import Path
-
-from pyspark.sql import functions as F, types as T
-
-from pyod.config import DataFrame
-from pyod.fs import find, read, read_excel, write
-from pyod.column import cast_dtype
-from pyod.dataframe import aggregate, diagnose, map_columns
-from pyod.logging import logger
-
-from cdm_tools import read_table
-from cdm_tools.models import GeneralLedgerDetail, TrialBalance, ChartOfAccounts
-from cdm_tools.analytics import JournalEntryTesting
-
-# COMMAND ----------
-
-# This cell is for the user to run all the prerequisite codes above this line.
-# Please note that the user should scroll to the initialization section to initialize the notebook, else it would be waiting for all commands to run and it might time out and cause errors.
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #2. Define Parameters
-# MAGIC ---
-# MAGIC
-# MAGIC Provide inputs required for journal entry reconciliation and downstream analytic(s).
-
-# COMMAND ----------
-
-# DBTITLE 1,Parameters
-OUTPUT_DIRECTORY: str = "SPEC-DATAPREP/FY27/TB TIEOUT"
-
-# Source Omnia exports (inside a zip) + the empty template + the final output path.
-Mapping_excel_path: str = "User Imported Data/EFT_UP/FY27/TB_Tieout/TB_Tieout.zip/Group Mapping TB Tieout.xlsx"
-tb_excel_path: str = 'User Imported Data/EFT_UP/FY27/TB_Tieout/TB_Tieout.zip/TIEOUT_Q3_TB_Details.xlsx'
-
-TEMPLATE_PATH = "User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/Consolidated_Analytical_Review_template.xlsx"
-Validation = {}
-
-# COMMAND ----------
-
-def Ctrl_Totals(df, column_names):
-    agg_exprs = [F.sum(F.col(c)).alias(c) for c in column_names]
-    result_df = df.agg(*agg_exprs, F.count("*").alias("count"))
-    return result_df
-DISABLE_DISPLAY=False
-
-ready_for_logs = DISABLE_DISPLAY
-def display_mask(*args, **kwargs):
-    # Apply your masking or logging behavior here.
-    pass
-
-
-# Capture the original display function once, before replacing it.
-if "_original_display" not in globals():
-    _original_display = display
-
-
-def display_router(*args, **kwargs):
-    # This condition is evaluated every time display() is called.
-    if ready_for_logs:
-        return display_mask(*args, **kwargs)
-
-    return _original_display(*args, **kwargs)
-
-
-display = display_router
-
-def clean_df(df):
-    """
-    The function performs the following operations on the DataFrame:
-    1) Replace dot (.) with underscore (_) in all field names
-    2) Removes the leading and trailing spaces from all field names
-    3) Removes the leading and trailing spaces from all field values
-    """
-    new_columns = [
-        F.trim(F.expr(f"`{c}`")).alias(c.replace(".", "_").strip()) for c in df.columns
-    ]
-    return df.select(new_columns)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #3. Omnia Export Readin
-# MAGIC ---
-
-# COMMAND ----------
-
-cp.fs.ls('User Imported Data/EFT_UP/FY27/TB_Tieout/TB_Tieout.zip',True)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Preparing TB BS and TB IS YTD For formating Automation
-
-# COMMAND ----------
-
-TB_03312026 = read_excel(tb_excel_path, sheet_name=["TB Report - LE Close USD"],
-                       header=0, naming_convention="neutral", trim=True)
-TB_12312025 = read_excel(tb_excel_path, sheet_name=["Dec TB Report - LE Close USD"],
-                       header=0, naming_convention="neutral", trim=True)
-TB_Grouping_Mapping = read_excel(Mapping_excel_path, sheet_name=["Sheet1"],
-                       header=0, naming_convention="neutral", trim=True)
-
-TB_03312026 = TB_03312026.withColumn(
-    "row_id",
-    F.monotonically_increasing_id()
-)
-
-# cp.write(TB_03312026, f'{OUTPUT_DIRECTORY}/TB_03312026.parquet', 'overwrite', register=True)
-TB_03312026 = cp.read(f'{OUTPUT_DIRECTORY}/TB_03312026.parquet')
-
-TB_12312025 = TB_12312025.withColumn(
-    "row_id",
-    F.monotonically_increasing_id()
-)
-
-# cp.write(TB_12312025, f'{OUTPUT_DIRECTORY}/TB_12312025.parquet', 'overwrite', register=True)
-TB_12312025 = cp.read(f'{OUTPUT_DIRECTORY}/TB_12312025.parquet')
-
-TB_Grouping_Mapping = TB_Grouping_Mapping.withColumn(
-    "row_id",
-    F.monotonically_increasing_id()
-)
-TB_03312026 = TB_03312026.withColumnRenamed('__UNNAMED__0','Account').withColumnRenamed('__UNNAMED__123','Elimination')
-TB_12312025 = TB_12312025.withColumnRenamed('__UNNAMED__1','Account').withColumnRenamed('__UNNAMED__110','Elimination').drop("__UNNAMED__0",'__UNNAMED__112')
-
-print("\nCount:",TB_03312026.count())
-display(TB_03312026.limit(10))
-print("\nCount:",TB_12312025.count())
-display(TB_12312025.limit(10))
-print("\nCount:",TB_Grouping_Mapping.count())
-display(TB_Grouping_Mapping.limit(10))
-
-# COMMAND ----------
-
-print(TB_03312026.count())
-TB_03312026 = TB_03312026.filter(col("Account").isNotNull())
-TB_03312026 = TB_03312026.join(TB_Grouping_Mapping.select("Account","Grouping Code"),on='Account',how ="left")
-print(TB_03312026.count())
-display(TB_03312026.limit(10))
-
-
-# COMMAND ----------
-
-print(TB_12312025.count())
-TB_12312025 = TB_12312025.filter(col("Account").isNotNull())
-TB_12312025 = TB_12312025.join(TB_Grouping_Mapping.select("Account","Grouping Code"),on='Account',how ="left")
-print(TB_12312025.count())
-display(TB_12312025.limit(10))
-
-# COMMAND ----------
-
-# DBTITLE 1,TB_03312026
-excluded_columns = {
-    "Account",
-    "__sheet__",
-    "row_id",
-    "Grouping Code"
-}
-
-remaining_columns = [
-    column_name
-    for column_name in TB_03312026.columns
-    if column_name not in excluded_columns
-]
+excluded_columns = {"Account", "__sheet__", "row_id", "Grouping Code"}
 
 def to_numeric(column_name):
-    cleaned_column = F.trim(F.col(column_name).cast("string"))
-    cleaned_column = F.regexp_replace(cleaned_column, r"\$", "")
-    return cleaned_column.cast("double").alias(column_name)
+    c = F.regexp_replace(F.trim(F.col(column_name).cast("string")), r"\$", "")
+    return c.cast("double").alias(column_name)
 
-# Convert all remaining columns to numeric double values.
-TB_03312026 = TB_03312026.select(
-    *[
-        to_numeric(column_name)
-        if column_name in remaining_columns
-        else F.col(column_name)
-        for column_name in TB_03312026.columns
-    ]
-)
+def add_totals(df):
+    numeric_cols = [c for c in df.columns if c not in excluded_columns]      # includes BR015
+    sum_cols     = [c for c in numeric_cols if c != "BR015"]                 # BR015 = check, not input
+    df = df.select(*[to_numeric(c) if c in numeric_cols else F.col(c) for c in df.columns])
+    total = sum((F.coalesce(F.col(c), F.lit(0.0)) for c in sum_cols), F.lit(0.0))
+    return (df.withColumn("Total Consolidated Balances", total)
+              .withColumn("D&T Check", F.col("BR015") - F.col("Total Consolidated Balances"))
+              .withColumn("Total Consolidated Balances (Rounded in millions)",
+                          F.round(F.col("Total Consolidated Balances") / F.lit(1_000_000), 2)))
 
-# Calculate the row-level total.
-total_expression = sum(
-    (
-        F.coalesce(F.col(column_name), F.lit(0.0))
-        for column_name in remaining_columns
-    ),
-    F.lit(0.0),
-)
+TB_03312026 = add_totals(TB_03312026)
+TB_12312025 = add_totals(TB_12312025)
+print(TB_03312026.count(), TB_12312025.count())
 
-TB_03312026 = TB_03312026.withColumn(
-    "Total Consolidated Balances",
-    total_expression,
-)
 
-print(f"Rows: {TB_03312026.count()}")
 
-TB_03312026 = TB_03312026.withColumn('D&T Check',col("BR015")-col('Total Consolidated Balances'))
 
-# COMMAND ----------
 
-display(TB_03312026.limit(10))
 
-# COMMAND ----------
 
-# DBTITLE 1,TB_12312025
-excluded_columns = {
-    "Account",
-    "__sheet__",
-    "row_id",
-    "Grouping Code"
-}
 
-remaining_columns = [
-    column_name
-    for column_name in TB_12312025.columns
-    if column_name not in excluded_columns
-]
-
-def to_numeric(column_name):
-    cleaned_column = F.trim(F.col(column_name).cast("string"))
-    cleaned_column = F.regexp_replace(cleaned_column, r"\$", "")
-    return cleaned_column.cast("double").alias(column_name)
-
-# Convert all remaining columns to numeric double values.
-TB_12312025 = TB_12312025.select(
-    *[
-        to_numeric(column_name)
-        if column_name in remaining_columns
-        else F.col(column_name)
-        for column_name in TB_12312025.columns
-    ]
-)
-
-# Calculate the row-level total.
-total_expression = sum(
-    (
-        F.coalesce(F.col(column_name), F.lit(0.0))
-        for column_name in remaining_columns
-    ),
-    F.lit(0.0),
-)
-
-TB_12312025 = TB_12312025.withColumn(
-    "Total Consolidated Balances",
-    total_expression,
-)
-
-print(f"Rows: {TB_12312025.count()}")
-
-TB_12312025 = TB_12312025.withColumn('D&T Check',col("BR015")-col('Total Consolidated Balances'))
-
-# COMMAND ----------
-
-display(TB_12312025.limit(10))
-
-# COMMAND ----------
-
-TB_03312026 = TB_03312026.withColumn(
-    "Total Consolidated Balances (Rounded in millions)",
-    F.round(
-        F.col("Total Consolidated Balances").cast("double") / F.lit(1_000_000),
-        2,
-    ),
-)
-display(TB_03312026.limit(10))
-TB_12312025 = TB_12312025.withColumn(
-    "Total Consolidated Balances (Rounded in millions)",
-    F.round(
-        F.col("Total Consolidated Balances").cast("double") / F.lit(1_000_000),
-        2,
-    ),
-)
-display(TB_12312025.limit(10))
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## Automation Excel Formating and Automation starts Here
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ### Validation
-
-# COMMAND ----------
-
-# filename: TB_TieOut_Validation_v3.py
-# Code Generated by Sidekick is for learning and experimentation purposes only.
-
-import numpy as np
-import pandas as pd
-from collections import defaultdict
+# ============ VALIDATION: TB TIE-OUT ============
+import numpy as np, pandas as pd
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-# ---------- CONFIG (only edit here) ----------
+# ---------- CONFIG ----------
+TOL         = 1
 VALID_XLSX  = f"{OUTPUT_DIRECTORY}/TB_TieOut_Validation.xlsx"
 TIEOUT_XLSX = OUTPUT_FILE
-TOL         = 1
 ACCT, CODE, TOT, CONSOL = "Account", "Grouping Code", "Total Consolidated Balances", "BR015"
 EXCLUDE     = {"Account", "__sheet__", "row_id", "Grouping Code"}
 BS_MARKER, IS_MARKER = "balance sheet", "income statement"
-TOT_HDR     = "Total Consolidated Balances"
-MAP         = dict(path=Mapping_excel_path, sheet="Sheet1", header=0)
-
-SUBTOTAL_PATTERNS = {
-    "total assets", "total liabilities", "net income",
-    "total equity", "total liabilities and equity",
-    "total revenue", "total expenses",
-}
+SUBTOTALS   = {"total assets", "total liabilities", "net income", "total equity",
+               "total liabilities and equity", "total revenue", "total expenses"}
+MAP = dict(path=Mapping_excel_path, sheet="Sheet1", header=0)
 
 SRC = {
-    "03312026": dict(
-        path=tb_excel_path, sheet="TB Report - LE Close USD", header=0,
-        rename={"__UNNAMED__0": "Account", "__UNNAMED__123": "Elimination"}, drop=[],
-        parquet=f"{OUTPUT_DIRECTORY}/TB_03312026.parquet",
-        final=TB_03312026, tab="Trial Balance 9-26",
-    ),
-    "12312025": dict(
-        path=tb_excel_path, sheet="Dec TB Report - LE Close USD", header=0,
-        rename={"__UNNAMED__1": "Account", "__UNNAMED__110": "Elimination"},
-        drop=["__UNNAMED__0", "__UNNAMED__112"],
-        parquet=f"{OUTPUT_DIRECTORY}/TB_12312025.parquet",
-        final=TB_12312025, tab="Trial Balance 6-26",
-    ),
+    "03312026": dict(path=tb_excel_path, sheet="TB Report - LE Close USD", header=0,
+                     rename={"__UNNAMED__0": "Account", "__UNNAMED__123": "Elimination"}, drop=[],
+                     parquet=f"{OUTPUT_DIRECTORY}/TB_03312026.parquet",
+                     final=TB_03312026, tab="Trial Balance 9-26"),
+    "12312025": dict(path=tb_excel_path, sheet="Dec TB Report - LE Close USD", header=0,
+                     rename={"__UNNAMED__1": "Account", "__UNNAMED__110": "Elimination"},
+                     drop=["__UNNAMED__0", "__UNNAMED__112"],
+                     parquet=f"{OUTPUT_DIRECTORY}/TB_12312025.parquet",
+                     final=TB_12312025, tab="Trial Balance 6-26"),
 }
+CY, PY = list(SRC)
 
-TABLES = [
-    ("RAW - Excel vs Parquet snapshot",
-     ["Period", "Raw_Rows", "Raw_Total", "Parquet_Rows", "Parquet_Total"]),
-    ("FILTERED OUT - no Account",
-     ["Period", "NoAcct_Rows", "NoAcct_Total"]),
-    ("KEPT - after Account filter",
-     ["Period", "Kept_Rows", "Kept_Total"]),
-    ("FINAL - after mapping join (Diff must be 0)",
-     ["Period", "Final_Rows", "Final_Total", "Diff_Rows", "Diff_Total", "Fanout_Map_Accts", "Map_Unused_Accts"]),
-    ("EXCLUDED FROM TIE-OUT",
-     ["Period", "NoCode_Rows", "NoCode_Total", "Unused_Code_Count", "Unused_Code_Total", "Config_Codes_Missing"]),
-    ("EXCEL TB TAB - read-back",
-     ["Period", "PreBS_Rows", "PreBS_Total", "Expected_Excel_Rows", "Excel_Rows",
-      "Expected_Excel_Total", "Excel_Total", "Diff_Excel_Total"]),
-    ("DATA QUALITY",
-     ["Period", "Bad_Cells", "Bad_Cols", "Dropped_Nonzero_Cols"]),
-    ("STATUS",
-     ["Period", "Status"]),
-]
+USED = ({c.strip() for sp in TIEOUT_SHEETS for t in sp.tables for r in t.rows
+         if r.kind == "sigma" for c in r.codes.split("+")}
+        | {sp.side.code for sp in TIEOUT_SHEETS if sp.side})
 
-NAVY, BLUE, BAND = "1F3864", "0070C0", "DDEBF7"
-ACC          = '_($* #,##0.00_);_($* (#,##0.00);_($* "-"??_);_(@_)'
-STATUS_FILL  = {"PASS": "C6EFCE", "WARN": "FFEB9C", "FAIL": "FFC7CE"}
+# ---------- HELPERS ----------
+def bt(c): return F.col("`" + c.replace("`", "``") + "`")
 
-# ---------- CHECK_DETAIL registry ----------
-CHECK_DETAIL = defaultdict(list)
+def num(c):   # mirrors pipeline to_numeric: strip $, trim, safe cast
+    return F.expr("try_cast(regexp_replace(trim(cast(`%s` as string)), '[$]', '') as double)"
+                  % c.replace("`", "``"))
 
-CHECK_META = {
-    "FAIL_Parquet_Mismatch"  : ("FAIL: Parquet snapshot differs from fresh Raw read",
-                                ["Period", "Metric", "Raw_Value", "Parquet_Value", "Delta"]),
-    "FAIL_Final_vs_Kept"     : ("FAIL: Final DF row/total mismatch vs Kept (post-account-filter)",
-                                ["Period", "Metric", "Kept_Value", "Final_Value", "Delta"]),
-    "FAIL_Excel_Mismatch"    : ("FAIL: Excel TB tab read-back differs from DataFrame",
-                                ["Period", "Metric", "DF_Value", "Excel_Value", "Delta"]),
-    "WARN_No_Code"           : ("WARN: Rows on TB tab with no Grouping Code (excluded from tie-out)",
-                                ["Period", "RowId", "Account", "Value"]),
-    "WARN_Above_BS"          : ("WARN: Rows above BS_MARKER (not on TB tab, not in tie-out)",
-                                ["Period", "RowId", "Account", "Value"]),
-    "WARN_No_Account"        : ("WARN: Rows filtered out â€” Account is null",
-                                ["Period", "RowId", "Value"]),
-    "WARN_Bad_Cells"         : ("WARN: Non-numeric non-empty cells found (parse failures)",
-                                ["Period", "Column", "Bad_Cell_Count"]),
-    "WARN_Dropped_Cols"      : ("WARN: Dropped columns contained non-zero sums",
-                                ["Period", "Column", "Nonzero_Sum"]),
-    "WARN_Unused_Codes"      : ("WARN: Grouping Codes present in data but not used by any tie-out tab",
-                                ["Period", "Grouping_Code", "Amount"]),
-    "WARN_Missing_Codes"     : ("WARN: Tie-out config references codes absent from data",
-                                ["Period", "Grouping_Code"]),
-    "WARN_Map_Duplicates"    : ("WARN: Mapping has duplicate Account entries (fanout inflates totals)",
-                                ["Period", "Account", "Mapping_Count", "Row_Value", "Inflated_By"]),
-    "WARN_Unavailable"       : ("WARN: Parquet or Excel read-back unavailable for period",
-                                ["Period", "Source", "Error_Note"]),
-}
-
-
-# ---------- helpers ----------
-def hold(df):
-    """Serverless: no cache/persist. Run plan once, keep result as in-memory df."""
-    p = df.toPandas()
-    return spark.createDataFrame(p.astype(object).where(p.notna(), None), schema=df.schema)
-
-
-def bt(c):
-    return F.col("`" + c.replace("`", "``") + "`")
-
-
-def num(c):
-    """Mirror pipeline: strip $, trim whitespace, safe cast to double."""
-    return F.expr(
-        "try_cast(regexp_replace(trim(cast(`%s` as string)), '[$]', '') as double)"
-        % c.replace("`", "``")
-    )
-
-
-def prep(df, s, full):
-    """
-    Mirror pipeline: rename/drop -> slim df.
-    Columns:
-        A = Account
-        I = row_id
-        V = net total (sum of all non-EXCLUDE cols)
-        B = BR015 consolidated col (standalone, for reference only)
-    """
-    ex = {}
+def slim(df, s, full=False):
+    """Raw/parquet -> pandas: A account, I row_id, V = sum of entity cols (BR015 excluded),
+    B = BR015. Spark only here; everything after is pandas."""
+    bad, dropped = {}, {}
     if full:
         zs = [c for c in s["drop"] if c in df.columns]
         if zs:
-            r = df.agg(*[F.sum(num(c)).alias(f"c{i}") for i, c in enumerate(zs)]).first()
-            ex["dropped"] = {c: r[i] for i, c in enumerate(zs) if r[i]}
+            r = df.agg(*[F.sum(F.abs(num(c))).alias(f"c{i}") for i, c in enumerate(zs)]).first()
+            dropped = {c: r[i] for i, c in enumerate(zs) if r[i]}
     for a, b in s["rename"].items():
         df = df.withColumnRenamed(a, b)
-    df   = df.drop(*s["drop"])
-    vals = [c for c in df.columns if c not in EXCLUDE]
+    df = df.drop(*s["drop"])
+    vals = [c for c in df.columns if c not in EXCLUDE and c != CONSOL]       # summed columns
     if full:
-        r = df.agg(*[F.sum(
-            F.when(bt(c).isNotNull() & (F.trim(bt(c).cast("string")) != "") & num(c).isNull(), 1)
-             .otherwise(0)).alias(f"c{i}") for i, c in enumerate(vals)]).first()
-        ex["bad"] = {c: r[i] for i, c in enumerate(vals) if r[i]}
+        chk = vals + [CONSOL]                                                # parse-check BR015 too
+        r = df.agg(*[F.sum(F.when(bt(c).isNotNull() & (F.trim(bt(c).cast("string")) != "")
+                                  & num(c).isNull(), 1).otherwise(0)).alias(f"c{i}")
+                     for i, c in enumerate(chk)]).first()
+        bad = {c: r[i] for i, c in enumerate(chk) if r[i]}
     net = sum((F.coalesce(num(c), F.lit(0.0)) for c in vals), F.lit(0.0))
-    k   = df.select(
-        F.col(ACCT).alias("A"),
-        F.col("row_id").alias("I"),
-        net.alias("V"),
-        F.coalesce(num(CONSOL), F.lit(0.0)).alias("B"),
-    )
-    return hold(k), ex
-
+    return (df.select(F.col(ACCT).alias("A"), F.col("row_id").alias("I"), net.alias("V"),
+                      F.coalesce(num(CONSOL), F.lit(0.0)).alias("B")).toPandas(), bad, dropped)
 
 def excel_tb(wb, name):
-    """
-    Rows + total on a Trial Balance tab (BS + IS tables).
-    Skips known subtotal rows so ex_rows matches tab_rows from the DataFrame.
-    """
-    ws, on, col, n, tot = wb[name], False, None, 0, 0.0
-    for r in ws.iter_rows(values_only=True):
+    """Rows + total on a Trial Balance tab (BS + IS tables), subtotal rows skipped."""
+    on, col, n, tot = False, None, 0, 0.0
+    for r in wb[name].iter_rows(values_only=True):
         b = r[1] if len(r) > 1 else None
         if isinstance(b, str) and b.strip().upper() in ("BALANCE SHEET", "INCOME STATEMENT"):
-            h   = [str(x).strip() if x is not None else "" for x in r]
-            col = h.index(TOT_HDR) if TOT_HDR in h else None
-            on  = True
+            h = [str(x).strip() if x is not None else "" for x in r]
+            col, on = (h.index(TOT) if TOT in h else None), True
             continue
         if on and b not in (None, ""):
-            if isinstance(b, str) and b.strip().lower() in SUBTOTAL_PATTERNS:
-                continue
-            n  += 1
-            v   = r[col] if col is not None and col < len(r) else None
+            if isinstance(b, str) and b.strip().lower() in SUBTOTALS: continue
+            n += 1
+            v = r[col] if col is not None and col < len(r) else None
             tot += float(v) if isinstance(v, (int, float)) else 0.0
     return n, tot
 
+HDR  = PatternFill("solid", fgColor="1F3864")
+FILL = {k: PatternFill("solid", fgColor=v) for k, v in
+        {"PASS": "C6EFCE", "WARN": "FFEB9C", "FAIL": "FFC7CE"}.items()}
 
-def _fill(c):
-    return PatternFill("solid", fgColor=c)
-
-
-def block(ws, r, title, cols, rows):
-    """Title bar + header + banded rows starting at row r. Returns next free row."""
-    n = len(cols)
-    if n > 1:
-        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=n)
-    for j in range(1, n + 1):
-        ws.cell(r, j).fill = _fill(NAVY)
-    ws.cell(r, 1, title).font = Font(bold=True, color="FFFFFF")
-    for j, c in enumerate(cols, 1):
-        h = ws.cell(r + 1, j, c)
-        h.font, h.fill = Font(bold=True, color="FFFFFF"), _fill(BLUE)
-        h.alignment   = Alignment(horizontal="center", vertical="center")
-    for i, row in enumerate(rows):
-        for j, c in enumerate(cols, 1):
-            v = row.get(c)
+def put(ws, r, title, df):
+    """Title + header + rows at row r. Returns next free row."""
+    ws.cell(r, 1, title).font = Font(bold=True, size=11)
+    if df.empty:
+        ws.cell(r + 1, 1, "none")
+        return r + 4
+    for j, c in enumerate(df.columns, 1):
+        h = ws.cell(r + 1, j, str(c)); h.font = Font(bold=True, color="FFFFFF"); h.fill = HDR
+    clean = df.astype(object).where(df.notna(), None)
+    for i, row in enumerate(clean.itertuples(index=False), r + 2):
+        for j, v in enumerate(row, 1):
             if isinstance(v, np.generic): v = v.item()
-            if isinstance(v, float) and v != v: v = None             # NaN -> blank
-            cell = ws.cell(r + 2 + i, j, v)
-            if i % 2 == 0: cell.fill = _fill(BAND)
-            if isinstance(v, bool): pass
-            elif isinstance(v, int) and c != "RowId": cell.number_format = "#,##0"
-            elif isinstance(v, float):                cell.number_format = ACC
-            if c == "Status" and v in STATUS_FILL:
-                cell.fill, cell.font = _fill(STATUS_FILL[v]), Font(bold=True)
-    return r + len(rows) + 3
+            cell = ws.cell(i, j, v)
+            if isinstance(v, float): cell.number_format = "#,##0.00;(#,##0.00);-"
+            if isinstance(v, str) and v in FILL: cell.fill = FILL[v]
+    return r + len(df) + 4
 
+def widths(ws):
+    ws.column_dimensions["A"].width = 30
+    for j in range(2, 16): ws.column_dimensions[get_column_letter(j)].width = 20
 
-def records(pdf):
-    return pdf.astype(object).where(pdf.notna(), None).to_dict("records")
-
-
-def collect_check(sheet_key, period, sdf, col_map):
-    """
-    Pull rows from a Spark DF and append them to CHECK_DETAIL[sheet_key].
-    col_map: dict {output_col_name: spark_col_expr_or_col_name}
-    """
-    exprs = [F.col(v).alias(k) if isinstance(v, str) else v.alias(k)
-             for k, v in col_map.items()]
-    pdf   = sdf.select(*exprs).toPandas()
-    if pdf.empty:
-        return
-    pdf.insert(0, "Period", period)
-    CHECK_DETAIL[sheet_key].extend(records(pdf))
-
-
-def detail_sheet(wb, sheet_key, title, cols, rows):
-    """Write one check-detail sheet; skip silently if no rows."""
-    if not rows:
-        return
-    ws = wb.create_sheet(sheet_key[:31])
-    ws.sheet_view.showGridLines = False
-    block(ws, 1, title, cols, rows)
-    ws.column_dimensions["A"].width = 14
-    ws.column_dimensions["B"].width = 45
-    for j in range(3, len(cols) + 1):
-        ws.column_dimensions[get_column_letter(j)].width = 22
-    ws.freeze_panes = "A3"
-
-
-# ---------- pre-loop setup ----------
-LABS = list(SRC)
-USED = (
-    {c.strip() for sp in TIEOUT_SHEETS for t in sp.tables for r in t.rows
-     if r.kind == "sigma" for c in r.codes.split("+")}
-    | {sp.side.code for sp in TIEOUT_SHEETS if sp.side}
-)
-
-if not USED:
-    print("WARNING: USED set is empty â€” TIEOUT_SHEETS may not be fully populated. "
-          "All Grouping Codes will appear unused and Status may be forced to WARN.")
-
-m    = hold(read_excel(MAP["path"], sheet_name=[MAP["sheet"]], header=MAP["header"],
-                       naming_convention="neutral", trim=True).select(ACCT, CODE))
-mcnt = m.filter(F.col(ACCT).isNotNull()).groupBy(ACCT).agg(F.count("*").alias("n"))
-mdup = mcnt.filter("n > 1").withColumnRenamed(ACCT, "A")
+# ---------- MAPPING (once) ----------
+m = (read_excel(MAP["path"], sheet_name=[MAP["sheet"]], header=MAP["header"],
+                naming_convention="neutral", trim=True).select(ACCT, CODE).toPandas().dropna(subset=[ACCT]))
+first_code = lambda s: next((x for x in s if pd.notna(x) and str(x).strip()), None)
+mg = (m.groupby(ACCT).agg(n=(CODE, "size"), nd=(CODE, "nunique"), code=(CODE, first_code))
+        .reset_index().rename(columns={ACCT: "A"}))      # n = times mapped, code = first non-blank code
 
 try:
     xwb = cp.openpyxl.read(TIEOUT_XLSX)
 except Exception as e:
-    xwb = None
-    print("Excel read-back failed:", e)
+    xwb = None; print("Excel read-back failed:", e)
 
-summary, detail, cov = [], [], {}
+# ---------- MAIN LOOP ----------
+wf, p1a, p1b, p2chk, p2, issues, excl, p4, dts = {}, [], [], [], [], [], [], [], []
 
-
-# ---------- main loop ----------
 for lab, s in SRC.items():
-
-    raw  = hold(
-        read_excel(s["path"], sheet_name=[s["sheet"]], header=s["header"],
-                   naming_convention="neutral", trim=True)
-        .withColumn("row_id", F.monotonically_increasing_id())
-    )
-    k, ex = prep(raw, s, True)
-
-    # â”€â”€ base aggregations (no D&T check) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    ka = F.col("A").isNotNull()
-    r  = [x or 0 for x in k.agg(
-        F.count("*"),
-        F.sum("V"),
-        F.sum(F.when(~ka, 1).otherwise(0)),
-        F.sum(F.when(~ka, F.col("V")).otherwise(0.0)),
-    ).first()]
-    raw_rows, raw_tot, na_rows, na_tot = r
-    kept_rows, kept_tot = raw_rows - na_rows, raw_tot - na_tot
-
-    # â”€â”€ WARN: rows with no Account â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    collect_check("WARN_No_Account", lab,
-                  k.filter(~ka).filter(F.col("V") != 0),
-                  {"RowId": "I", "Value": "V"})
-
-    # â”€â”€ parquet snapshot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    raw = (read_excel(s["path"], sheet_name=[s["sheet"]], header=s["header"],
+                      naming_convention="neutral", trim=True)
+           .withColumn("row_id", F.monotonically_increasing_id()))
+    k, bad, dropped = slim(raw, s, True)
     try:
-        pk, _       = prep(cp.read(s["parquet"]), s, False)
-        pr          = pk.agg(F.count("*"), F.sum("V")).first()
-        pq_rows, pq_tot = pr[0], pr[1] or 0.0
-        pq_ok       = True
+        pq = slim(cp.read(s["parquet"]), s)[0]
     except Exception as e:
-        print(f"[{lab}] parquet read failed:", e)
-        pq_rows = pq_tot = None
-        pq_ok   = False
-        CHECK_DETAIL["WARN_Unavailable"].append(
-            {"Period": lab, "Source": "Parquet", "Error_Note": str(e)})
+        pq = None; print(f"[{lab}] parquet read failed:", e)
+    f = s["final"].select(F.col(ACCT).alias("A"), F.col("row_id").alias("I"),
+                          F.col(TOT).cast("double").alias("V"), F.col(CODE).alias("C"),
+                          F.col(CONSOL).cast("double").alias("B")).toPandas()
 
-    # â”€â”€ FAIL: parquet vs raw mismatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if pq_ok:
-        pq_mismatch = pq_rows != raw_rows or abs(pq_tot - raw_tot) > TOL
-        if pq_mismatch:
-            for metric, raw_v, pq_v in [
-                ("Row Count", raw_rows, pq_rows),
-                ("Net Total",  raw_tot,  pq_tot),
-            ]:
-                CHECK_DETAIL["FAIL_Parquet_Mismatch"].append({
-                    "Period": lab, "Metric": metric,
-                    "Raw_Value": raw_v, "Parquet_Value": pq_v,
-                    "Delta": (raw_v - pq_v) if isinstance(raw_v, (int, float)) else None,
-                })
-    else:
-        pq_mismatch = False
+    # ---- P1: waterfall (raw side; mapping deduped so each raw row counted once)
+    k   = k.merge(mg[["A", "n", "nd", "code"]], on="A", how="left")
+    na  = k.A.isna()
+    nc  = ~na & k.code.isna()
+    inc = ~na & k.code.notna()
+    nz  = k.V != 0
+    cnt = lambda mask: (int(mask.sum()), float(k.V[mask].sum()))
+    R, NA, NC, INC = (len(k), float(k.V.sum())), cnt(na), cnt(nc), cnt(inc)
+    DIF = (R[0] - NA[0] - NC[0] - INC[0], round(R[1] - NA[1] - NC[1] - INC[1], 2))
+    wf[lab] = [R, NA, NC, INC, DIF]
 
-    # â”€â”€ final df â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    f = hold(s["final"].select(
-        F.col(ACCT).alias("A"),
-        F.col("row_id").alias("I"),
-        F.col(TOT).cast("double").alias("V"),
-        F.col(CODE).alias("C"),
-    ))
+    # ---- P1: final df tie. Final must equal Kept + fanout from duplicate mapping rows
+    kk  = k[~na]
+    ext = kk.n.fillna(1) - 1
+    kept_rows, kept_amt = len(kk), float(kk.V.sum())
+    fan_rows,  fan_amt  = int(ext.sum()), float((kk.V * ext).sum())
+    fin_rows,  fin_amt  = len(f), float(f.V.sum())
+    d_rows, d_amt = fin_rows - kept_rows - fan_rows, round(fin_amt - kept_amt - fan_amt, 2)
+    pq_dr = None if pq is None else len(pq) - len(k)
+    pq_da = None if pq is None else round(float(pq.V.sum() - k.V.sum()), 2)
+    p1a.append({"Period": lab, "Kept_Rows": kept_rows, "Fan_Rows": fan_rows, "Final_Rows": fin_rows,
+                "Diff_Rows": d_rows, "Kept_Amt": kept_amt, "Fan_Amt": fan_amt, "Final_Amt": fin_amt,
+                "Diff_Amt": d_amt, "Parquet_Rows_Diff": pq_dr, "Parquet_Amt_Diff": pq_da})
 
-    nocode = F.col("C").isNull() | (F.trim(F.col("C")) == "")
-    bs_id  = f.filter(F.lower(F.col("A")) == BS_MARKER).agg(F.min("I")).first()[0]
+    # ---- P1: D&T check. BR015 (source total) vs recomputed entity sum
+    dt  = (kk.B - kk.V).round(2)
+    off = dt.abs() > TOL
+    dt_diff = round(float(kk.B.sum() - kk.V.sum()), 2)
+    dts.append({"Period": lab, "BR015_Amt": float(kk.B.sum()), "Total_Amt": float(kk.V.sum()),
+                "Diff": dt_diff, "Rows_Off": int(off.sum()),
+                "Status": "FAIL" if abs(dt_diff) > TOL else ("WARN" if off.any() else "PASS")})
 
-    if bs_id is None:
-        print(f"[{lab}] WARNING: BS_MARKER not found in final df â€” 'pre' filter set to False.")
-        pre = F.lit(False)
-        tab = ~F.lower(F.col("A")).isin(BS_MARKER, IS_MARKER)
-    else:
-        pre = F.col("I") < bs_id
-        tab = (F.col("I") > bs_id) & ~F.lower(F.col("A")).isin(BS_MARKER, IS_MARKER)
+    # ---- P1: excluded rows (non-zero only)
+    ex = pd.concat([k[na & nz].assign(Reason="NO_ACCT"), k[nc & nz].assign(Reason="NO_CODE")])
+    excl.append(pd.DataFrame({"Period": lab, "Reason": ex.Reason, "RowId": ex.I, "Account": ex.A, "Value": ex.V}))
+    excl.append(pd.DataFrame({"Period": lab, "Reason": "DT_DIFF", "RowId": kk.I[off],
+                              "Account": kk.A[off], "Value": dt[off]}))
 
-    fr = [x or 0 for x in f.agg(
-        F.count("*"),
-        F.sum("V"),
-        F.sum(F.when(nocode, 1).otherwise(0)),
-        F.sum(F.when(nocode, F.col("V")).otherwise(0.0)),
-        F.sum(F.when(pre, 1).otherwise(0)),
-        F.sum(F.when(pre, F.col("V")).otherwise(0.0)),
-        F.sum(F.when(tab, 1).otherwise(0)),
-        F.sum(F.when(tab, F.col("V")).otherwise(0.0)),
-    ).first()]
-    f_rows, f_tot, nc_rows, nc_tot, pre_rows, pre_tot, tab_rows, tab_tot = fr
+    # ---- P2: code coverage, raw side vs final side
+    code_ok = f.C.notna() & (f.C.astype(str).str.strip() != "")
+    rc  = k[inc].groupby("code").V.agg(Rows_Raw="size", Amt_Raw="sum")
+    fc  = f[code_ok].groupby("C").V.agg(Rows_Final="size", Amt_Final="sum")
+    idx = rc.index.union(fc.index).union(list(USED))
+    c = rc.join(fc, how="outer").reindex(idx).fillna(0).rename_axis("Code").reset_index()
+    c[["Rows_Raw", "Rows_Final"]] = c[["Rows_Raw", "Rows_Final"]].astype(int)
+    c["Used"] = c.Code.isin(USED)
+    def flag(r):
+        o = []
+        if not r.Used and abs(r.Amt_Final) > TOL: o.append("UNUSED")
+        if abs(r.Amt_Final - r.Amt_Raw) > TOL:    o.append("FANOUT")
+        if r.Used and r.Rows_Final == 0:          o.append("MISSING_IN_DATA")
+        return ",".join(o)
+    c["Flag"] = c.apply(flag, axis=1)
+    c.insert(0, "Period", lab)
+    p2.append(c)
+    code_diff = round(float(c.Amt_Raw.sum()) - INC[1], 2)
+    p2chk.append({"Period": lab, "Sum_Raw_by_Code": float(c.Amt_Raw.sum()),
+                  "Included_Amt": INC[1], "Diff": code_diff})
 
-    # â”€â”€ FAIL: final vs kept mismatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    final_row_mismatch   = f_rows != kept_rows
-    final_total_mismatch = abs(f_tot - kept_tot) > TOL
-    if final_row_mismatch or final_total_mismatch:
-        for metric, kept_v, final_v in [
-            ("Row Count", kept_rows, f_rows),
-            ("Net Total",  kept_tot, f_tot),
-        ]:
-            delta = final_v - kept_v if isinstance(final_v, (int, float)) else None
-            if (abs(delta) > TOL if isinstance(delta, float) else delta != 0):
-                CHECK_DETAIL["FAIL_Final_vs_Kept"].append({
-                    "Period": lab, "Metric": metric,
-                    "Kept_Value": kept_v, "Final_Value": final_v, "Delta": delta,
-                })
+    # ---- P2: mapping issues
+    dup = kk[kk.n > 1]
+    issues += [
+        pd.DataFrame({"Period": lab, "Issue": "DUP_MAP", "Account": dup.A, "Value": dup.V * (dup.n - 1),
+                      "Detail": "mapped " + dup.n.astype(int).astype(str) + "x, codes=" + dup.nd.astype(int).astype(str)}),
+        pd.DataFrame({"Period": lab, "Issue": "MAP_UNUSED", "Account": mg.A[~mg.A.isin(kk.A)],
+                      "Value": None, "Detail": "in mapping, not in TB"}),
+    ]
 
-    # â”€â”€ code coverage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    cc  = (f.filter(~nocode)
-            .groupBy("C").agg(F.sum("V").alias("v"))
-            .toPandas().set_index("C")["v"])
-    cov[lab]          = cc
-    un                = cc[~cc.index.isin(USED)]
-    cfg_missing_codes = USED - set(cc.index)
-    cfg_missing       = len(cfg_missing_codes)
-
-    # â”€â”€ WARN: no grouping code â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    collect_check("WARN_No_Code", lab,
-                  f.filter(nocode).filter(F.col("V") != 0),
-                  {"RowId": "I", "Account": "A", "Value": "V"})
-
-    # â”€â”€ WARN: above BS marker â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    collect_check("WARN_Above_BS", lab,
-                  f.filter(pre).filter(F.col("V") != 0),
-                  {"RowId": "I", "Account": "A", "Value": "V"})
-
-    # â”€â”€ WARN: unused grouping codes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    for code, amount in un.items():
-        CHECK_DETAIL["WARN_Unused_Codes"].append(
-            {"Period": lab, "Grouping_Code": code, "Amount": float(amount)})
-
-    # â”€â”€ WARN: config codes missing from data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    for code in sorted(cfg_missing_codes):
-        CHECK_DETAIL["WARN_Missing_Codes"].append(
-            {"Period": lab, "Grouping_Code": code})
-
-    # â”€â”€ mapping diagnostics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    kacc       = k.filter(ka).select(F.col("A").alias(ACCT)).distinct()
-    fan_accts  = mdup.withColumnRenamed("A", ACCT).join(kacc, ACCT, "left_semi").count()
-    map_unused = mcnt.select(ACCT).join(kacc, ACCT, "left_anti").count()
-
-    # â”€â”€ WARN: mapping duplicates â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    if fan_accts:
-        dup_rows = (
-            k.filter(ka)
-             .join(mdup, k["A"] == mdup["A"], "inner")
-             .select(
-                 k["A"].alias("Account"),
-                 k["I"].alias("RowId"),
-                 k["V"].alias("Row_Value"),
-                 mdup["n"].alias("Mapping_Count"),
-                 (k["V"] * (mdup["n"] - 1)).alias("Inflated_By"),
-             )
-        )
-        collect_check("WARN_Map_Duplicates", lab, dup_rows,
-                      {"Account": "Account", "Mapping_Count": "Mapping_Count",
-                       "Row_Value": "Row_Value", "Inflated_By": "Inflated_By"})
-
-    # â”€â”€ WARN: bad cells â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    for col_name, cnt in ex.get("bad", {}).items():
-        if cnt:
-            CHECK_DETAIL["WARN_Bad_Cells"].append(
-                {"Period": lab, "Column": col_name, "Bad_Cell_Count": int(cnt)})
-
-    # â”€â”€ WARN: dropped non-zero columns â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    for col_name, total in ex.get("dropped", {}).items():
-        CHECK_DETAIL["WARN_Dropped_Cols"].append(
-            {"Period": lab, "Column": col_name, "Nonzero_Sum": float(total)})
-
-    # â”€â”€ excel read-back â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # ---- P4: excel read-back
+    low    = f.A.str.lower()
+    mk     = low.isin([BS_MARKER, IS_MARKER])
+    has_bs = (low == BS_MARKER).any()
+    bs_id  = f.I[low == BS_MARKER].min() if has_bs else None
+    pre    = (f.I < bs_id) if has_bs else pd.Series(False, index=f.index)
+    tab    = (~mk & (f.I > bs_id)) if has_bs else ~mk
+    t_rows, t_amt = int(tab.sum()), float(f.V[tab].sum())
     if xwb is not None and s["tab"] in xwb.sheetnames:
-        ex_rows, ex_tot = excel_tb(xwb, s["tab"])
-        ex_ok = True
+        x_rows, x_amt = excel_tb(xwb, s["tab"])
+        xs = "FAIL" if (x_rows != t_rows or abs(x_amt - t_amt) > TOL) else "PASS"
     else:
-        ex_rows = ex_tot = None
-        ex_ok   = False
-        CHECK_DETAIL["WARN_Unavailable"].append(
-            {"Period": lab, "Source": "Excel TB tab",
-             "Error_Note": f"Tab '{s['tab']}' not found"})
+        x_rows = x_amt = None; xs = "WARN"
+    p4.append({"Period": lab, "Tab": s["tab"], "PreBS_Rows": int(pre.sum()), "PreBS_Amt": float(f.V[pre].sum()),
+               "DF_Rows": t_rows, "Excel_Rows": x_rows, "DF_Amt": t_amt, "Excel_Amt": x_amt,
+               "Diff_Rows": None if x_rows is None else x_rows - t_rows,
+               "Diff_Amt": None if x_rows is None else round(x_amt - t_amt, 2), "Status": xs})
 
-    # â”€â”€ FAIL: excel mismatch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    ex_mismatch = ex_ok and (ex_rows != tab_rows or abs(ex_tot - tab_tot) > TOL)
-    if ex_mismatch:
-        for metric, df_v, xl_v in [
-            ("Row Count", tab_rows, ex_rows),
-            ("Net Total",  tab_tot, ex_tot),
-        ]:
-            CHECK_DETAIL["FAIL_Excel_Mismatch"].append({
-                "Period": lab, "Metric": metric,
-                "DF_Value": df_v, "Excel_Value": xl_v,
-                "Delta": (xl_v - df_v) if isinstance(xl_v, (int, float)) else None,
-            })
+    # ---- P1: checks + status
+    fail = (DIF[0] != 0 or abs(DIF[1]) > TOL or d_rows != 0 or abs(d_amt) > TOL or fan_rows > 0
+            or abs(code_diff) > TOL or (pq is not None and (pq_dr != 0 or abs(pq_da) > TOL))
+            or xs == "FAIL" or dts[-1]["Status"] == "FAIL")
+    pre_nz = int((f.V[pre] != 0).sum())
+    nc_nz  = int((nc & nz).sum())
+    warn = bool(nc_nz or bad or dropped or pre_nz or pq is None or xs == "WARN"
+                or dts[-1]["Status"] == "WARN"
+                or c.Flag.str.contains("UNUSED|MISSING").any())
+    p1b.append({"Period": lab, "Bad_Cells": int(sum(bad.values())), "Bad_Cols": ", ".join(bad),
+                "Dropped_NonZero_Cols": ", ".join(dropped), "NoCode_NonZero_Rows": nc_nz,
+                "PreBS_NonZero_Rows": pre_nz, "Fanout_Rows": fan_rows,
+                "Unused_Codes": int(c.Flag.str.contains("UNUSED").sum()),
+                "Missing_Codes": int(c.Flag.str.contains("MISSING").sum()),
+                "DT_Check": dts[-1]["Status"], "Excel_Check": xs,
+                "Status": "FAIL" if fail else ("WARN" if warn else "PASS")})
 
-    # â”€â”€ legacy combined detail (Excluded_Detail sheet) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    for reason, sdf, vcol in [
-        ("NO ACCT - filtered out",   k.filter(~ka),              "V"),
-        ("NO CODE - not in tie-out", f.filter(nocode),            "V"),
-        ("ABOVE BS MARKER",          f.filter(pre),               "V"),
-        ("MAP DUP - inflated amount",
-         k.filter(ka).join(mdup, "A")
-          .withColumn("D", F.col("V") * (F.col("n") - 1)),        "D"),
-    ]:
-        p = (sdf.filter(F.col(vcol) != 0)
-                .select(F.col("I").cast("long").alias("RowId"),
-                        F.col("A").alias("Account"),
-                        F.col(vcol).alias("Value"))
-                .toPandas())
-        if len(p):
-            p.insert(0, "Reason", reason)
-            p.insert(0, "Period", lab)
-            detail.append(p)
+# ---------- P1 waterfall table ----------
+wf_pd = pd.DataFrame({"Step": ["Raw", "Filtered - no Account", "No Grouping Code", "Included", "Diff (must be 0)"]})
+for lab, v in wf.items():
+    wf_pd[f"{lab}_Rows"] = [x[0] for x in v]
+    wf_pd[f"{lab}_Amt"]  = [x[1] for x in v]
 
-    # â”€â”€ status flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    bad  = (pq_mismatch
-            or final_row_mismatch or final_total_mismatch
-            or ex_mismatch)
+# ---------- P3: QTD by grouping code ----------
+codes_pd = pd.concat(p2, ignore_index=True)
+a, b = [codes_pd[codes_pd.Period == x].set_index("Code") for x in (CY, PY)]
+q = pd.DataFrame(index=a.index.union(b.index))
+for nm, d in (("CY", a), ("PY", b)):
+    q[f"{nm}_Rows"], q[f"{nm}_Amt"], q[f"{nm}_Raw"] = d.Rows_Final, d.Amt_Final, d.Amt_Raw
+q = q.fillna(0)
+q["QTD"], q["QTD_Raw"] = q.CY_Amt - q.PY_Amt, q.CY_Raw - q.PY_Raw
+q["Diff"] = (q.QTD - q.QTD_Raw).round(2)
+q["Used"] = q.index.isin(USED)
+q = q.rename_axis("Code").reset_index()
+def qflag(r):
+    o = []
+    if not r.Used and abs(r.CY_Amt) + abs(r.PY_Amt) > TOL: o.append("UNUSED")
+    if r.CY_Rows == 0 and r.PY_Rows == 0:                  o.append("MISSING_IN_DATA")
+    elif r.CY_Rows == 0 or r.PY_Rows == 0:                 o.append("ONE_SIDED")
+    if abs(r.Diff) > TOL:                                  o.append("FANOUT")
+    return ",".join(o)
+q["Flag"] = q.apply(qflag, axis=1)
+q = q[["Code", "Used", "CY_Rows", "PY_Rows", "CY_Amt", "PY_Amt", "QTD", "QTD_Raw", "Diff", "Flag"]]
 
-    warn = (nc_rows
-            or ex.get("bad") or ex.get("dropped")
-            or len(un) or cfg_missing
-            or pre_rows
-            or not pq_ok or not ex_ok)
+chk = pd.DataFrame([
+    {"Check": "Sum QTD_Raw by code vs P1 Included (CY - PY)",
+     "Value": q.QTD_Raw.sum(), "Expected": wf[CY][3][1] - wf[PY][3][1]},
+    {"Check": "Sum QTD (final df) vs QTD_Raw  [non-zero = mapping fanout]",
+     "Value": q.QTD.sum(), "Expected": q.QTD_Raw.sum()},
+    {"Check": "INFO: QTD of rows with no code (outside tie-out)",
+     "Value": wf[CY][2][1] - wf[PY][2][1], "Expected": None},
+])
+chk["Diff"]   = (chk.Value - chk.Expected).round(2)
+chk["Status"] = np.where(chk.Expected.isna(), "INFO", np.where(chk.Diff.abs() <= TOL, "PASS", "FAIL"))
 
-    diff_excel_total = (ex_tot - tab_tot) if ex_ok else None
-
-    summary.append({
-        "Period"               : lab,
-        "Raw_Rows"             : int(raw_rows),
-        "Raw_Total"            : raw_tot,
-        "Parquet_Rows"         : pq_rows,
-        "Parquet_Total"        : pq_tot,
-        "NoAcct_Rows"          : int(na_rows),
-        "NoAcct_Total"         : na_tot,
-        "Kept_Rows"            : int(kept_rows),
-        "Kept_Total"           : kept_tot,
-        "Final_Rows"           : int(f_rows),
-        "Final_Total"          : f_tot,
-        "Diff_Rows"            : int(f_rows - kept_rows),
-        "Diff_Total"           : f_tot - kept_tot,
-        "Fanout_Map_Accts"     : fan_accts,
-        "Map_Unused_Accts"     : map_unused,
-        "NoCode_Rows"          : int(nc_rows),
-        "NoCode_Total"         : nc_tot,
-        "Unused_Code_Count"    : len(un),
-        "Unused_Code_Total"    : float(un.sum()),
-        "Config_Codes_Missing" : cfg_missing,
-        "PreBS_Rows"           : int(pre_rows),
-        "PreBS_Total"          : pre_tot,
-        "Expected_Excel_Rows"  : int(tab_rows),
-        "Excel_Rows"           : ex_rows,
-        "Expected_Excel_Total" : tab_tot,
-        "Excel_Total"          : ex_tot,
-        "Diff_Excel_Total"     : diff_excel_total,
-        "Bad_Cells"            : int(sum(ex.get("bad", {}).values())),
-        "Bad_Cols"             : ", ".join(ex.get("bad", {})),
-        "Dropped_Nonzero_Cols" : ", ".join(ex.get("dropped", {})),
-        "Status"               : "FAIL" if bad else ("WARN" if warn else "PASS"),
-    })
-
-
-# ---------- code coverage frame ----------
-cov_pd = pd.DataFrame(cov).fillna(0.0)
-cov_pd = cov_pd.reindex(cov_pd.index.union(list(USED))).fillna(0.0).sort_index()
-if len(LABS) > 1:
-    cov_pd[f"QTD_{LABS[0]}"] = cov_pd[LABS[0]] - cov_pd[LABS[1]]
-cov_pd["Used_In_TieOut"] = cov_pd.index.isin(USED)
-cov_pd = cov_pd.rename_axis("Grouping Code").reset_index()
-cov_pd.columns = [str(c) for c in cov_pd.columns]
-
-detail_pd = (pd.concat(detail, ignore_index=True) if detail
-             else pd.DataFrame(columns=["Period", "Reason", "RowId", "Account", "Value"]))
-
-
-# ---------- write Excel ----------
+# ---------- WRITE ----------
 wb = Workbook()
+ws = wb.active; ws.title = "P1_YTD"; ws.sheet_view.showGridLines = False
+r = put(ws, 1, "1. YTD WATERFALL - raw -> filtered -> no code -> included (Diff must be 0)", wf_pd)
+r = put(ws, r, "2. FINAL DF TIE - Final = Kept + mapping fanout (Diff must be 0)", pd.DataFrame(p1a))
+r = put(ws, r, "3. D&T CHECK - BR015 vs Total Consolidated Balances (Diff must be 0)", pd.DataFrame(dts))
+r = put(ws, r, "4. CHECKS + STATUS", pd.DataFrame(p1b))
+put(ws, r, "5. EXCLUDED ROWS (non-zero only, incl. DT_DIFF)", pd.concat(excl, ignore_index=True))
+widths(ws)
 
-# â”€â”€ Sheet 1: Summary â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-ws = wb.active
-ws.title = "Summary"
-ws.sheet_view.showGridLines = False
-r = 1
-for title, cols in TABLES:
-    r = block(ws, r, title, cols, summary)
-ws.column_dimensions["A"].width = 14
-for c in "BCDEFGH":
-    ws.column_dimensions[c].width = 24
+ws = wb.create_sheet("P2_Codes"); ws.sheet_view.showGridLines = False
+r = put(ws, 1, "1. SUM BY CODE vs INCLUDED (Diff must be 0)", pd.DataFrame(p2chk))
+r = put(ws, r, "2. CODE COVERAGE per period",
+        codes_pd[["Period", "Code", "Used", "Rows_Raw", "Amt_Raw", "Rows_Final", "Amt_Final", "Flag"]]
+        .sort_values(["Period", "Code"]))
+put(ws, r, "3. MAPPING ISSUES", pd.concat(issues, ignore_index=True))
+widths(ws)
 
-# â”€â”€ Sheet 2: Excluded_Detail (legacy combined) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-ws2 = wb.create_sheet("Excluded_Detail")
-ws2.sheet_view.showGridLines = False
-block(ws2, 1, "EXCLUDED / FLAGGED ROWS (all checks combined)",
-      list(detail_pd.columns), records(detail_pd))
-for c, w in zip("ABCDE", (12, 50, 14, 45, 22)):
-    ws2.column_dimensions[c].width = w
-ws2.freeze_panes = "A3"
+ws = wb.create_sheet("P3_QTD_Codes"); ws.sheet_view.showGridLines = False
+r = put(ws, 1, f"1. QTD BY GROUPING CODE  (QTD = {CY} - {PY})", q)
+put(ws, r, "2. QTD CHECKS", chk)
+widths(ws)
 
-# â”€â”€ Sheet 3: Code Coverage â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-ws3 = wb.create_sheet("Code_Coverage")
-ws3.sheet_view.showGridLines = False
-block(ws3, 1, "GROUPING CODE COVERAGE - used by tie-out tabs?",
-      list(cov_pd.columns), records(cov_pd))
-ws3.column_dimensions["A"].width = 16
-for j in range(2, len(cov_pd.columns) + 1):
-    ws3.column_dimensions[get_column_letter(j)].width = 22
-ws3.freeze_panes = "A3"
-
-# â”€â”€ Sheets 4-N: one per FAIL/WARN check (only written if rows exist) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-CHECK_SHEET_ORDER = [
-    "FAIL_Parquet_Mismatch",
-    "FAIL_Final_vs_Kept",
-    "FAIL_Excel_Mismatch",
-    "WARN_No_Code",
-    "WARN_Above_BS",
-    "WARN_No_Account",
-    "WARN_Bad_Cells",
-    "WARN_Dropped_Cols",
-    "WARN_Unused_Codes",
-    "WARN_Missing_Codes",
-    "WARN_Map_Duplicates",
-    "WARN_Unavailable",
-]
-
-for key in CHECK_SHEET_ORDER:
-    title, cols = CHECK_META[key]
-    full_cols   = ["Period"] + [c for c in cols if c != "Period"]
-    detail_sheet(wb, key, title, full_cols, CHECK_DETAIL[key])
+ws = wb.create_sheet("P4_Excel"); ws.sheet_view.showGridLines = False
+put(ws, 1, "TB TAB READ-BACK - Excel vs final DataFrame", pd.DataFrame(p4))
+widths(ws)
 
 cp.openpyxl.write(wb, VALID_XLSX, register=True)
 
-display(spark.createDataFrame(pd.DataFrame(summary).astype(str)))
-
-# â”€â”€ sheet manifest â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-print("\nâ”€â”€ Validation workbook sheets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
-for ws_obj in wb.worksheets:
-    n_rows = max(0, ws_obj.max_row - 2)
-    tag    = ""
-    if ws_obj.title.startswith("FAIL_"):  tag = "  â—€ FAIL detail"
-    elif ws_obj.title.startswith("WARN_"): tag = "  â—€ WARN detail"
-    print(f"  {ws_obj.title:<32}  {n_rows:>5} data rows{tag}")
-print("â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€")
-
-
-# COMMAND ----------
-
+print(pd.DataFrame(p1b)[["Period", "DT_Check", "Excel_Check", "Status"]].to_string(index=False))
+display(spark.createDataFrame(wf_pd.astype(str)))
