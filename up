@@ -1,116 +1,12 @@
 # COMMAND ----------
 
-# DBTITLE 1,Global Constant Setup
-# =============================================================================
-# CELL 1 — CONSTANTS, COLUMN LISTS, GLOBALS, AND DATE PARSER
-# =============================================================================
-
-import re
+# DBTITLE 1,Utility Functions (Serverless Safe & Exact Parity)
 import datetime
-import builtins
+import calendar
 from collections import defaultdict
-from functools import reduce
-from pyspark.sql import functions as F, Window, types as T
-
-BASE_RAW_COLUMNS = [
-    "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name",
-    "Month", "Default Effective Date", "Posted Date", "JE Category",
-    "Journal Description", "JE Line Number", "Line Description", "Currency Code",
-    "Je Source", "Ledger", "Account Description", "Invoice Reference",
-    "Journal Line Vendor/Customer", "Vendor/Customer Name", "Vendor PO#",
-    "Vendor/Customer Number", "COA", "Company", "Business",
-    "Client Sector Idenitifier", "Client Sector", "Location",
-    "Location Description", "Department/Cost Center", "Natural Account",
-    "Product", "Product Description", "Revenue Type", "Revenue Description",
-    "Intercompany", "Future1", "Future2", "Accounted Dr", "Accounted Cr",
-    "Net Accounted", "Entered Dr", "Entered CR", "Net Entered", "FX",
-    "USD DR", "USD CR", "USD NET", "Company Description"
-]
-
-PIPE2_RAW_COLUMNS = BASE_RAW_COLUMNS + ["Year Flag", "Source Quarter"]
-
-DECIMAL_TYPE       = T.DecimalType(38, 6)
-EXACT_ZERO         = F.lit(0).cast(DECIMAL_TYPE)
-SMALL_AMT_MAX      = 5
-P4_TOLERANCE       = 1      # Pipeline 4's "up to $1 difference" tolerance-match ceiling
-NUM_PARTITIONS     = 400
-
-# ---------------- AA Comment rule labels ----------------
-AA_ONE_TO_MANY          = "One to Many"
-AA_EXACT_MATCH_SYNC     = "Exact Match (There is a lag of more than two month)"
-AA_EXACT_MATCH_UNSYNC   = "Exact match (Credit memo occures before sales invoice)"
-AA_APPROX_MATCH         = "Upto $1 Difference"
-AA_ONLY_CREDITS         = "Only Credit Memos Present in Vendor"
-AA_CLIENT_CONFIRM       = "Need More Clarity. Audit Team to address."
-
-CURRENT_QUARTER = None
-CURRENT_FY      = None
-PRIOR_FY        = None
-STAGE_PATH_P1 = STAGE_PATH_P2 = STAGE_PATH_P3 = STAGE_PATH_P4 = None
-
-
-def to_date_clean(col_name: str):
-    raw = F.trim(F.col(col_name).cast("string"))
-    return F.coalesce(
-        F.to_date(raw, "MM/dd/yyyy"),
-        F.to_date(raw, "M/d/yyyy"),
-        F.to_date(raw, "yyyy-MM-dd"),
-        F.to_date(raw, "dd-MMM-yy"),
-        F.to_date(raw, "dd-MMM-yyyy"),
-        F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
-    )
-
-
-HAS_CF = 'JE_raw_2_aligned' in globals() and JE_raw_2_aligned is not None
-
-# COMMAND ----------
-
-# DBTITLE 1,Config and Quarter Setup
-# =============================================================================
-# CELL 2 — DERIVE CURRENT_FY / PRIOR_FY / CURRENT_QUARTER FROM THE DATA
-# =============================================================================
-
-_years_df = JE_raw.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))
-if HAS_CF:
-    _years_df = _years_df.unionByName(
-        JE_raw_2_aligned.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))
-    )
-
-_year_rows = [r["yr"] for r in _years_df.where(F.col("yr").isNotNull()).distinct().collect()]
-assert _year_rows, "Could not derive any year from Default Effective Date in the input data."
-
-_max_year = builtins.max(_year_rows)
-CURRENT_FY = f"FY{str(_max_year)[-2:]}"
-PRIOR_FY   = f"FY{str(_max_year - 1)[-2:]}"
-
-_cq_rows = (
-    JE_raw.withColumn("_yr", F.year(to_date_clean("Default Effective Date")))
-          .withColumn("_q",  F.quarter(to_date_clean("Default Effective Date")))
-          .where(F.col("_yr") == _max_year)
-          .select("_q").distinct().collect()
-)
-_max_q = builtins.max([r["_q"] for r in _cq_rows]) if _cq_rows else 4
-CURRENT_QUARTER = f"Q{_max_q}"
-
-print(f"[CONFIG] Current FY (derived): {CURRENT_FY}  |  Prior FY (derived): {PRIOR_FY}")
-print(f"[CONFIG] Current Quarter label (derived, for filename only): {CURRENT_QUARTER}")
-print(f"[CONFIG] Carry-forward present: {HAS_CF}")
-
-STAGE_PATH_P1 = f"{output_path}/_stage/p1"
-STAGE_PATH_P2 = f"{output_path}/_stage/p2"
-STAGE_PATH_P3 = f"{output_path}/_stage/p3"
-STAGE_PATH_P4 = f"{output_path}/_stage/p4"
-
-# COMMAND ----------
-
-# DBTITLE 1,Utility Function Part 1 (Serverless Optimized)
-# =============================================================================
-# CELL 3 — SHARED UTILITY FUNCTIONS (NO dbutils.fs, ZERO LOOP DISK I/O)
-# =============================================================================
 
 def write_table(df, name: str, log: bool = True, base_path: str = None):
     if df is None:
-        print(f"  [SKIP] {name} – no data")
         return None
     path = f"{base_path or output_path}/{name}.parquet"
     cp.write(df, path, "overwrite", register=True)
@@ -118,14 +14,12 @@ def write_table(df, name: str, log: bool = True, base_path: str = None):
         print(f"  [WRITTEN] {path}")
     return path
 
-
 def materialize_df(df, name: str, repartition_key: str = None,
                    stage_path: str = None, num_partitions: int = NUM_PARTITIONS,
                    force_write: bool = False):
     """
-    Lightweight pass-through by default on Serverless so intermediate filter
-    splits do not waste time and staging storage writing dozens of Parquet files.
-    Set force_write=True only when an explicit disk checkpoint is desired.
+    Pass-through by default to avoid intermediate Parquet writes. 
+    force_write=True is used exclusively on base_tag outputs to freeze row_id.
     """
     if df is None:
         return None
@@ -137,88 +31,64 @@ def materialize_df(df, name: str, repartition_key: str = None,
         return cp.read(path)
     return df
 
-
 def debug_count(label: str, df):
     n = df.count() if df is not None else None
-    row_df = spark.createDataFrame([(label, n)], ["Metric", "Count"])
-    display(row_df)
-
+    display(spark.createDataFrame([(label, n)], ["Metric", "Count"]))
 
 def display_metric(label: str, value):
     display(spark.createDataFrame([(label, value)], ["Metric", "Count"]))
 
-
 def debug_group_count(df, col_name: str, label: str, limit: int = 20):
     print(f"\n  [PROFILE] {label}")
-    profiled = (
-        df.groupBy(col_name)
-          .count()
-          .orderBy(F.desc("count"), F.asc(col_name))
-          .limit(limit)
-    )
+    profiled = df.groupBy(col_name).count().orderBy(F.desc("count"), F.asc(col_name)).limit(limit)
     display(profiled)
 
-
 def audit_summary(datasets: dict):
-    rows  = []
-    total = 0
-    ok    = True
+    rows, total, ok = [], 0, True
     for label, df in datasets.items():
         if df is None:
             rows.append((label, None))
             ok = False
         else:
-            n      = df.count()
+            n = df.count()
             total += n
             rows.append((label, n))
     rows.append(("TOTAL", total))
-    summary_df = spark.createDataFrame(rows, ["Dataset", "Count"])
-    display(summary_df)
+    display(spark.createDataFrame(rows, ["Dataset", "Count"]))
     return ok
 
-
 def export_to_excel(sheets: dict, path: str):
-    _front = ["primary_key", "JE Category", "Net Entered",
-              "Default Effective Date", "Source Quarter"]
-    _drop  = {
+    _front = ["primary_key", "JE Category", "Net Entered", "Default Effective Date", "Source Quarter"]
+    _drop = {
         "pair_id", "pk_row_count", "row_id", "invoice_ref_clean", "cat_clean",
         "company_desc_clean", "vendor_num_clean", "eff_dt", "month_dt",
         "entered_net_dec", "abs_entered_dec", "abs_entered_key",
         "is_valid_row", "valid_company_desc", "valid_vendor_num", "abs_usd_net",
         "p4_primary_key", "pk_sales_count", "pk_credit_count",
     }
-
     def _prep(df):
         if df is None:
             return None
-        df            = df.drop(*[c for c in _drop if c in df.columns])
+        df = df.drop(*[c for c in _drop if c in df.columns])
         present_front = [c for c in _front if c in df.columns]
-        rest          = [c for c in df.columns if c not in present_front]
+        rest = [c for c in df.columns if c not in present_front]
         return df.select(*(present_front + rest)).pandas_api()
 
     cp.pandas.to_excel(
-        dataframes  =[_prep(df) for df in sheets.values()],
-        sheet_names =list(sheets.keys()),
-        path        =path,
+        dataframes=[_prep(df) for df in sheets.values()],
+        sheet_names=list(sheets.keys()),
+        path=path,
     )
     print(f"  [EXCEL] Written → {path}")
-
-
-# ── Schema helpers ───────────────────────────────────────────────────────────
 
 def ensure_required_columns(df, required_cols: list):
     for c in required_cols:
         if c not in df.columns:
             df = df.withColumn(c, F.lit(None).cast("string"))
-    df = df.withColumn(
+    return df.withColumn(
         "Company Description",
-        F.coalesce(
-            F.col("Company Description").cast("string"),
-            F.col("Company").cast("string"),
-        )
-    )
-    return df.select(*required_cols)
-
+        F.coalesce(F.col("Company Description").cast("string"), F.col("Company").cast("string"))
+    ).select(*required_cols)
 
 def ensure_row_id(df):
     if "row_id" in df.columns:
@@ -231,24 +101,15 @@ def ensure_row_id(df):
     order_cols = [c for c in preferred if c in df.columns] or sorted(df.columns)
     return df.withColumn(
         "row_id",
-        F.row_number()
-         .over(Window.orderBy(*[F.col(c).asc_nulls_last() for c in order_cols]))
-         .cast("string"),
+        F.row_number().over(Window.orderBy(*[F.col(c).asc_nulls_last() for c in order_cols])).cast("string")
     )
-
-
-# ── Type-conversion helpers ──────────────────────────────────────────────────
 
 def to_decimal_clean(col_name: str, precision: int = 38, scale: int = 6):
     cleaned = F.trim(F.col(col_name).cast("string"))
     cleaned = F.regexp_replace(cleaned, ",", "")
-    cleaned = F.when(
-        cleaned.rlike(r"^\(.*\)$"),
-        F.concat(F.lit("-"), F.regexp_replace(cleaned, r"[()]", "")),
-    ).otherwise(cleaned)
+    cleaned = F.when(cleaned.rlike(r"^\(.*\)$"), F.concat(F.lit("-"), F.regexp_replace(cleaned, r"[()]", ""))).otherwise(cleaned)
     cleaned = F.when(cleaned == "", None).otherwise(cleaned)
     return cleaned.cast(T.DecimalType(precision, scale))
-
 
 def month_from_business_column(month_col):
     raw = F.trim(month_col.cast("string"))
@@ -262,7 +123,6 @@ def month_from_business_column(month_col):
         F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
     )
 
-
 def union_non_null(*dfs):
     valid = [df for df in dfs if df is not None]
     if not valid:
@@ -272,1727 +132,178 @@ def union_non_null(*dfs):
         out = out.unionByName(df, allowMissingColumns=True)
     return out
 
-
-# ── Pipeline base transformation ─────────────────────────────────────────────
-
 def base_tag(df, required_cols: list):
     df = ensure_required_columns(df, required_cols)
     df = ensure_row_id(df)
-    df = (
+    return (
         df
-        .withColumn("invoice_ref_clean",  F.trim(F.col("Invoice Reference")))
-        .withColumn("cat_clean",          F.trim(F.upper(F.col("JE Category"))))
+        .withColumn("invoice_ref_clean", F.trim(F.col("Invoice Reference")))
+        .withColumn("cat_clean", F.trim(F.upper(F.col("JE Category"))))
         .withColumn("company_desc_clean", F.trim(F.upper(F.col("Company Description"))))
-        .withColumn("vendor_num_clean",   F.trim(F.col("Vendor/Customer Number").cast("string")))
-        .withColumn("eff_dt",             to_date_clean("Default Effective Date"))
+        .withColumn("vendor_num_clean", F.trim(F.col("Vendor/Customer Number").cast("string")))
+        .withColumn("eff_dt", to_date_clean("Default Effective Date"))
         .withColumn("Default Effective Date", F.col("eff_dt"))
-        .withColumn("Source Quarter",     F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
-        .withColumn("Year Flag",          F.concat(F.lit("FY"), F.date_format(F.col("eff_dt"), "yy")))
-        .withColumn("month_dt",           month_from_business_column(F.col("Month")))
-        .withColumn("entered_net_dec",    to_decimal_clean("Net Entered"))
-        .withColumn("abs_entered_dec",    F.abs(F.col("entered_net_dec")))
-        .withColumn("abs_entered_key",    F.col("abs_entered_dec").cast("string"))
-        .withColumn("valid_company_desc",
-            F.col("company_desc_clean").isNotNull() & (F.col("company_desc_clean") != ""))
-        .withColumn("valid_vendor_num",
-            F.col("vendor_num_clean").isNotNull() & (F.col("vendor_num_clean") != ""))
+        .withColumn("Source Quarter", F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
+        .withColumn("Year Flag", F.concat(F.lit("FY"), F.date_format(F.col("eff_dt"), "yy")))
+        .withColumn("month_dt", month_from_business_column(F.col("Month")))
+        .withColumn("entered_net_dec", to_decimal_clean("Net Entered"))
+        .withColumn("abs_entered_dec", F.abs(F.col("entered_net_dec")))
+        .withColumn("abs_entered_key", F.col("abs_entered_dec").cast("string"))
+        .withColumn("valid_company_desc", F.col("company_desc_clean").isNotNull() & (F.col("company_desc_clean") != ""))
+        .withColumn("valid_vendor_num", F.col("vendor_num_clean").isNotNull() & (F.col("vendor_num_clean") != ""))
         .withColumn("primary_key",
             F.when(
-                F.col("valid_company_desc")
-                & F.col("valid_vendor_num")
-                & F.col("abs_entered_dec").isNotNull(),
-                F.concat_ws("_",
-                    F.col("company_desc_clean"),
-                    F.col("vendor_num_clean"),
-                    F.col("abs_entered_key"),
-                ),
+                F.col("valid_company_desc") & F.col("valid_vendor_num") & F.col("abs_entered_dec").isNotNull(),
+                F.concat_ws("_", F.col("company_desc_clean"), F.col("vendor_num_clean"), F.col("abs_entered_key")),
             )
         )
         .withColumn("is_valid_row",
-            F.col("row_id").isNotNull()
-            & F.col("entered_net_dec").isNotNull()
-            & F.col("eff_dt").isNotNull()
-            & F.col("month_dt").isNotNull()
-            & F.col("primary_key").isNotNull()
+            F.col("row_id").isNotNull() & F.col("entered_net_dec").isNotNull() &
+            F.col("eff_dt").isNotNull() & F.col("month_dt").isNotNull() & F.col("primary_key").isNotNull()
         )
     )
-    return df
-
-
-# ── Matching helpers ──────────────────────────────────────────────────────────
 
 def make_sales(src_df, pk_col: str = "primary_key"):
-    return (
-        src_df.filter(F.col("cat_clean") == "SALES INVOICES")
-        .select(
-            F.col(pk_col).alias("primary_key"),
-            F.col("row_id").alias("sales_row_id"),
-            F.col("entered_net_dec").alias("sales_amt"),
-            F.col("eff_dt").alias("sales_eff_dt"),
-            F.col("month_dt").alias("sales_month"),
-            F.col("invoice_ref_clean").alias("sales_ref"),
-        )
+    return src_df.filter(F.col("cat_clean") == "SALES INVOICES").select(
+        F.col(pk_col).alias("primary_key"), F.col("row_id").alias("sales_row_id"),
+        F.col("entered_net_dec").alias("sales_amt"), F.col("eff_dt").alias("sales_eff_dt"),
+        F.col("month_dt").alias("sales_month"), F.col("invoice_ref_clean").alias("sales_ref"),
     )
-
 
 def make_credit(src_df, pk_col: str = "primary_key"):
-    return (
-        src_df.filter(F.col("cat_clean") == "CREDIT MEMOS")
-        .select(
-            F.col(pk_col).alias("primary_key"),
-            F.col("row_id").alias("credit_row_id"),
-            F.col("entered_net_dec").alias("credit_amt"),
-            F.col("eff_dt").alias("credit_eff_dt"),
-            F.col("month_dt").alias("credit_month"),
-            F.col("invoice_ref_clean").alias("credit_ref"),
-        )
+    return src_df.filter(F.col("cat_clean") == "CREDIT MEMOS").select(
+        F.col(pk_col).alias("primary_key"), F.col("row_id").alias("credit_row_id"),
+        F.col("entered_net_dec").alias("credit_amt"), F.col("eff_dt").alias("credit_eff_dt"),
+        F.col("month_dt").alias("credit_month"), F.col("invoice_ref_clean").alias("credit_ref"),
     )
 
-
-def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df,
-                         name: str, stage_path: str = None):
+def build_unmatched_rows(base_df, rem_sales_df, rem_credit_df, name: str, stage_path: str = None):
     remaining_ids = (
         rem_sales_df.select(F.col("sales_row_id").alias("row_id"))
         .unionByName(rem_credit_df.select(F.col("credit_row_id").alias("row_id")))
         .distinct()
     )
-    unmatched = base_df.join(remaining_ids, on="row_id", how="inner")
-    return materialize_df(unmatched, name, "primary_key", stage_path=stage_path)
+    return materialize_df(base_df.join(remaining_ids, on="row_id", how="inner"), name, "primary_key", stage_path=stage_path)
 
-
-def resolve_to_original(pairs_df, base_df, match_label: str,
-                        stage_name: str, stage_path: str = None,
-                        has_year_flag: bool = False):
+def resolve_to_original(pairs_df, base_df, match_label: str, stage_name: str, stage_path: str = None, has_year_flag: bool = False):
     if pairs_df is None:
         return None
-
-    w_pair = Window.orderBy(
-        F.col("primary_key").asc(),
-        F.col("sales_row_id").asc(),
-        F.col("credit_row_id").asc(),
-    )
-
-    pairs_with_id = (
-        pairs_df
-        .withColumn(
-            "pair_id",
-            F.concat(
-                F.lit(f"{match_label}_"),
-                F.row_number().over(w_pair).cast("string"),
-            ),
-        )
-        .select("pair_id", "sales_row_id", "credit_row_id", "match_type")
-    )
+    w_pair = Window.orderBy(F.col("primary_key").asc(), F.col("sales_row_id").asc(), F.col("credit_row_id").asc())
+    pairs_with_id = pairs_df.withColumn("pair_id", F.concat(F.lit(f"{match_label}_"), F.row_number().over(w_pair).cast("string"))).select("pair_id", "sales_row_id", "credit_row_id", "match_type")
 
     if has_year_flag:
-        yf_sales  = base_df.select(
-            F.col("row_id").alias("sales_row_id"),
-            F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("sales_year_flag"),
-            F.upper(F.trim(F.col("Source Quarter").cast("string"))).alias("sales_quarter_flag"),
-        )
-        yf_credit = base_df.select(
-            F.col("row_id").alias("credit_row_id"),
-            F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("credit_year_flag"),
-            F.upper(F.trim(F.col("Source Quarter").cast("string"))).alias("credit_quarter_flag"),
-        )
-        _sales_cy_py  = F.when(F.col("sales_year_flag")  == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
+        yf_sales = base_df.select(F.col("row_id").alias("sales_row_id"), F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("sales_year_flag"))
+        yf_credit = base_df.select(F.col("row_id").alias("credit_row_id"), F.upper(F.trim(F.col("Year Flag").cast("string"))).alias("credit_year_flag"))
+        _sales_cy_py = F.when(F.col("sales_year_flag") == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
         _credit_cy_py = F.when(F.col("credit_year_flag") == CURRENT_FY, F.lit("CY")).otherwise(F.lit("PY"))
+        pairs_with_id = pairs_with_id.join(yf_sales, on="sales_row_id", how="left").join(yf_credit, on="credit_row_id", how="left").withColumn(
+            "Year Pair Flag",
+            F.when(F.col("sales_year_flag").isNull() | F.col("credit_year_flag").isNull(), F.lit("Unknown"))
+            .otherwise(F.concat(_sales_cy_py, F.lit(" Sales Inv with "), _credit_cy_py, F.lit(" Credit Memo")))
+        ).select("pair_id", "sales_row_id", "credit_row_id", "match_type", "Year Pair Flag")
 
-        pairs_with_id = (
-            pairs_with_id
-            .join(yf_sales,  on="sales_row_id",  how="left")
-            .join(yf_credit, on="credit_row_id", how="left")
-            .withColumn(
-                "Year Pair Flag",
-                F.when(
-                    F.col("sales_year_flag").isNull() | F.col("credit_year_flag").isNull(),
-                    F.lit("Unknown"),
-                ).otherwise(
-                    F.concat(_sales_cy_py, F.lit(" Sales Inv with "), _credit_cy_py, F.lit(" Credit Memo"))
-                )
-            )
-            .select("pair_id", "sales_row_id", "credit_row_id", "match_type", "Year Pair Flag")
-        )
-
-    orig_cols  = [F.col(f"orig.`{c}`") for c in base_df.columns]
+    orig_cols = [F.col(f"orig.`{c}`") for c in base_df.columns]
     extra_meta = ["pair_id", "match_type"] + (["Year Pair Flag"] if has_year_flag else [])
-    meta_cols  = [F.col(c) for c in extra_meta if c not in base_df.columns]
+    meta_cols = [F.col(c) for c in extra_meta if c not in base_df.columns]
 
-    sales_side = (
-        pairs_with_id
-        .join(base_df.alias("orig"),
-              pairs_with_id["sales_row_id"] == F.col("orig.row_id"), "inner")
-        .select(*meta_cols, *orig_cols)
-    )
-    credit_side = (
-        pairs_with_id
-        .join(base_df.alias("orig"),
-              pairs_with_id["credit_row_id"] == F.col("orig.row_id"), "inner")
-        .select(*meta_cols, *orig_cols)
-    )
+    sales_side = pairs_with_id.join(base_df.alias("orig"), pairs_with_id["sales_row_id"] == F.col("orig.row_id"), "inner").select(*meta_cols, *orig_cols)
+    credit_side = pairs_with_id.join(base_df.alias("orig"), pairs_with_id["credit_row_id"] == F.col("orig.row_id"), "inner").select(*meta_cols, *orig_cols)
+    return materialize_df(sales_side.unionByName(credit_side), stage_name, "primary_key", stage_path=stage_path)
 
-    resolved = sales_side.unionByName(credit_side)
-    return materialize_df(resolved, stage_name, "primary_key", stage_path=stage_path)
-
+def _is_last_day_of_month(d: datetime.date) -> bool:
+    return d.day == calendar.monthrange(d.year, d.month)[1]
 
 def _spark_months_between_int(d_credit: datetime.date, d_sales: datetime.date) -> int:
-    """
-    Exact Python equivalent of Spark's F.months_between(credit_month, sales_month).cast("int").
-    """
     if not d_credit or not d_sales:
         return -9999
-    if d_credit.day == d_sales.day:
-        return (d_credit.year - d_sales.year) * 12 + (d_credit.month - d_sales.month)
-    diff = (d_credit.year - d_sales.year) * 12 + (d_credit.month - d_sales.month) + (d_credit.day - d_sales.day) / 31.0
-    return int(diff)
+    month_diff = (d_credit.year - d_sales.year) * 12 + (d_credit.month - d_sales.month)
+    if d_credit.day == d_sales.day or (_is_last_day_of_month(d_credit) and _is_last_day_of_month(d_sales)):
+        return int(month_diff)
+    return int(round(month_diff + (d_credit.day - d_sales.day) / 31.0, 8))
 
-
-def fast_in_memory_exhaustive_match(sales_df, credit_df, match_label: str,
-                                    base_df, stage_path: str = None,
-                                    has_year_flag: bool = False):
-    """
-    Serverless-safe replacement for rank_based_match() + exhaustive_match().
-    - Zero dbutils.fs calls
-    - Zero intermediate Parquet writes inside the iterative loop
-    - Executes the exact same iterative mutual-best-match (rn_sales == 1 AND rn_credit == 1)
-      logic in Python driver memory on lightweight row keys, discovering 100% of multi-pass
-      pairs in a single step.
-    """
-    print(f"\n[EXHAUSTIVE MATCH] {match_label} (In-Memory Coordinator)")
-
-    # 1. Narrow to PKs present on both sides to minimize driver collect
-    common_pks = (
-        sales_df.select("primary_key").distinct()
-        .join(credit_df.select("primary_key").distinct(), on="primary_key", how="inner")
-    )
-
-    s_rows = (
-        sales_df.join(common_pks, on="primary_key", how="inner")
-        .select("primary_key", "sales_row_id", "sales_amt", "sales_eff_dt", "sales_month")
-        .collect()
-    )
-    c_rows = (
-        credit_df.join(common_pks, on="primary_key", how="inner")
-        .select("primary_key", "credit_row_id", "credit_amt", "credit_eff_dt", "credit_month")
-        .collect()
-    )
+def fast_in_memory_exhaustive_match(sales_df, credit_df, match_label: str, base_df, stage_path: str = None, has_year_flag: bool = False):
+    print(f"\n[EXHAUSTIVE MATCH] {match_label} (Exact-Parity In-Memory Coordinator)")
+    common_pks = sales_df.select("primary_key").distinct().join(credit_df.select("primary_key").distinct(), on="primary_key", how="inner")
+    s_rows = sales_df.join(common_pks, on="primary_key", how="inner").select("primary_key", "sales_row_id", "sales_amt", "sales_eff_dt", "sales_month").dropDuplicates(["sales_row_id"]).collect()
+    c_rows = credit_df.join(common_pks, on="primary_key", how="inner").select("primary_key", "credit_row_id", "credit_amt", "credit_eff_dt", "credit_month").dropDuplicates(["credit_row_id"]).collect()
 
     if not s_rows or not c_rows:
         display_metric(f"[{match_label}] Total pairs", 0)
         return None, sales_df, credit_df
 
-    # 2. Group by primary_key in memory
-    s_by_pk = defaultdict(list)
-    for r in s_rows:
-        s_by_pk[r["primary_key"]].append(r)
-
-    c_by_pk = defaultdict(list)
-    for r in c_rows:
-        c_by_pk[r["primary_key"]].append(r)
+    s_by_pk, c_by_pk = defaultdict(list), defaultdict(list)
+    for r in s_rows: s_by_pk[r["primary_key"]].append(r)
+    for r in c_rows: c_by_pk[r["primary_key"]].append(r)
 
     confirmed_pairs = []
-
-    # 3. Exhaustive mutual-best-match loop per PK
     for pk, s_list in s_by_pk.items():
         c_list = c_by_pk.get(pk, [])
-        if not c_list:
-            continue
-
-        used_s = set()
-        used_c = set()
-
+        if not c_list: continue
+        used_s, used_c = set(), set()
         while True:
-            best_for_s = {}
-            best_for_c = {}
-
+            rn_sales_1_survivors = []
             for s in s_list:
                 s_id = s["sales_row_id"]
-                if s_id in used_s:
-                    continue
-                s_eff = s["sales_eff_dt"]
-                s_amt = s["sales_amt"]
-                s_mon = s["sales_month"]
-
+                if s_id in used_s: continue
+                s_eff, s_amt, s_mon = s["sales_eff_dt"], s["sales_amt"], s["sales_month"]
+                best_s_key, best_candidate = None, None
                 for c in c_list:
                     c_id = c["credit_row_id"]
-                    if c_id in used_c:
-                        continue
+                    if c_id in used_c: continue
                     c_eff = c["credit_eff_dt"]
-
-                    if s_eff is None or c_eff is None or s_eff > c_eff:
-                        continue
-
+                    if not s_eff or not c_eff or s_eff > c_eff: continue
                     amt_diff = abs(s_amt + c["credit_amt"])
-                    if amt_diff != 0:
-                        continue
-
+                    if amt_diff != 0: continue
                     m_lag = _spark_months_between_int(c["credit_month"], s_mon)
+                    if match_label == "NEXT_MONTH_EXACT" and m_lag != 1: continue
+                    elif match_label == "SAME_MONTH_EXACT" and m_lag != 0: continue
+                    elif match_label == "LAG_1_2_MONTH" and not (1 <= m_lag <= 2): continue
+                    elif match_label == "LAG_GT_2_MONTH" and not (m_lag > 2): continue
 
-                    if match_label == "NEXT_MONTH_EXACT" and m_lag != 1:
-                        continue
-                    elif match_label == "SAME_MONTH_EXACT" and m_lag != 0:
-                        continue
-                    elif match_label == "LAG_1_2_MONTH" and not (1 <= m_lag <= 2):
-                        continue
-                    elif match_label == "LAG_GT_2_MONTH" and not (m_lag > 2):
-                        continue
+                    s_rank_key = (amt_diff, m_lag, c_eff, str(c_id))
+                    if best_s_key is None or s_rank_key < best_s_key:
+                        best_s_key = s_rank_key
+                        best_candidate = (s, c, amt_diff, m_lag)
+                if best_candidate: rn_sales_1_survivors.append(best_candidate)
 
-                    # Mirror w_sales and w_credit window ordering exactly
-                    s_rank_key = (amt_diff, m_lag, c_eff, c_id)
-                    c_rank_key = (amt_diff, m_lag, s_eff, s_id)
+            if not rn_sales_1_survivors: break
 
-                    if s_id not in best_for_s or s_rank_key < best_for_s[s_id][0]:
-                        best_for_s[s_id] = (s_rank_key, c_id)
-                    if c_id not in best_for_c or c_rank_key < best_for_c[c_id][0]:
-                        best_for_c[c_id] = (c_rank_key, s_id)
+            best_for_c = {}
+            for s, c, amt_diff, m_lag in rn_sales_1_survivors:
+                s_id, c_id, s_eff = s["sales_row_id"], c["credit_row_id"], s["sales_eff_dt"]
+                c_rank_key = (amt_diff, m_lag, s_eff, str(s_id))
+                if c_id not in best_for_c or c_rank_key < best_for_c[c_id][0]:
+                    best_for_c[c_id] = (c_rank_key, s_id)
 
             new_matches = 0
-            for s_id, (_, target_c_id) in best_for_s.items():
-                if target_c_id in best_for_c and best_for_c[target_c_id][1] == s_id:
-                    confirmed_pairs.append((pk, s_id, target_c_id, match_label))
-                    used_s.add(s_id)
-                    used_c.add(target_c_id)
-                    new_matches += 1
-
-            if new_matches == 0:
-                break
+            for c_id, (_, winning_s_id) in best_for_c.items():
+                confirmed_pairs.append((pk, winning_s_id, c_id, match_label))
+                used_s.add(winning_s_id)
+                used_c.add(c_id)
+                new_matches += 1
+            if new_matches == 0: break
 
     total_pairs = len(confirmed_pairs)
     display_metric(f"[{match_label}] Total pairs", total_pairs)
+    if total_pairs == 0: return None, sales_df, credit_df
 
-    if total_pairs == 0:
-        return None, sales_df, credit_df
-
-    # 4. Convert confirmed pairs back to a Spark DataFrame
-    pairs_schema = T.StructType([
-        T.StructField("primary_key",   T.StringType()),
-        T.StructField("sales_row_id",  T.StringType()),
-        T.StructField("credit_row_id", T.StringType()),
-        T.StructField("match_type",    T.StringType()),
-    ])
-    slim_all = spark.createDataFrame(confirmed_pairs, schema=pairs_schema)
-
+    slim_all = spark.createDataFrame(confirmed_pairs, schema=["primary_key", "sales_row_id", "credit_row_id", "match_type"])
     matched_s_ids = slim_all.select("sales_row_id").distinct()
     matched_c_ids = slim_all.select("credit_row_id").distinct()
-
-    rem_sales  = sales_df.join(matched_s_ids,  on="sales_row_id",  how="left_anti")
+    rem_sales = sales_df.join(matched_s_ids, on="sales_row_id", how="left_anti")
     rem_credit = credit_df.join(matched_c_ids, on="credit_row_id", how="left_anti")
-
-    resolved = resolve_to_original(
-        slim_all, base_df, match_label,
-        f"RESOLVED_{match_label}", stage_path, has_year_flag,
-    )
-
-    debug_count(f"[{match_label}] Resolved rows",    resolved)
-    debug_count(f"[{match_label}] Remaining sales",  rem_sales)
-    debug_count(f"[{match_label}] Remaining credit", rem_credit)
-
+    resolved = resolve_to_original(slim_all, base_df, match_label, f"RESOLVED_{match_label}", stage_path, has_year_flag)
     return resolved, rem_sales, rem_credit
 
-# COMMAND ----------
+MATCH_STEPS = [("NEXT_MONTH_EXACT", None), ("SAME_MONTH_EXACT", None), ("LAG_1_2_MONTH", None)]
+LAG_GT_2_STEPS = [("LAG_GT_2_MONTH", None)]
 
-# DBTITLE 1,Utility Function AA Comment Logic
-# =============================================================================
-# CELL 3B — AA COMMENT LOGIC & MATCH STEP CONFIG
-# =============================================================================
-
-def assign_aa_comment(df, raw_df, oto_df=None,
-                      small_amt_threshold: float = SMALL_AMT_MAX):
-    if "abs_entered_dec" not in df.columns:
-        df = df.withColumn("abs_entered_dec", F.abs(to_decimal_clean("Net Entered")))
-    if "eff_dt" not in df.columns:
-        df = df.withColumn("eff_dt", to_date_clean("Default Effective Date"))
-    if "vendor_num_clean" not in df.columns:
-        df = df.withColumn("vendor_num_clean",
-                           F.trim(F.col("Vendor/Customer Number").cast("string")))
-    if "company_desc_clean" not in df.columns:
-        df = df.withColumn("company_desc_clean",
-                           F.trim(F.upper(F.col("Company Description"))))
-    if "entered_net_dec" not in df.columns:
-        df = df.withColumn("entered_net_dec", to_decimal_clean("Net Entered"))
-    if "cat_clean" not in df.columns:
-        df = df.withColumn("cat_clean", F.trim(F.upper(F.col("JE Category"))))
-
-    otm_expr      = F.col("match_type") == "ONE_TO_MANY"
-    sync_expr     = F.col("match_type") == "ONE_TO_ONE_DATE_SYNC"
-    unsync_expr   = F.col("match_type") == "ONE_TO_ONE_DATE_UNSYNC"
-    no_match_expr = F.col("match_type") == "NO_MATCH_FOUND"
-
-    _no_match_cm  = no_match_expr & (F.col("cat_clean") == "CREDIT MEMOS")
-
-    if oto_df is not None:
-        oto_lookup = (
-            oto_df.select(
-                F.col("sales_row_id").alias("row_id"),
-                F.col("amount_net").cast(DECIMAL_TYPE).alias("_pair_net_abs"),
-            ).unionByName(
-                oto_df.select(
-                    F.col("credit_row_id").alias("row_id"),
-                    F.col("amount_net").cast(DECIMAL_TYPE).alias("_pair_net_abs"),
-                )
-            ).distinct()
-        )
-        df = df.join(oto_lookup, on="row_id", how="left")
-        _exact_cancel = (
-            F.col("_pair_net_abs").isNotNull()
-            & (F.col("_pair_net_abs") == EXACT_ZERO)
-        )
-    else:
-        df = df.withColumn("_pair_net_abs", F.lit(None).cast(DECIMAL_TYPE))
-        _exact_cancel = F.lit(False)
-
-    # ── Rule Group 1: ONE_TO_MANY ────────────────────────────────────────────
-    df = df.withColumn("AA Comment",
-        F.when(otm_expr, F.lit(AA_ONE_TO_MANY))
-         .otherwise(F.lit(None).cast("string"))
-    ).withColumn("AA Rule",
-        F.when(otm_expr, F.lit("Rule1_OTM"))
-         .otherwise(F.lit(None).cast("string"))
-    )
-
-    # ── Rule Group 2a: DATE_SYNC — exact or approx ──────────────────────────
-    df = df.withColumn("AA Comment",
-        F.when(
-            F.col("AA Comment").isNull() & sync_expr & _exact_cancel,
-            F.lit(AA_EXACT_MATCH_SYNC),
-        ).when(
-            F.col("AA Comment").isNull() & sync_expr,
-            F.lit(AA_APPROX_MATCH),
-        ).otherwise(F.col("AA Comment"))
-    ).withColumn("AA Rule",
-        F.when(F.col("AA Rule").isNull() & sync_expr & _exact_cancel,
-               F.lit("Rule2a_DateSync_ExactMatch"))
-         .when(F.col("AA Rule").isNull() & sync_expr,
-               F.lit("Rule2a_DateSync_ApproxMatch"))
-         .otherwise(F.col("AA Rule"))
-    )
-
-    # ── Rule Group 2b: DATE_UNSYNC — exact or approx ────────────────────────
-    df = df.withColumn("AA Comment",
-        F.when(
-            F.col("AA Comment").isNull() & unsync_expr & _exact_cancel,
-            F.lit(AA_EXACT_MATCH_UNSYNC),
-        ).when(
-            F.col("AA Comment").isNull() & unsync_expr,
-            F.lit(AA_APPROX_MATCH),
-        ).otherwise(F.col("AA Comment"))
-    ).withColumn("AA Rule",
-        F.when(F.col("AA Rule").isNull() & unsync_expr & _exact_cancel,
-               F.lit("Rule2b_DateUnsync_ExactMatch"))
-         .when(F.col("AA Rule").isNull() & unsync_expr,
-               F.lit("Rule2b_DateUnsync_ApproxMatch"))
-         .otherwise(F.col("AA Rule"))
-    )
-
-    # ── Rule Group 3: NO_MATCH_FOUND — COMPANY+VENDOR composite-key stats ──
-    vendor_stats = (
-        raw_df
-        .withColumn("_co_clean", F.trim(F.upper(F.col("Company Description"))))
-        .withColumn("_vn_clean", F.trim(F.col("Vendor/Customer Number").cast("string")))
-        .withColumn("_cat",      F.trim(F.upper(F.col("JE Category"))))
-        .groupBy("_co_clean", "_vn_clean")
-        .agg(
-            F.countDistinct(
-                F.when(F.col("_cat") == "SALES INVOICES", F.col("Invoice Reference"))
-            ).alias("sales_inv_count"),
-            F.countDistinct(
-                F.when(F.col("_cat") == "CREDIT MEMOS", F.col("Invoice Reference"))
-            ).alias("credit_memo_count"),
-        )
-    )
-
-    debug_count(
-        "[AA Rule Group 3] Distinct Company+Vendor combinations (composite key stats)",
-        vendor_stats,
-    )
-
-    df = (
-        df.join(
-            vendor_stats
-                .withColumnRenamed("_co_clean", "_co_join")
-                .withColumnRenamed("_vn_clean", "_vn_join"),
-            (df["company_desc_clean"] == F.col("_co_join"))
-            & (df["vendor_num_clean"] == F.col("_vn_join")),
-            "left",
-        )
-        .drop("_co_join", "_vn_join")
-    )
-
-    # Priority 1 — company+vendor combo has ONLY credit memos, zero sales invoices
-    df = df.withColumn("AA Comment",
-        F.when(
-            F.col("AA Comment").isNull()
-            & _no_match_cm
-            & (F.col("sales_inv_count") == 0)
-            & (F.col("credit_memo_count") > 0),
-            F.lit(AA_ONLY_CREDITS),
-        ).otherwise(F.col("AA Comment"))
-    ).withColumn("AA Rule",
-        F.when(
-            F.col("AA Rule").isNull() & _no_match_cm
-            & (F.col("sales_inv_count") == 0) & (F.col("credit_memo_count") > 0),
-            F.lit("Rule3P1_OnlyCredits_CompanyVendor"),
-        ).otherwise(F.col("AA Rule"))
-    )
-
-    # Priority 4 — catch-all
-    df = df.withColumn("AA Comment",
-        F.when(
-            F.col("AA Comment").isNull() & _no_match_cm,
-            F.lit(AA_CLIENT_CONFIRM),
-        ).otherwise(F.col("AA Comment"))
-    ).withColumn("AA Rule",
-        F.when(
-            F.col("AA Rule").isNull() & _no_match_cm,
-            F.lit("Rule3P4_ClientConfirm"),
-        ).otherwise(F.col("AA Rule"))
-    )
-
-    return df.drop("_pair_net_abs", "sales_inv_count", "credit_memo_count")
-
-
-MATCH_STEPS = [
-    ("NEXT_MONTH_EXACT", None),
-    ("SAME_MONTH_EXACT", None),
-    ("LAG_1_2_MONTH",    None),
-]
-
-LAG_GT_2_STEPS = [
-    ("LAG_GT_2_MONTH",   None),
-]
-
-
-def run_match_pipeline(sales_df, credit_df, base_df,
-                       steps: list, stage_path: str,
-                       has_year_flag: bool = False):
-    resolved_datasets = []
-    cur_s, cur_c = sales_df, credit_df
-
+def run_match_pipeline(sales_df, credit_df, base_df, steps: list, stage_path: str, has_year_flag: bool = False):
+    resolved_datasets, cur_s, cur_c = [], sales_df, credit_df
     for match_label, _ in steps:
-        resolved, cur_s, cur_c = fast_in_memory_exhaustive_match(
-            cur_s, cur_c, match_label,
-            base_df, stage_path=stage_path, has_year_flag=has_year_flag,
-        )
+        resolved, cur_s, cur_c = fast_in_memory_exhaustive_match(cur_s, cur_c, match_label, base_df, stage_path=stage_path, has_year_flag=has_year_flag)
         resolved_datasets.append((match_label, resolved))
-
     return resolved_datasets, cur_s, cur_c
 
-print("[UTIL] All serverless-optimized utility functions loaded.")
 
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 1 : Current Quarter Exact Match
-# =============================================================================
-# CELL 4 — PIPELINE 1: CY Sales Invoice ↔ Credit Memo matching
-# =============================================================================
-print("\n" + "="*70)
-print("PIPELINE 1 — CY Sales Invoice ↔ Credit Memo matching")
-print("="*70)
-
-debug_count("P1 Raw row count", JE_raw)
-
-print("\n[P1-S1] Base prep...")
-
-je_tagged = base_tag(JE_raw, BASE_RAW_COLUMNS)
-
-P1_INVALID = materialize_df(
-    je_tagged.filter(~F.col("is_valid_row"))
-             .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P1_INVALID_PREP_ROWS", "row_id", stage_path=STAGE_PATH_P1,
-)
-je_prep = materialize_df(
-    je_tagged.filter(F.col("is_valid_row"))
-             .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P1_je_prep", "primary_key", stage_path=STAGE_PATH_P1,
-)
-
-debug_count("P1 Invalid prep rows", P1_INVALID)
-debug_count("P1 Valid prep rows",   je_prep)
-debug_group_count(je_prep, "cat_clean", "P1 JE Category distribution")
-
-print("\n[P1-S2] Splitting on blank invoice reference...")
-
-_blank     = F.col("invoice_ref_clean").isNull() | (F.trim(F.col("invoice_ref_clean")) == "")
-
-P1_EXC_1   = materialize_df(je_prep.filter(_blank),  "P1_DATASET_EXC_1", "primary_key", stage_path=STAGE_PATH_P1)
-je_working = materialize_df(je_prep.filter(~_blank), "P1_je_working",    "primary_key", stage_path=STAGE_PATH_P1)
-
-debug_count("P1 EXC_1 (blank invoice ref)",  P1_EXC_1)
-debug_count("P1 Working (non-blank invoice)", je_working)
-
-print("\n[P1-S3] Classifying by PK cardinality...")
-
-_pk_cnt    = Window.partitionBy("primary_key")
-je_counted = je_working.withColumn("pk_row_count", F.count("*").over(_pk_cnt))
-
-_unique  = je_counted.filter(F.col("pk_row_count") == 1)
-_dup     = je_counted.filter(F.col("pk_row_count") > 1)
-
-P1_UNIQUE_OTHER = materialize_df(
-    _unique.filter(~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")),
-    "P1_UNIQUE_OTHER", "primary_key", stage_path=STAGE_PATH_P1,
-)
-P1_UNIQUE_SALES = materialize_df(
-    _unique.filter(F.col("cat_clean") == "SALES INVOICES"),
-    "P1_UNIQUE_SALES", "primary_key", stage_path=STAGE_PATH_P1,
-)
-P1_UNIQUE_CREDITS = materialize_df(
-    _unique.filter(F.col("cat_clean") == "CREDIT MEMOS"),
-    "P1_UNIQUE_CREDITS", "primary_key", stage_path=STAGE_PATH_P1,
-)
-P1_DUP_OTHER_OR_ZERO = materialize_df(
-    _dup.filter(
-        (~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-        | (F.col("entered_net_dec") == EXACT_ZERO)
-    ),
-    "P1_DUP_OTHER_OR_ZERO", "primary_key", stage_path=STAGE_PATH_P1,
-)
-P1_DUP_SI_CM = materialize_df(
-    _dup.filter(F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-        .filter(F.col("entered_net_dec") != EXACT_ZERO),
-    "P1_DUP_SI_CM", "primary_key", stage_path=STAGE_PATH_P1,
-)
-
-debug_count("P1_UNIQUE_OTHER",       P1_UNIQUE_OTHER)
-debug_count("P1_UNIQUE_SALES",       P1_UNIQUE_SALES)
-debug_count("P1_UNIQUE_CREDITS",     P1_UNIQUE_CREDITS)
-debug_count("P1_DUP_OTHER_OR_ZERO",  P1_DUP_OTHER_OR_ZERO)
-debug_count("P1_DUP_SI_CM",          P1_DUP_SI_CM)
-
-print("\n[P1-S4] Building sales / credit side tables...")
-
-p1_sales  = materialize_df(make_sales(P1_DUP_SI_CM),  "P1_sales",  stage_path=STAGE_PATH_P1)
-p1_credit = materialize_df(make_credit(P1_DUP_SI_CM), "P1_credit", stage_path=STAGE_PATH_P1)
-
-debug_count("P1 sales_all",  p1_sales)
-debug_count("P1 credit_all", p1_credit)
-
-print("\n[P1-S5-8] Running all match steps...")
-
-p1_resolved_list, p1_rem_sales, p1_rem_credit = run_match_pipeline(
-    p1_sales, p1_credit, P1_DUP_SI_CM, MATCH_STEPS, stage_path=STAGE_PATH_P1, has_year_flag=False
-)
-
-print("\n[P1-S9] Assembling unmatched groups...")
-
-P1_UNMATCHED = build_unmatched_rows(
-    P1_DUP_SI_CM, p1_rem_sales, p1_rem_credit,
-    "P1_REMAIN_UNMATCHED", stage_path=STAGE_PATH_P1,
-)
-
-print("\n[P1-S10] Writing outputs...")
-
-write_table(P1_INVALID,           "P1_INVALID_PREP_ROWS",  base_path=output_path_et)
-write_table(P1_EXC_1,             "P1_DATASET_EXC_1",      base_path=output_path_et)
-write_table(P1_DUP_OTHER_OR_ZERO, "P1_DUP_OTHER_OR_ZERO",  base_path=output_path_et)
-write_table(P1_UNIQUE_OTHER,      "P1_UNIQUE_OTHER",        base_path=output_path_et)
-write_table(P1_UNIQUE_SALES,      "P1_UNIQUE_SALES",        base_path=output_path_et)
-write_table(P1_UNIQUE_CREDITS,    "P1_UNIQUE_CREDITS",      base_path=output_path_et)
-for lbl, df in p1_resolved_list:
-    write_table(df, f"P1_MATCHED_{lbl}",                    base_path=output_path_et)
-write_table(P1_UNMATCHED,         "P1_REMAIN_UNMATCHED",    base_path=output_path_et)
-
-print("\n[P1-S11] === PIPELINE 1 AUDIT ===")
-audit_summary({
-    "P1_INVALID":           P1_INVALID,
-    "P1_EXC_1":             P1_EXC_1,
-    "P1_UNIQUE_OTHER":      P1_UNIQUE_OTHER,
-    "P1_UNIQUE_SALES":      P1_UNIQUE_SALES,
-    "P1_UNIQUE_CREDITS":    P1_UNIQUE_CREDITS,
-    "P1_DUP_OTHER_OR_ZERO": P1_DUP_OTHER_OR_ZERO,
-    **{f"P1_MATCHED_{lbl}": df for lbl, df in p1_resolved_list},
-    "P1_UNMATCHED":         P1_UNMATCHED,
-})
-
-P1_ALL_MATCHED   = union_non_null(*[df for _, df in p1_resolved_list])
-P1_ALL_UNMATCHED = union_non_null(P1_UNIQUE_SALES, P1_UNIQUE_CREDITS, P1_UNMATCHED)
-
-print("\n[P1] Done.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 2 : Exact match Using PY quarter
-# =============================================================================
-# CELL 5 — PIPELINE 2: Cross-year matching (CY unmatched + PY carry-forward)
-# =============================================================================
-print("\n" + "="*70)
-print("PIPELINE 2 — Cross-year matching (CY unmatched + PY carry-forward)")
-print("="*70)
-
-_P1_DROP = [
-    "row_id", "invoice_ref_clean", "cat_clean", "company_desc_clean",
-    "vendor_num_clean", "eff_dt", "month_dt", "entered_net_dec",
-    "abs_entered_dec", "abs_entered_key", "primary_key", "pk_row_count", "abs_usd_net",
-]
-_RENAME = {"Entered Net": "Net Entered", "USD Net": "USD NET"}
-
-
-def align_to_raw(df, drop_cols, rename_map, target_cols):
-    df = df.drop(*[c for c in drop_cols if c in df.columns])
-    for old, new in rename_map.items():
-        if old in df.columns:
-            df = df.withColumnRenamed(old, new)
-    return df.select(*[c for c in target_cols if c in df.columns])
-
-
-cy_unmatched = align_to_raw(P1_ALL_UNMATCHED, _P1_DROP, _RENAME, BASE_RAW_COLUMNS)
-
-if HAS_CF:
-    JE_raw_pipe2 = cy_unmatched.unionByName(JE_raw_2_aligned, allowMissingColumns=True)
-    debug_count("P2-S0 Combined input (current + carry-forward)", JE_raw_pipe2)
-else:
-    JE_raw_pipe2 = cy_unmatched
-    debug_count("P2-S0 Current unmatched only (no carry-forward)", JE_raw_pipe2)
-
-print("\n[P2-S1] Base prep...")
-
-je_tagged_p2 = base_tag(JE_raw_pipe2, PIPE2_RAW_COLUMNS)
-
-P2_INVALID = materialize_df(
-    je_tagged_p2.filter(~F.col("is_valid_row"))
-                .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P2_INVALID_PREP_ROWS", "row_id", stage_path=STAGE_PATH_P2,
-)
-je_prep_p2 = materialize_df(
-    je_tagged_p2.filter(F.col("is_valid_row"))
-                .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P2_je_prep", "primary_key", stage_path=STAGE_PATH_P2,
-)
-
-debug_count("P2 Invalid",    P2_INVALID)
-debug_count("P2 Valid prep", je_prep_p2)
-
-print("\n[P2-S2] Blank invoice reference split...")
-
-P2_EXC_1   = materialize_df(je_prep_p2.filter(_blank),  "P2_EXC_1",      "primary_key", stage_path=STAGE_PATH_P2)
-je_work_p2 = materialize_df(je_prep_p2.filter(~_blank), "P2_je_working", "primary_key", stage_path=STAGE_PATH_P2)
-
-debug_count("P2 EXC_1",   P2_EXC_1)
-debug_count("P2 Working", je_work_p2)
-
-print("\n[P2-S3] Classifying by PK cardinality...")
-
-_pk_cnt_p2    = Window.partitionBy("primary_key")
-je_counted_p2 = je_work_p2.withColumn("pk_row_count", F.count("*").over(_pk_cnt_p2))
-
-_unique_p2 = je_counted_p2.filter(F.col("pk_row_count") == 1)
-_dup_p2    = je_counted_p2.filter(F.col("pk_row_count") > 1)
-
-P2_UNIQUE_OTHER = materialize_df(
-    _unique_p2.filter(~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")),
-    "P2_UNIQUE_OTHER", "primary_key", stage_path=STAGE_PATH_P2,
-)
-P2_UNIQUE_SALES = materialize_df(
-    _unique_p2.filter(F.col("cat_clean") == "SALES INVOICES"),
-    "P2_UNIQUE_SALES", "primary_key", stage_path=STAGE_PATH_P2,
-)
-P2_UNIQUE_CREDITS = materialize_df(
-    _unique_p2.filter(F.col("cat_clean") == "CREDIT MEMOS"),
-    "P2_UNIQUE_CREDITS", "primary_key", stage_path=STAGE_PATH_P2,
-)
-P2_DUP_OTHER_OR_ZERO = materialize_df(
-    _dup_p2.filter(
-        (~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-        | (F.col("entered_net_dec") == EXACT_ZERO)
-    ),
-    "P2_DUP_OTHER_OR_ZERO", "primary_key", stage_path=STAGE_PATH_P2,
-)
-P2_DUP_SI_CM = materialize_df(
-    _dup_p2.filter(F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-           .filter(F.col("entered_net_dec") != EXACT_ZERO),
-    "P2_DUP_SI_CM", "primary_key", stage_path=STAGE_PATH_P2,
-)
-
-debug_count("P2_UNIQUE_OTHER",       P2_UNIQUE_OTHER)
-debug_count("P2_UNIQUE_SALES",       P2_UNIQUE_SALES)
-debug_count("P2_UNIQUE_CREDITS",     P2_UNIQUE_CREDITS)
-debug_count("P2_DUP_OTHER_OR_ZERO",  P2_DUP_OTHER_OR_ZERO)
-debug_count("P2_DUP_SI_CM",          P2_DUP_SI_CM)
-
-print("\n[P2-S4] Building sales / credit side tables...")
-
-p2_sales  = materialize_df(make_sales(P2_DUP_SI_CM),  "P2_sales",  stage_path=STAGE_PATH_P2)
-p2_credit = materialize_df(make_credit(P2_DUP_SI_CM), "P2_credit", stage_path=STAGE_PATH_P2)
-
-debug_count("P2 sales_all",  p2_sales)
-debug_count("P2 credit_all", p2_credit)
-
-print("\n[P2-S5-8] Running all match steps (with Year Pair Flag)...")
-
-p2_resolved_list, p2_rem_sales, p2_rem_credit = run_match_pipeline(
-    p2_sales, p2_credit, P2_DUP_SI_CM, MATCH_STEPS, stage_path=STAGE_PATH_P2, has_year_flag=True
-)
-
-P2_UNMATCHED = build_unmatched_rows(
-    P2_DUP_SI_CM, p2_rem_sales, p2_rem_credit,
-    "P2_REMAIN_UNMATCHED", stage_path=STAGE_PATH_P2,
-)
-
-print("\n[P2] Writing outputs...")
-
-write_table(P2_INVALID,           "P2_INVALID_PREP_ROWS",  base_path=output_path_et)
-write_table(P2_EXC_1,             "P2_DATASET_EXC_1",      base_path=output_path_et)
-write_table(P2_DUP_OTHER_OR_ZERO, "P2_DUP_OTHER_OR_ZERO",  base_path=output_path_et)
-write_table(P2_UNIQUE_OTHER,      "P2_UNIQUE_OTHER",        base_path=output_path_et)
-write_table(P2_UNIQUE_SALES,      "P2_UNIQUE_SALES",        base_path=output_path_et)
-write_table(P2_UNIQUE_CREDITS,    "P2_UNIQUE_CREDITS",      base_path=output_path_et)
-for lbl, df in p2_resolved_list:
-    write_table(df, f"P2_MATCHED_{lbl}",                    base_path=output_path_et)
-write_table(P2_UNMATCHED,         "P2_REMAIN_UNMATCHED",    base_path=output_path_et)
-
-print("\n[P2] === PIPELINE 2 AUDIT ===")
-audit_summary({
-    "P2_INVALID":           P2_INVALID,
-    "P2_EXC_1":             P2_EXC_1,
-    "P2_UNIQUE_OTHER":      P2_UNIQUE_OTHER,
-    "P2_UNIQUE_SALES":      P2_UNIQUE_SALES,
-    "P2_UNIQUE_CREDITS":    P2_UNIQUE_CREDITS,
-    "P2_DUP_OTHER_OR_ZERO": P2_DUP_OTHER_OR_ZERO,
-    **{f"P2_MATCHED_{lbl}": df for lbl, df in p2_resolved_list},
-    "P2_UNMATCHED":         P2_UNMATCHED,
-})
-
-P2_ALL_MATCHED   = union_non_null(*[df for _, df in p2_resolved_list])
-P2_ALL_UNMATCHED = union_non_null(P2_UNIQUE_SALES, P2_UNIQUE_CREDITS, P2_UNMATCHED)
-
-print("\n[P2] Done.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 3 : Same-PK Exact Match, Month Lag > 2
-# =============================================================================
-# CELL 6 — PIPELINE 3: Same-PK exact match, month lag > 2 (equal-count guard)
-# =============================================================================
-print("\n" + "="*70)
-print("PIPELINE 3 — Same-PK exact match, month lag > 2 (equal-count guard)")
-print("="*70)
-
-print("\n[P3-S1] Base prep (re-tag P2 unmatched)...")
-
-p3_tagged = base_tag(P2_ALL_UNMATCHED, PIPE2_RAW_COLUMNS)
-
-P3_INVALID = materialize_df(
-    p3_tagged.filter(~F.col("is_valid_row"))
-             .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P3_INVALID_PREP_ROWS", "row_id", stage_path=STAGE_PATH_P3,
-)
-je_prep_p3 = materialize_df(
-    p3_tagged.filter(F.col("is_valid_row"))
-             .drop("is_valid_row", "valid_company_desc", "valid_vendor_num"),
-    "P3_je_prep", "primary_key", stage_path=STAGE_PATH_P3,
-)
-
-debug_count("P3 Invalid",    P3_INVALID)
-debug_count("P3 Valid prep", je_prep_p3)
-
-print("\n[P3-S2] Blank invoice reference split...")
-
-P3_EXC_1   = materialize_df(je_prep_p3.filter(_blank),  "P3_EXC_1",      "primary_key", stage_path=STAGE_PATH_P3)
-je_work_p3 = materialize_df(je_prep_p3.filter(~_blank), "P3_je_working", "primary_key", stage_path=STAGE_PATH_P3)
-
-debug_count("P3 EXC_1",   P3_EXC_1)
-debug_count("P3 Working", je_work_p3)
-
-print("\n[P3-S3] Classifying by PK cardinality...")
-
-_pk_cnt_p3    = Window.partitionBy("primary_key")
-je_counted_p3 = je_work_p3.withColumn("pk_row_count", F.count("*").over(_pk_cnt_p3))
-
-_unique_p3 = je_counted_p3.filter(F.col("pk_row_count") == 1)
-_dup_p3    = je_counted_p3.filter(F.col("pk_row_count") > 1)
-
-P3_UNIQUE_OTHER = materialize_df(
-    _unique_p3.filter(~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS")),
-    "P3_UNIQUE_OTHER", "primary_key", stage_path=STAGE_PATH_P3,
-)
-P3_UNIQUE_SALES = materialize_df(
-    _unique_p3.filter(F.col("cat_clean") == "SALES INVOICES"),
-    "P3_UNIQUE_SALES", "primary_key", stage_path=STAGE_PATH_P3,
-)
-P3_UNIQUE_CREDITS = materialize_df(
-    _unique_p3.filter(F.col("cat_clean") == "CREDIT MEMOS"),
-    "P3_UNIQUE_CREDITS", "primary_key", stage_path=STAGE_PATH_P3,
-)
-P3_DUP_OTHER_OR_ZERO = materialize_df(
-    _dup_p3.filter(
-        (~F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-        | (F.col("entered_net_dec") == EXACT_ZERO)
-    ),
-    "P3_DUP_OTHER_OR_ZERO", "primary_key", stage_path=STAGE_PATH_P3,
-)
-P3_DUP_SI_CM = materialize_df(
-    _dup_p3.filter(F.col("cat_clean").isin("SALES INVOICES", "CREDIT MEMOS"))
-           .filter(F.col("entered_net_dec") != EXACT_ZERO),
-    "P3_DUP_SI_CM", "primary_key", stage_path=STAGE_PATH_P3,
-)
-
-debug_count("P3_UNIQUE_OTHER",       P3_UNIQUE_OTHER)
-debug_count("P3_UNIQUE_SALES",       P3_UNIQUE_SALES)
-debug_count("P3_UNIQUE_CREDITS",     P3_UNIQUE_CREDITS)
-debug_count("P3_DUP_OTHER_OR_ZERO",  P3_DUP_OTHER_OR_ZERO)
-debug_count("P3_DUP_SI_CM",          P3_DUP_SI_CM)
-
-print("\n[P3-S4] Equal-count guard — splitting DUP pool by per-PK sales==credit row counts...")
-
-_pk_win = Window.partitionBy("primary_key")
-P3_DUP_SI_CM_counted = (
-    P3_DUP_SI_CM
-    .withColumn(
-        "pk_sales_count",
-        F.size(F.collect_set(F.when(F.col("cat_clean") == "SALES INVOICES", F.col("row_id"))).over(_pk_win)),
-    )
-    .withColumn(
-        "pk_credit_count",
-        F.size(F.collect_set(F.when(F.col("cat_clean") == "CREDIT MEMOS", F.col("row_id"))).over(_pk_win)),
-    )
-)
-
-P3_DUP_EQUAL_COUNT = materialize_df(
-    P3_DUP_SI_CM_counted.filter(F.col("pk_sales_count") == F.col("pk_credit_count"))
-                        .drop("pk_sales_count", "pk_credit_count"),
-    "P3_DUP_EQUAL_COUNT", "primary_key", stage_path=STAGE_PATH_P3,
-)
-P3_DUP_UNEQUAL_COUNT = materialize_df(
-    P3_DUP_SI_CM_counted.filter(F.col("pk_sales_count") != F.col("pk_credit_count"))
-                        .drop("pk_sales_count", "pk_credit_count"),
-    "P3_DUP_UNEQUAL_COUNT", "primary_key", stage_path=STAGE_PATH_P3,
-)
-
-debug_count("P3_DUP_EQUAL_COUNT (eligible for matching)",  P3_DUP_EQUAL_COUNT)
-debug_count("P3_DUP_UNEQUAL_COUNT (bypasses matching)",    P3_DUP_UNEQUAL_COUNT)
-
-print("\n[P3-S5] Building sales / credit side tables (equal-count groups only)...")
-
-p3_sales  = materialize_df(make_sales(P3_DUP_EQUAL_COUNT),  "P3_sales",  stage_path=STAGE_PATH_P3)
-p3_credit = materialize_df(make_credit(P3_DUP_EQUAL_COUNT), "P3_credit", stage_path=STAGE_PATH_P3)
-
-debug_count("P3 sales_all",  p3_sales)
-debug_count("P3 credit_all", p3_credit)
-
-print("\n[P3-S6] Running LAG_GT_2_MONTH match step...")
-
-p3_resolved_list, p3_rem_sales, p3_rem_credit = run_match_pipeline(
-    p3_sales, p3_credit, P3_DUP_EQUAL_COUNT, LAG_GT_2_STEPS,
-    stage_path=STAGE_PATH_P3, has_year_flag=True,
-)
-
-print("\n[P3-S7] Assembling unmatched groups...")
-
-P3_UNMATCHED = build_unmatched_rows(
-    P3_DUP_EQUAL_COUNT, p3_rem_sales, p3_rem_credit,
-    "P3_REMAIN_UNMATCHED", stage_path=STAGE_PATH_P3,
-)
-
-print("\n[P3-S8] Writing outputs...")
-
-write_table(P3_INVALID,           "P3_INVALID_PREP_ROWS",  base_path=output_path_et)
-write_table(P3_EXC_1,             "P3_DATASET_EXC_1",      base_path=output_path_et)
-write_table(P3_DUP_OTHER_OR_ZERO, "P3_DUP_OTHER_OR_ZERO",  base_path=output_path_et)
-write_table(P3_UNIQUE_OTHER,      "P3_UNIQUE_OTHER",        base_path=output_path_et)
-write_table(P3_UNIQUE_SALES,      "P3_UNIQUE_SALES",        base_path=output_path_et)
-write_table(P3_UNIQUE_CREDITS,    "P3_UNIQUE_CREDITS",      base_path=output_path_et)
-write_table(P3_DUP_UNEQUAL_COUNT, "P3_DUP_UNEQUAL_COUNT",   base_path=output_path_et)
-for lbl, df in p3_resolved_list:
-    write_table(df, f"P3_MATCHED_{lbl}",                    base_path=output_path_et)
-write_table(P3_UNMATCHED,         "P3_REMAIN_UNMATCHED",    base_path=output_path_et)
-
-print("\n[P3] === PIPELINE 3 AUDIT ===")
-audit_summary({
-    "P3_INVALID":           P3_INVALID,
-    "P3_EXC_1":             P3_EXC_1,
-    "P3_UNIQUE_OTHER":      P3_UNIQUE_OTHER,
-    "P3_UNIQUE_SALES":      P3_UNIQUE_SALES,
-    "P3_UNIQUE_CREDITS":    P3_UNIQUE_CREDITS,
-    "P3_DUP_OTHER_OR_ZERO": P3_DUP_OTHER_OR_ZERO,
-    "P3_DUP_UNEQUAL_COUNT": P3_DUP_UNEQUAL_COUNT,
-    **{f"P3_MATCHED_{lbl}": df for lbl, df in p3_resolved_list},
-    "P3_UNMATCHED":         P3_UNMATCHED,
-})
-
-P3_ALL_MATCHED   = union_non_null(*[df for _, df in p3_resolved_list])
-P3_ALL_UNMATCHED = union_non_null(P3_UNIQUE_SALES, P3_UNIQUE_CREDITS, P3_DUP_UNEQUAL_COUNT, P3_UNMATCHED)
-
-print("\n[P3] Done.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 4: Approx match using PQ and CQ Data
-# =============================================================================
-# CELL 7 — PIPELINE 4: Tolerance matching on looser PK (no amount in key)
-# =============================================================================
-print("\n" + "="*70)
-print("PIPELINE 4 — Tolerance matching on looser PK (no amount in key)")
-print("="*70)
-
-print("\n[P4-S0] Preparing derived columns on P3 unmatched...")
-
-p4_input = base_tag(P3_ALL_UNMATCHED, PIPE2_RAW_COLUMNS)
-
-p4_input = p4_input.withColumn(
-    "p4_primary_key",
-    F.when(
-        F.col("valid_company_desc").isNull()
-        | (F.col("company_desc_clean") == "")
-        | F.col("valid_vendor_num").isNull()
-        | (F.col("vendor_num_clean") == ""),
-        F.lit(None),
-    ).otherwise(
-        F.concat_ws("_", F.col("company_desc_clean"), F.col("vendor_num_clean"))
-    )
-).drop("is_valid_row", "valid_company_desc", "valid_vendor_num")
-
-p4_invalid_pk = materialize_df(
-    p4_input.filter(F.col("p4_primary_key").isNull()),
-    "P4_invalid_pk", "row_id", stage_path=STAGE_PATH_P4,
-)
-p4_base = materialize_df(
-    p4_input.filter(F.col("p4_primary_key").isNotNull()),
-    "P4_base", "p4_primary_key", stage_path=STAGE_PATH_P4,
-)
-
-debug_count("P4 valid PK",   p4_base)
-debug_count("P4 invalid PK", p4_invalid_pk)
-
-print("\n  [PROFILE] PK failure breakdown")
-display(p4_invalid_pk.select(
-    F.sum(
-        F.when(F.col("company_desc_clean").isNull() | (F.col("company_desc_clean") == ""), 1)
-         .otherwise(0)
-    ).alias("missing_company_desc"),
-    F.sum(
-        F.when(F.col("vendor_num_clean").isNull() | (F.col("vendor_num_clean") == ""), 1)
-         .otherwise(0)
-    ).alias("missing_vendor_num"),
-    F.sum(
-        F.when(
-            (F.col("company_desc_clean").isNull() | (F.col("company_desc_clean") == ""))
-            & (F.col("vendor_num_clean").isNull()  | (F.col("vendor_num_clean") == "")),
-            1
-        ).otherwise(0)
-    ).alias("missing_both"),
-))
-
-print("\n[P4-S2] Building sales / credit side tables...")
-
-p4_sales  = materialize_df(make_sales(p4_base,  "p4_primary_key"), "P4_sales",  stage_path=STAGE_PATH_P4)
-p4_credit = materialize_df(make_credit(p4_base, "p4_primary_key"), "P4_credit", stage_path=STAGE_PATH_P4)
-
-debug_count("P4 sales",  p4_sales)
-debug_count("P4 credit", p4_credit)
-
-print(f"\n[P4-S3] Cross-joining within PK; tolerance = {P4_TOLERANCE}...")
-
-_tol = F.lit(P4_TOLERANCE).cast(DECIMAL_TYPE)
-
-p4_candidates = (
-    p4_sales.alias("s")
-    .join(p4_credit.alias("c"), on="primary_key", how="inner")
-    .withColumn("amount_net", F.abs(F.col("s.sales_amt") + F.col("c.credit_amt")))
-    .filter(F.col("amount_net") <= _tol)
-    .select(
-        "primary_key",
-        F.col("s.sales_row_id"),  F.col("c.credit_row_id"),
-        F.col("s.sales_amt"),     F.col("c.credit_amt"),     F.col("amount_net"),
-        F.col("s.sales_eff_dt"),  F.col("c.credit_eff_dt"),
-        F.col("s.sales_month"),   F.col("c.credit_month"),
-        F.col("s.sales_ref"),     F.col("c.credit_ref"),
-    )
-)
-p4_candidates = materialize_df(p4_candidates, "P4_candidates", stage_path=STAGE_PATH_P4)
-debug_count("P4 candidates (within tolerance)", p4_candidates)
-
-print("\n[P4-S4] Classifying one-to-many vs one-to-one...")
-
-sales_match_cts = (
-    p4_candidates
-    .groupBy("sales_row_id")
-    .agg(F.countDistinct("credit_row_id").alias("credit_count_per_sale"))
-)
-credit_match_cts = (
-    p4_candidates
-    .groupBy("credit_row_id")
-    .agg(F.countDistinct("sales_row_id").alias("sales_count_per_credit"))
-)
-
-p4_classified = (
-    p4_candidates
-    .join(sales_match_cts,  on="sales_row_id",  how="left")
-    .join(credit_match_cts, on="credit_row_id", how="left")
-    .withColumn("is_one_to_many",
-        (F.col("credit_count_per_sale") > 1) | (F.col("sales_count_per_credit") > 1))
-)
-p4_classified = materialize_df(p4_classified, "P4_classified", stage_path=STAGE_PATH_P4)
-
-print("\n[P4-S5] Building ONE_TO_MANY dataset...")
-
-otm_ids = (
-    p4_classified.filter(F.col("is_one_to_many"))
-    .select(F.col("sales_row_id").alias("row_id"))
-    .unionByName(
-        p4_classified.filter(F.col("is_one_to_many"))
-        .select(F.col("credit_row_id").alias("row_id"))
-    )
-    .distinct()
-)
-
-P4_ONE_TO_MANY = materialize_df(
-    p4_base.join(otm_ids, on="row_id", how="inner")
-           .withColumn("match_type", F.lit("ONE_TO_MANY")),
-    "P4_ONE_TO_MANY", stage_path=STAGE_PATH_P4,
-)
-debug_count("P4_ONE_TO_MANY", P4_ONE_TO_MANY)
-
-print("\n[P4-S6] Building DATE_SYNC / DATE_UNSYNC datasets...")
-
-oto = (
-    p4_classified.filter(~F.col("is_one_to_many"))
-    .withColumn("date_sync", F.col("sales_eff_dt") < F.col("credit_eff_dt"))
-)
-oto = materialize_df(oto, "P4_oto", stage_path=STAGE_PATH_P4)
-
-
-def _ids_for_flag(oto_df, flag_val):
-    flt = oto_df.filter(F.col("date_sync") == flag_val)
-    return (
-        flt.select(F.col("sales_row_id").alias("row_id"))
-           .unionByName(flt.select(F.col("credit_row_id").alias("row_id")))
-           .distinct()
-    )
-
-
-sync_ids   = _ids_for_flag(oto, True)
-unsync_ids = _ids_for_flag(oto, False)
-
-P4_DATE_SYNC = materialize_df(
-    p4_base.join(sync_ids, on="row_id", how="inner")
-           .withColumn("match_type", F.lit("ONE_TO_ONE_DATE_SYNC")),
-    "P4_DATE_SYNC", stage_path=STAGE_PATH_P4,
-)
-P4_DATE_UNSYNC = materialize_df(
-    p4_base.join(unsync_ids, on="row_id", how="inner")
-           .withColumn("match_type", F.lit("ONE_TO_ONE_DATE_UNSYNC")),
-    "P4_DATE_UNSYNC", stage_path=STAGE_PATH_P4,
-)
-
-debug_count("P4_DATE_SYNC",   P4_DATE_SYNC)
-debug_count("P4_DATE_UNSYNC", P4_DATE_UNSYNC)
-
-print("\n[P4-S7] Building NO_MATCH_FOUND...")
-
-matched_ids_all = (
-    otm_ids
-    .unionByName(sync_ids)
-    .unionByName(unsync_ids)
-    .distinct()
-)
-
-p4_no_match = materialize_df(
-    p4_base.join(matched_ids_all, on="row_id", how="left_anti")
-           .withColumn("match_type", F.lit("NO_MATCH_FOUND")),
-    "P4_no_match", stage_path=STAGE_PATH_P4,
-)
-
-P4_NO_MATCH_FOUND = materialize_df(
-    union_non_null(
-        p4_no_match,
-        p4_invalid_pk.withColumn("match_type", F.lit("NO_MATCH_FOUND")),
-    ),
-    "P4_NO_MATCH_FOUND", stage_path=STAGE_PATH_P4,
-)
-debug_count("P4_NO_MATCH_FOUND", P4_NO_MATCH_FOUND)
-
-print("\n[P4-S8] === PIPELINE 4 AUDIT ===")
-
-cnt_in       = p4_input.count()
-cnt_otm      = P4_ONE_TO_MANY.count()
-cnt_sync     = P4_DATE_SYNC.count()
-cnt_unsync   = P4_DATE_UNSYNC.count()
-cnt_no_match = P4_NO_MATCH_FOUND.count()
-cnt_out      = cnt_otm + cnt_sync + cnt_unsync + cnt_no_match
-
-_p4_audit_df = spark.createDataFrame(
-    [
-        ("INPUT — p4_input",            cnt_in),
-        ("OUTPUT — P4_ONE_TO_MANY",     cnt_otm),
-        ("OUTPUT — P4_DATE_SYNC",       cnt_sync),
-        ("OUTPUT — P4_DATE_UNSYNC",     cnt_unsync),
-        ("OUTPUT — P4_NO_MATCH_FOUND",  cnt_no_match),
-        ("Total IN",                    cnt_in),
-        ("Total OUT",                   cnt_out),
-        ("Diff (should be 0)",          cnt_in - cnt_out),
-    ],
-    ["Metric", "Count"],
-)
-display(_p4_audit_df)
-
-assert cnt_in == cnt_out, (
-    f"Row count mismatch! IN={cnt_in:,}  OUT={cnt_out:,}  DIFF={cnt_in - cnt_out:,}"
-)
-
-print("\n[P4-S9] Writing Pipeline 4 outputs...")
-
-write_table(P4_ONE_TO_MANY,    "P4_ONE_TO_MANY",    base_path=output_path_et)
-write_table(P4_DATE_SYNC,      "P4_DATE_SYNC",      base_path=output_path_et)
-write_table(P4_DATE_UNSYNC,    "P4_DATE_UNSYNC",    base_path=output_path_et)
-write_table(P4_NO_MATCH_FOUND, "P4_NO_MATCH_FOUND", base_path=output_path_et)
-
-print("\n[P4] Done.")
-
-# COMMAND ----------
-
-# DBTITLE 1,AA Comment Application (Bug Fixed: raw_for_stats Union)
-# =============================================================================
-# CELL 8 — AA COMMENT ASSIGNMENT
-# =============================================================================
-print("\n" + "="*70)
-print("AA COMMENT ASSIGNMENT")
-print("="*70)
-
-P4_ALL_UNMATCHED = union_non_null(
-    P4_ONE_TO_MANY,
-    P4_DATE_SYNC,
-    P4_DATE_UNSYNC,
-    P4_NO_MATCH_FOUND,
-)
-
-if "abs_entered_dec" not in P4_ALL_UNMATCHED.columns:
-    P4_ALL_UNMATCHED = P4_ALL_UNMATCHED.withColumn(
-        "abs_entered_dec", F.abs(to_decimal_clean("Net Entered"))
-    )
-if "eff_dt" not in P4_ALL_UNMATCHED.columns:
-    P4_ALL_UNMATCHED = P4_ALL_UNMATCHED.withColumn(
-        "eff_dt", to_date_clean("Default Effective Date")
-    )
-if "vendor_num_clean" not in P4_ALL_UNMATCHED.columns:
-    P4_ALL_UNMATCHED = P4_ALL_UNMATCHED.withColumn(
-        "vendor_num_clean",
-        F.trim(F.col("Vendor/Customer Number").cast("string"))
-    )
-if "company_desc_clean" not in P4_ALL_UNMATCHED.columns:
-    P4_ALL_UNMATCHED = P4_ALL_UNMATCHED.withColumn(
-        "company_desc_clean",
-        F.trim(F.upper(F.col("Company Description")))
-    )
-
-# --- BUG FIX (Cell 8): Union JE_raw and JE_raw_2_aligned when HAS_CF is True ---
-# Ensures Company + Vendor sales_inv_count checks across BOTH current quarter
-# and prior-quarter carry-forward data.
-if HAS_CF:
-    raw_for_stats = JE_raw.unionByName(JE_raw_2_aligned, allowMissingColumns=True)
-else:
-    raw_for_stats = JE_raw
-
-P4_ALL_UNMATCHED_COMMENTED = assign_aa_comment(
-    df                  = P4_ALL_UNMATCHED,
-    raw_df              = raw_for_stats,
-    oto_df              = oto,
-    small_amt_threshold = SMALL_AMT_MAX,
-)
-
-# Materialize once to output_path_et and read back so Cell 9 & Cell 11 share
-# a single pre-computed table without re-evaluating the pipeline.
-write_table(P4_ALL_UNMATCHED_COMMENTED, "P4_ALL_UNMATCHED_WITH_AA_COMMENT", base_path=output_path_et)
-P4_ALL_UNMATCHED_COMMENTED = cp.read(f"{output_path_et}/P4_ALL_UNMATCHED_WITH_AA_COMMENT.parquet")
-
-debug_count("P4 Unmatched with AA Comment", P4_ALL_UNMATCHED_COMMENTED)
-debug_group_count(P4_ALL_UNMATCHED_COMMENTED, "AA Comment", "AA Comment distribution")
-debug_group_count(P4_ALL_UNMATCHED_COMMENTED, "AA Rule",    "AA Rule distribution (audit trace)")
-
-print("\n[AA-VALIDATION] DEALERWEB LLC / DWB_DRWI99 composite-key check...")
-_composite_check = (
-    P4_ALL_UNMATCHED_COMMENTED
-    .filter(
-        (F.col("company_desc_clean") == "DEALERWEB LLC")
-        & (F.col("vendor_num_clean") == "DWB_DRWI99")
-    )
-    .select(
-        "company_desc_clean", "vendor_num_clean", "cat_clean",
-        "match_type", "AA Comment", "AA Rule", "Net Entered",
-    )
-)
-display(_composite_check)
-
-print("\n[AA] Done.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Writing Output
-# =============================================================================
-# CELL 9 — FINAL EXCEL EXPORT
-# =============================================================================
-print("\n" + "="*70)
-print("FINAL EXCEL EXPORT")
-print("="*70)
-
-all_invalid      = union_non_null(P1_INVALID,           P2_INVALID,           P3_INVALID)
-all_exc_1        = union_non_null(P1_EXC_1,             P2_EXC_1,             P3_EXC_1)
-all_dup_other    = union_non_null(P1_DUP_OTHER_OR_ZERO, P2_DUP_OTHER_OR_ZERO, P3_DUP_OTHER_OR_ZERO)
-all_unique_other = union_non_null(P1_UNIQUE_OTHER,      P2_UNIQUE_OTHER,      P3_UNIQUE_OTHER)
-
-print("P4_ALL_UNMATCHED_COMMENTED (before filter):", P4_ALL_UNMATCHED_COMMENTED.count())
-is_current_period = (
-    (F.upper(F.trim(F.col("Source Quarter"))) == F.lit(CURRENT_QUARTER)) &
-    (F.upper(F.trim(F.col("Year Flag"))) == F.lit(CURRENT_FY))
-)
-
-has_aa_comment = (
-    F.col("AA Comment").isNotNull() &
-    (F.trim(F.col("AA Comment")) != "")
-)
-P4_ALL_UNMATCHED_COMMENTED = P4_ALL_UNMATCHED_COMMENTED.filter(
-    is_current_period | has_aa_comment
-)
-print("P4_ALL_UNMATCHED_COMMENTED (after filter):", P4_ALL_UNMATCHED_COMMENTED.count())
-
-export_to_excel(
-    sheets={
-        "INVALID_ROWS":                     all_invalid,
-        "BLANK_Vendor_Number":              all_exc_1,
-        "Non Sales - Credit Pairs":         all_dup_other,
-        "Other_Unique_PKs":                 all_unique_other,
-        "Same Quater Matched Pairs":        P1_ALL_MATCHED,
-        "Prev to Curr Quater Match Pair":   P2_ALL_MATCHED,
-        "Same PK Lag > 2 Month Match Pair": P3_ALL_MATCHED,
-        "Unmatched_Items":                  P4_ALL_UNMATCHED_COMMENTED,
-    },
-    path=f"{output_path_et}/Tradeweb Securities Data Final - {CURRENT_FY} {CURRENT_QUARTER}.xlsx",
-)
-
-print("\n[FINAL] === END-TO-END ROW CONSERVATION CHECK ===")
-
-# COMMAND ----------
-
-# =============================================================================
-# CELL 10 — END-TO-END ROW CONSERVATION CHECK
-# =============================================================================
-total_raw = JE_raw.count()
-
-dfs = {
-    "all_invalid":                all_invalid,
-    "all_exc_1":                  all_exc_1,
-    "all_dup_other":              all_dup_other,
-    "all_unique_other":           all_unique_other,
-    "P1_ALL_MATCHED":             P1_ALL_MATCHED,
-    "P2_ALL_MATCHED":             P2_ALL_MATCHED,
-    "P3_ALL_MATCHED":             P3_ALL_MATCHED,
-    "P4_ALL_UNMATCHED_COMMENTED": P4_ALL_UNMATCHED_COMMENTED,
-}
-
-_conservation_rows = [("Raw rows (JE_raw)", total_raw)]
-total_out = 0
-for name, df in dfs.items():
-    if df is None:
-        _conservation_rows.append((name, None))
-        continue
-    try:
-        cnt = df.count()
-        _conservation_rows.append((name, cnt))
-        total_out += cnt
-    except Exception as e:
-        print(f"  [ERROR] {name} caused: {e}")
-        raise
-
-_conservation_rows.append(("Total out", total_out))
-display(spark.createDataFrame(_conservation_rows, ["Dataset", "Count"]))
-
-print("\n[DONE] All pipelines complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Account Description Summary (Bug Fixed: Decimal Casting)
-# =============================================================================
-# CELL 11 — ACCOUNT DESCRIPTION SUMMARY WITH EDITABLE GROUP DICTIONARY
-# =============================================================================
-from openpyxl import Workbook
-from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
-
-COMPANIES = [
-    "Dealerweb LLC",
-    "Institutional Cash Distributors LLC",
-    "Tradeweb Direct LLC",
-    "Tradeweb Europe Limited",
-    "Tradeweb LLC",
-    "Tradeweb Markets LLC",
-    "TW SEF",
-]
-
-DISPLAY_SUMMARIES = True
-
-is_current_period = (
-    (F.upper(F.trim(F.col("Source Quarter"))) == F.lit(CURRENT_QUARTER))
-    & (F.upper(F.trim(F.col("Year Flag"))) == F.lit(CURRENT_FY))
-)
-
-SUMMARY_DATASETS = {
-    "Same Quarter Match":          P1_ALL_MATCHED,
-    "Previous Quarter Match":      P2_ALL_MATCHED.filter(is_current_period) if P2_ALL_MATCHED is not None else None,
-    "Same PK Lag > 2 Month Match": P3_ALL_MATCHED.filter(is_current_period) if P3_ALL_MATCHED is not None else None,
-    "Unmatched":                   P4_ALL_UNMATCHED_COMMENTED.filter(is_current_period) if P4_ALL_UNMATCHED_COMMENTED is not None else None,
-}
-
-ACCOUNT_GROUPS = {
-    "Commissions": [
-        "Commissions - Fixed",
-        "Commissions - Variable",
-    ],
-    "Contra Revenue": [
-        "Contra Revenue - Subscription Fees - Fixed",
-        "Contra Revenue Commissions - Tech Credits - Variable",
-        "Contra Revenue Commissions - Variable",
-    ],
-    "Other Revenue": [
-        "Other Revenue - Fixed",
-        "Other Revenue - Fixed - LSEG",
-        "Other Revenue - Variable",
-    ],
-    "Subscription Fees": [
-        "Subscription Fees - Fixed",
-        "Subscription Fees - Fixed - LSEG",
-        "Subscription Fees - Variable",
-    ],
-    "Transaction Fees": [
-        "Transaction Fees - Fixed",
-        "Transaction Fees - Variable",
-    ],
-}
-
-
-def _normalize_text(value):
-    if value is None:
-        return ""
-    value = str(value).strip()
-    value = value.replace("–", "-").replace("—", "-")
-    value = re.sub(r"\s+", " ", value)
-    return value.upper()
-
-
-def _union_non_null(*dfs):
-    valid_dfs = [df for df in dfs if df is not None]
-    if not valid_dfs:
-        return spark.createDataFrame([], "Account Description string")
-    return reduce(lambda a, b: a.unionByName(b, allowMissingColumns=True), valid_dfs)
-
-
-def _build_group_lookup():
-    lookup = {}
-    for group_name, members in ACCOUNT_GROUPS.items():
-        for member in members:
-            lookup[_normalize_text(member)] = group_name
-    return lookup
-
-
-GROUP_LOOKUP = _build_group_lookup()
-
-
-def _group_name_for_account(account_desc):
-    normalized = _normalize_text(account_desc)
-    return GROUP_LOOKUP.get(normalized, account_desc.strip() if account_desc else "Unmapped")
-
-
-def _safe_sheet_name(name: str) -> str:
-    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(name)).strip()
-    return cleaned[:31] if cleaned else "Sheet"
-
-
-def _with_je_category(df):
-    if df is None:
-        return None
-    if "JE Category" in df.columns:
-        return df.withColumn(
-            "JE Category",
-            F.when(F.trim(F.col("JE Category")) == "", F.lit("Blank"))
-             .otherwise(F.coalesce(F.trim(F.col("JE Category")), F.lit("Blank")))
-        )
-    return df.withColumn("JE Category", F.lit("Unspecified"))
-
-
-def build_company_summary(company_desc: str):
-    company_key = company_desc.strip().upper()
-
-    per_company = {
-        sheet_name: _with_je_category(
-            df.filter(F.upper(F.trim(F.col("Company Description"))) == F.lit(company_key))
-        ) if df is not None else None
-        for sheet_name, df in SUMMARY_DATASETS.items()
-    }
-
-    acct_values = (
-        _union_non_null(
-            *[
-                df.select(F.trim(F.col("Account Description")).alias("Account Description"))
-                for df in per_company.values() if df is not None
-            ]
-        )
-        .filter(F.col("Account Description").isNotNull())
-        .filter(F.trim(F.col("Account Description")) != "")
-        .distinct()
-        .orderBy("Account Description")
-        .collect()
-    )
-
-    raw_accounts = [r["Account Description"] for r in acct_values]
-
-    grouped_accounts = {}
-    for acct in raw_accounts:
-        grp = _group_name_for_account(acct)
-        grouped_accounts.setdefault(grp, []).append(acct)
-
-    ordered_group_names = ["Total"]
-    for configured_group in ACCOUNT_GROUPS.keys():
-        if configured_group in grouped_accounts:
-            ordered_group_names.append(configured_group)
-
-    for grp in sorted(grouped_accounts.keys()):
-        if grp not in ACCOUNT_GROUPS:
-            ordered_group_names.append(grp)
-
-    rows = []
-
-    for grp in ordered_group_names:
-        rows.append([f"Account Grouping: {grp}", None, None, None, None, None])
-        rows.append(["Sheet Name", "JE Category", "Count", "Entered Dr", "Entered CR", "Net Entered"])
-
-        group_total_cnt = 0
-        group_total_dr  = 0.0
-        group_total_cr  = 0.0
-        group_total_net = 0.0
-
-        group_members = None if grp == "Total" else grouped_accounts.get(grp, [])
-
-        for sheet_name, df in per_company.items():
-            if df is None:
-                rows.append([sheet_name, "No Data", 0, 0.0, 0.0, 0.0])
-                rows.append([f"{sheet_name} Total", "", 0, 0.0, 0.0, 0.0])
-                continue
-
-            sub = df if grp == "Total" else df.filter(F.trim(F.col("Account Description")).isin(group_members))
-
-            # --- BUG FIX (Cell 11): Clean & cast string currency columns to DecimalType ---
-            # Prevents strings with commas/parentheses from summing to null/0.0
-            je_summary = (
-                sub.groupBy("JE Category")
-                .agg(
-                    F.count("primary_key").alias("cnt"),
-                    F.sum(to_decimal_clean("Entered Dr")).alias("dr"),
-                    F.sum(to_decimal_clean("Entered CR")).alias("cr"),
-                    F.sum(to_decimal_clean("Net Entered")).alias("net"),
-                )
-                .orderBy("JE Category")
-                .collect()
-            )
-
-            sheet_total_cnt = 0
-            sheet_total_dr  = 0.0
-            sheet_total_cr  = 0.0
-            sheet_total_net = 0.0
-
-            if je_summary:
-                first_row = True
-                for r in je_summary:
-                    cnt = int(r["cnt"] or 0)
-                    dr  = float(r["dr"])  if r["dr"]  is not None else 0.0
-                    cr  = float(r["cr"])  if r["cr"]  is not None else 0.0
-                    net = float(r["net"]) if r["net"] is not None else 0.0
-
-                    sheet_total_cnt += cnt
-                    sheet_total_dr  += dr
-                    sheet_total_cr  += cr
-                    sheet_total_net += net
-
-                    rows.append([
-                        sheet_name if first_row else "",
-                        r["JE Category"],
-                        cnt,
-                        dr,
-                        cr,
-                        net,
-                    ])
-                    first_row = False
-            else:
-                rows.append([sheet_name, "No Data", 0, 0.0, 0.0, 0.0])
-
-            group_total_cnt += sheet_total_cnt
-            group_total_dr  += sheet_total_dr
-            group_total_cr  += sheet_total_cr
-            group_total_net += sheet_total_net
-
-            rows.append([
-                f"{sheet_name} Total",
-                "",
-                sheet_total_cnt,
-                sheet_total_dr,
-                sheet_total_cr,
-                sheet_total_net,
-            ])
-
-        rows.append([
-            "Group Total",
-            "",
-            group_total_cnt,
-            group_total_dr,
-            group_total_cr,
-            group_total_net,
-        ])
-
-        rows.append([None, None, None, None, None, None])
-
-    if rows and all(v is None for v in rows[-1]):
-        rows.pop()
-
-    return rows
-
-
-def _rows_to_display_df(rows):
-    schema = T.StructType([
-        T.StructField("Sheet Name / Section", T.StringType(), True),
-        T.StructField("JE Category",          T.StringType(), True),
-        T.StructField("Count",                T.LongType(),   True),
-        T.StructField("Entered Dr",           T.DoubleType(), True),
-        T.StructField("Entered CR",           T.DoubleType(), True),
-        T.StructField("Net Entered",          T.DoubleType(), True),
-    ])
-    return spark.createDataFrame(rows, schema=schema)
-
-
-def display_company_summary(company_desc: str):
-    rows = build_company_summary(company_desc)
-    display_df = _rows_to_display_df(rows)
-    display(display_df)
-    return rows
-
-
-def _apply_summary_format(ws, company_desc, rows):
-    thin   = Side(border_style="thin", color="000000")
-    double = Side(border_style="double", color="000000")
-
-    title_font    = Font(name="Calibri", sz=11, bold=True)
-    header_font   = Font(name="Calibri", sz=9, bold=True, color="00FFFFFF")
-    section_font  = Font(name="Calibri", sz=9, bold=True)
-    cell_font     = Font(name="Calibri", sz=9)
-    subtotal_font = Font(name="Calibri", sz=9, bold=True)
-
-    header_fill   = PatternFill("solid", fgColor="00000000")
-    subtotal_fill = PatternFill("solid", fgColor="00D9E1F2")
-
-    left_alignment   = Alignment(wrap_text=False, vertical="center")
-    center_alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
-    cell_alignment   = Alignment(wrap_text=True, vertical="center")
-
-    border_thin     = Border(top=thin, left=thin, right=thin, bottom=thin)
-    border_subtotal = Border(top=thin, left=thin, right=thin, bottom=double)
-    border_header   = Border(top=thin, left=thin, right=thin, bottom=thin)
-
-    ws.sheet_view.showGridLines = False
-    ws.sheet_view.zoomScale = 100
-    ws.sheet_format.defaultRowHeight = 12
-
-    ws.column_dimensions["A"].width = 2.4
-    ws.column_dimensions["B"].width = 28
-    ws.column_dimensions["C"].width = 24
-    ws.column_dimensions["D"].width = 12
-    ws.column_dimensions["E"].width = 16
-    ws.column_dimensions["F"].width = 16
-    ws.column_dimensions["G"].width = 16
-
-    ws["B2"] = f"Account Description Summary - {CURRENT_FY} {CURRENT_QUARTER}"
-    ws["B3"] = company_desc
-    ws["B2"].font = title_font
-    ws["B3"].font = title_font
-    ws["B2"].alignment = left_alignment
-    ws["B3"].alignment = left_alignment
-
-    start_row = 7
-
-    for idx, row_values in enumerate(rows):
-        excel_row = start_row + idx
-        first_value = row_values[0]
-
-        for col_idx, value in enumerate(row_values, start=2):
-            cell = ws.cell(row=excel_row, column=col_idx, value=value)
-            cell.font = cell_font
-            cell.alignment = cell_alignment
-
-        if first_value is None:
-            continue
-
-        if isinstance(first_value, str) and first_value.startswith("Account Grouping:"):
-            for col_idx in range(2, 8):
-                cell = ws.cell(row=excel_row, column=col_idx)
-                cell.font = section_font
-                cell.alignment = left_alignment
-            continue
-
-        if first_value == "Sheet Name":
-            for col_idx in range(2, 8):
-                cell = ws.cell(row=excel_row, column=col_idx)
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.alignment = center_alignment
-                cell.border = border_header
-            continue
-
-        if isinstance(first_value, str) and first_value.endswith(" Total") and first_value != "Group Total":
-            for col_idx in range(2, 8):
-                cell = ws.cell(row=excel_row, column=col_idx)
-                cell.font = subtotal_font
-                cell.fill = subtotal_fill
-                cell.border = border_subtotal
-                cell.alignment = cell_alignment if col_idx > 2 else left_alignment
-
-                if col_idx == 4:
-                    cell.number_format = "#,##0;-#,##0"
-                elif col_idx >= 5:
-                    cell.number_format = "$ #,##0.00;$ (#,##0.00)"
-            continue
-
-        if first_value == "Group Total":
-            for col_idx in range(2, 8):
-                cell = ws.cell(row=excel_row, column=col_idx)
-                cell.font = header_font
-                cell.fill = header_fill
-                cell.alignment = center_alignment if col_idx > 2 else left_alignment
-                cell.border = border_subtotal
-
-                if col_idx == 4:
-                    cell.number_format = "#,##0;-#,##0"
-                elif col_idx >= 5:
-                    cell.number_format = "$ #,##0.00;$ (#,##0.00)"
-            continue
-
-        for col_idx in range(2, 8):
-            cell = ws.cell(row=excel_row, column=col_idx)
-            cell.font = cell_font
-            cell.border = border_thin
-
-            if col_idx == 4:
-                cell.number_format = "#,##0;-#,##0"
-            elif col_idx >= 5:
-                cell.number_format = "$ #,##0.00;$ (#,##0.00)"
-
-
-def write_summary_workbook(path: str, show_displays: bool = False):
-    wb = Workbook()
-    wb.remove(wb.active)
-
-    for company in COMPANIES:
-        tab_name = _safe_sheet_name(company.replace("Tradeweb ", "TW ").replace(" ", ""))
-        ws = wb.create_sheet(tab_name)
-
-        rows = build_company_summary(company)
-        _apply_summary_format(ws, company, rows)
-
-        if show_displays:
-            print(f"\nDisplaying summary for: {company}")
-            display(_rows_to_display_df(rows))
-
-    if "cp" in globals() and hasattr(cp, "openpyxl"):
-        cp.openpyxl.write(wb, path, register=True)
-    else:
-        wb.save(path)
-
-    if show_displays:
-        display(spark.createDataFrame([(path,)], ["Workbook Path"]))
-
-
-output_file = f"{output_path_et}/Account_Description_Summary - {CURRENT_FY} {CURRENT_QUARTER}.xlsx"
-write_summary_workbook(output_file, show_displays=DISPLAY_SUMMARIES)
+je_tagged = materialize_df(base_tag(JE_raw, BASE_RAW_COLUMNS), "P1_je_tagged", "primary_key", stage_path=STAGE_PATH_P1, force_write=True)
