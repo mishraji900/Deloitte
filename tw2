@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import calendar
@@ -21,6 +22,7 @@ from openpyxl.worksheet.formula import ArrayFormula
 # ============================================================================
 
 ACCOUNT_GROUP_COLUMN = "Account Grouping"
+PARENT_COLUMN = "Grouping Total"
 YES_VALUE = "Yes"
 NO_VALUE = "No"
 PROCEDURE_TEXT = "Please Fill Procedures Box."
@@ -45,6 +47,7 @@ NUMBER_FORMAT = "#,##0;(#,##0);-"
 PERCENT_FORMAT = "0%;(0%);-"
 
 INPUT_NAMES = ("TB_Final_BS", "TB_Final_IS_YTD", "TB_Final_QTD") ## Edit Input Dataframe Name as needed
+GROUPING_PATH_NAMES = ("GROUPING_PATH_BS", "GROUPING_PATH_IS") ## Notebook variables holding grouping file paths
 ENTITY_SKIP_PREFIXES = ("__sheet__", "row_count_", DATE_COLUMN_PREFIX)
 
 SUMMARY_HEADER_ROW = 11
@@ -156,6 +159,7 @@ class SheetConfig:
     column_widths: dict[str, int]
     classifier: str
     all_comparison_blocks: tuple[ComparisonBlock, ...] | None = None
+    grouping_sheet: str = ""          # sheet name in grouping file: "BS" or "IS"
 
     def __post_init__(self) -> None:
         # If no separate block list is supplied, use all comparison blocks.
@@ -242,6 +246,7 @@ def build_sheet_configs() -> list[SheetConfig]:
                 "V": 3, "W": 10,
             },
             classifier="bs",
+            grouping_sheet="BS",
         ),
         SheetConfig(
             sheet_id="IS_YTD",
@@ -277,6 +282,7 @@ def build_sheet_configs() -> list[SheetConfig]:
                 "J": 3, "K": 10,
             },
             classifier="is",
+            grouping_sheet="IS",
         ),
         SheetConfig(
             sheet_id="IS_QTD",
@@ -316,6 +322,7 @@ def build_sheet_configs() -> list[SheetConfig]:
                 "P": 10,
             },
             classifier="is_qtd",
+            grouping_sheet="IS",
         ),
     ]
 # ============================================================================
@@ -505,9 +512,104 @@ def classify_is_qtd_periods(
     return roles, discarded
 
 
+# ============================================================================
+# GROUPING FILE: ORDER + GROUP TOTAL ROWS
+# ============================================================================
+
+def _norm(value: Any) -> str:
+    return " ".join(str(value).split()).casefold()
+
+
+@lru_cache(maxsize=None)
+def read_grouping(path: str, sheet: str) -> tuple[tuple[str, str], ...]:
+    """(Grouping Total, Group) from cols A:B in file order. Col C ignored."""
+    ws = load_template(path)[sheet]
+    return tuple(
+        (str(total or "").strip(), str(group).strip())
+        for total, group in ws.iter_rows(min_row=2, max_col=2, values_only=True)
+        if group and str(group).strip()
+    )
+
+
+def apply_grouping(df: pd.DataFrame, grouping) -> pd.DataFrame:
+    """Order rows like grouping file, tag parent total.
+    Unlisted groups go last; listed groups with no data are dropped."""
+    inf = float("inf")
+    pos = {_norm(group): (i, total) for i, (total, group) in enumerate(grouping)}
+    hit = df[ACCOUNT_GROUP_COLUMN].map(lambda s: pos.get(_norm(s), (inf, "")))
+    df = df.assign(
+        _pos=hit.map(lambda x: x[0]),
+        **{PARENT_COLUMN: hit.map(lambda x: x[1])},
+    )
+    unlisted = df.loc[df["_pos"] == inf, ACCOUNT_GROUP_COLUMN].tolist()
+    if unlisted:
+        print(f"Not in grouping file (appended last): {unlisted}")
+    return (
+        df.sort_values("_pos", kind="stable")
+        .drop(columns="_pos")
+        .reset_index(drop=True)
+    )
+
+
+def sum_formula(column: str, rows: list[int]) -> str:
+    runs: list[list[int]] = []
+    for row in sorted(rows):
+        if runs and row == runs[-1][1] + 1:
+            runs[-1][1] = row
+        else:
+            runs.append([row, row])
+    return "=SUM(" + ",".join(
+        f"{column}{a}:{column}{b}" if a != b else f"{column}{a}"
+        for a, b in runs
+    ) + ")"
+
+
+def plan_rows(
+    dataframe: pd.DataFrame,
+    first_row: int,
+) -> tuple[list[int], list[tuple[int, str, list[int]]], int]:
+    """-> (sheet row per df row, [(total_row, label, member_rows)], grand_total_row).
+    Nesting from file alone: an UPPERCASE total (TOTAL CURRENT ASSETS) also sums
+    every non-uppercase subtotal (Total other current assets) since the last uppercase total."""
+    parents = dataframe[PARENT_COLUMN].tolist()
+    detail_rows, totals, pending, members_block, row = [], [], [], [], first_row
+
+    for i, parent in enumerate(parents):
+        detail_rows.append(row)
+        members_block.append(row)
+        row += 1
+        if i + 1 == len(parents) or parents[i + 1] != parent:
+            if parent:
+                members = list(members_block)
+                if parent.isupper():
+                    members += pending
+                    pending = []
+                else:
+                    pending.append(row)
+                totals.append((row, parent, members))
+                row += 1
+            members_block = []
+
+    return detail_rows, totals, row
+
+
+def _selfcheck() -> None:
+    df = pd.DataFrame({PARENT_COLUMN: (
+        ["Total other current assets"] * 2 + ["TOTAL CURRENT ASSETS"] * 2 + [""]
+    )})
+    rows, totals, grand = plan_rows(df, 14)
+    assert rows == [14, 15, 17, 18, 20] and grand == 21
+    assert totals == [
+        (16, "Total other current assets", [14, 15]),
+        (19, "TOTAL CURRENT ASSETS", [17, 18, 16]),
+    ]
+    assert sum_formula("C", [14, 15, 17, 18, 20]) == "=SUM(C14:C15,C17:C18,C20)"
+
+
 def prepare_data(
     config: SheetConfig,
     sources: dict[str, Any],
+    grouping: tuple[tuple[str, str], ...],
 ) -> tuple[pd.DataFrame, dict[str, str], dict[str, str], pd.DataFrame]:
     df = convert_to_pandas(sources[config.source_key], config.source_key)
 
@@ -562,6 +664,7 @@ def prepare_data(
     }
 
     grouped = grouped.rename(columns=rename_map)
+    grouped = apply_grouping(grouped, grouping)
     display_roles = {
         role: rename_map[column]
         for role, column in raw_roles.items()
@@ -831,11 +934,10 @@ def write_summary_sheet(
 
     # ── Detail rows ────────────────────────────────────────────────────────
     first_row = config.first_data_row
-    last_data_row = config.first_data_row + len(dataframe) - 1
+    detail_rows, totals, total_row = plan_rows(dataframe, first_row)
+    last_data_row = total_row - 1
 
-    for row_number, (_, source_row) in enumerate(
-        dataframe.iterrows(), config.first_data_row
-    ):
+    for row_number, (_, source_row) in zip(detail_rows, dataframe.iterrows()):
         put(
             worksheet, f"B{row_number}",
             source_row[ACCOUNT_GROUP_COLUMN],
@@ -865,6 +967,21 @@ def write_summary_sheet(
         )
         worksheet.row_dimensions[row_number].height = 18
 
+    # ── Group total rows: amount cols only, no variance/flag/yes-list ──────
+    for sub_row, label, members in totals:
+        put(
+            worksheet, f"B{sub_row}", label,
+            font=BOLD_FONT, fill=PROCEDURE_FILL, alignment=LEFT_ALIGN,
+        )
+        for column in config.role_to_excel_column.values():
+            put(
+                worksheet, f"{column}{sub_row}",
+                sum_formula(column, members),
+                font=BOLD_FONT, fill=PROCEDURE_FILL,
+                alignment=RIGHT_ALIGN, number_format=NUMBER_FORMAT,
+            )
+        worksheet.row_dimensions[sub_row].height = 18
+
     # ── Accounts Flagged (Yes): one merged cell + one array formula/block ──
     # Same pattern as the LE sheet. Style BEFORE merge so border spreads.
     if len(dataframe):
@@ -888,18 +1005,14 @@ def write_summary_sheet(
             )
             worksheet.merge_cells(f"{col}{first_row}:{col}{last_data_row}")
 
-    # ── Total row ──────────────────────────────────────────────────────────
-    total_row = config.first_data_row + len(dataframe)
+    # ── Grand total row (detail rows only, no double count) ────────────────
     put(
         worksheet, f"B{total_row}", config.total_label,
         font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_ALIGN,
     )
 
     for column in config.role_to_excel_column.values():
-        value = (
-            f"=SUM({column}{config.first_data_row}:{column}{total_row - 1})"
-            if len(dataframe) else 0
-        )
+        value = sum_formula(column, detail_rows) if detail_rows else 0
         put(
             worksheet, f"{column}{total_row}", value,
             font=BOLD_FONT, border=TOTAL_BORDER,
@@ -1393,7 +1506,9 @@ def run(
     template_path: str | Path,
     output_directory: str | Path,
     sources: dict[str, Any],
+    grouping_paths: dict[str, Any],
 ) -> None:
+    _selfcheck()
     configs = build_sheet_configs()
     workbook = load_template(template_path)
 
@@ -1412,8 +1527,11 @@ def run(
     for config in configs:
         print(f"\nPreparing {config.sheet_id}...")
 
+        grouping = read_grouping(
+            str(grouping_paths[config.grouping_sheet]), config.grouping_sheet
+        )
         dataframe, display_roles, raw_roles, raw_df = prepare_data(
-            config, sources
+            config, sources, grouping
         )
         comparisons = (
             active_blocks(config, raw_roles)
@@ -1468,7 +1586,9 @@ def run(
 def main() -> None:
     # Runtime inputs remain external; this script only processes them.
     runtime = globals()
-    required_names = ("TEMPLATE_PATH", "OUTPUT_DIRECTORY", *INPUT_NAMES)
+    required_names = (
+        "TEMPLATE_PATH", "OUTPUT_DIRECTORY", *GROUPING_PATH_NAMES, *INPUT_NAMES
+    )
     missing = [name for name in required_names if runtime.get(name) is None]
 
     if missing:
@@ -1485,209 +1605,12 @@ def main() -> None:
             "TB_Final_IS_YTD": runtime["TB_Final_IS_YTD"],
             "TB_Final_QTD": runtime["TB_Final_QTD"],
         },
+        grouping_paths={
+            "BS": runtime["GROUPING_PATH_BS"],
+            "IS": runtime["GROUPING_PATH_IS"],
+        },
     )
 
 
 if __name__ == "__main__":
     main()
-
-# Code Generated by Sidekick is for learning and experimentation purposes only.
-# filename: tb-validation-raw-to-final.py
-
-# ============ VALIDATION: RAW -> FINAL PARQUET ============
-from functools import reduce
-from pathlib import Path
-import numpy as np, pandas as pd
-from pyspark.sql import Window, functions as F
-from pyod.fs import read, read_excel, write_excel
-
-# ---------- CONFIG ----------
-TOL        = 0.01
-VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
-BS_SHEET   = "Balance Sheet TB Links"
-QTD_SHEETS = ("Income Statement TB Links",)
-LINK_SHEETS = ["Balance Sheet TB Links", "Income Statement TB Links"]
-META = {"Account", "Linked TB Account #", "__sheet__", "row_id"}
-
-SRC = {
-    "03312026": dict(path=excel_path_03312026, sheets=LINK_SHEETS, header=1, cols=Columns_03312026, kind="links"),
-    "12312025": dict(path=excel_path_12312025, sheets=LINK_SHEETS, header=1, cols=Columns_12312025, kind="links"),
-    "06302025": dict(path=excel_path_06302025, sheets=LINK_SHEETS, header=1, cols=Columns_06302025, kind="links"),
-    "09302025": dict(path="User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/"
-                          "Broadridge_-_Risk_Assessment.zip/TB_09_30_FY26.xlsx",
-                     sheets=["3) 9.30.2025"], header=8, cols=Columns_09302025_QTD, kind="plain", key="BALANCE SHEET"),
-    "03312025": dict(path=excel_path_03312025_2, sheets=["Sheet2"], header=0,
-                     cols=Columns_03312025_QTD, kind="plain", key="Account"),
-}
-YTD_LABELS = ["03312026", "12312025", "06302025"]
-QTD_PAIRS  = {"03312026": "12312025", "12312025": "09302025", "06302025": "03312025"}   # CY: PY
-QTD_FILES  = {"03312026": QTD_SHEETS, "12312025": QTD_SHEETS, "06302025": QTD_SHEETS,
-              "09302025": None, "03312025": None}
-
-FIN = {k: read(Path(OUTPUT_DIRECTORY) / f"{v}.parquet")
-       for k, v in {"BS": "TB_Final_BS", "IS": "TB_Final_IS_YTD", "QTD": "TB_Final_QTD"}.items()}
-
-# ---------- HELPERS ----------
-def bt(c): return F.col("`" + c.replace("`", "``") + "`")
-
-_cache = {}
-def prep(label, sheets=None):
-    """Raw Excel -> slim df: __A account, __G group, __S sheet, __V row net,
-    __ok has acct#, __GV group non-blank, __R raw row order.
-    Also returns unlisted non-zero numeric cols."""
-    k = (label, sheets)
-    if k in _cache: return _cache[k]
-    s = SRC[label]
-    raw = (read_excel(s["path"], sheet_name=list(sheets or s["sheets"]), header=s["header"],
-                      naming_convention="neutral", trim=True)
-           .withColumn("row_id", F.monotonically_increasing_id()))
-    net = reduce(lambda a, b: a + b, [F.coalesce(bt(c).cast("double"), F.lit(0.0)) for c in s["cols"]])
-
-    if s["kind"] == "links":
-        w, acct = Window.orderBy("row_id").rowsBetween(Window.unboundedPreceding, 0), F.col("Linked TB Account #")
-        d = (raw.withColumn("__ok", acct.isNotNull() & (acct != ""))
-                .withColumn("__A", F.upper(F.concat_ws(": ", F.split(acct, r"\.").getItem(0), F.col("Account"))))
-                .withColumn("__G", F.last(F.when(~F.col("__ok"), F.col("Account")), ignorenulls=True).over(w))
-                .withColumn("__S", F.when(F.col("__sheet__") == BS_SHEET, "BS").otherwise("IS")))
-    else:
-        d = (raw.withColumn("__ok", F.lit(True)).withColumn("__A", F.upper(bt(s["key"])))
-                .withColumn("__G", F.lit("-")).withColumn("__S", F.lit("IS")))
-
-    d = (d.withColumn("__GV", F.col("__G").isNotNull() & (F.trim(F.col("__G")) != ""))
-          .withColumn("__V", net)
-          .withColumn("__R", F.col("row_id")))
-
-    extra = [c for c in raw.columns if c not in s["cols"] and c not in META and c != s.get("key")]
-    ex = {}
-    if extra:
-        r = d.filter("__ok").agg(*[F.expr("sum(try_cast(`%s` as double))" % c.replace("`", "``")).alias(f"c{i}")
-                                   for i, c in enumerate(extra)]).first()
-        ex = {c: r[i] for i, c in enumerate(extra) if r[i]}
-    _cache[k] = (d.select("__A", "__G", "__S", "__V", "__ok", "__GV", "__R"), ex)
-    return _cache[k]
-
-def fin_sum(key, lab):
-    """Final parquet -> (Total Amount, sum of entity cols) for period lab."""
-    df, tc = FIN[key], f"Total Amount_{lab}"
-    ent = [c for c in df.columns if c.endswith(f"_{lab}") and not c.startswith(("Total Amount_", "row_count_"))]
-    r = df.agg(F.sum(bt(tc)), *[F.sum(bt(c)) for c in ent]).first()
-    return float(r[0] or 0.0), float(sum(x or 0.0 for x in r[1:]))
-
-def recon(label, sheets=None):
-    """Raw -> NoAcct -> NoGroup -> Included. Rows + amount per sheet. Diff must be 0.
-    Excluded tab is expected to hold NoAcct + NoGroup rows (zero / blank rows included)."""
-    d, _ = prep(label, sheets)
-    ok, gv, v = F.col("__ok"), F.col("__GV"), F.col("__V")
-    buckets = {"Raw": F.lit(True), "NoAcct": ~ok, "NoGroup": ok & ~gv, "Included": ok & gv,
-               "Excl_Zero": ~(ok & gv) & (v == 0)}            # informational: zero/blank rows inside Excluded
-    aggs = []
-    for k, c in buckets.items():
-        aggs += [F.sum(F.when(c, 1).otherwise(0)).alias(f"{k}_Rows"),
-                 F.sum(F.when(c, v).otherwise(0.0)).alias(f"{k}_Amt")]
-    p = d.groupBy("__S").agg(*aggs).toPandas().rename(columns={"__S": "Sheet"})
-    p.insert(0, "File", label)
-    p["Diff_Rows"] = p.Raw_Rows - p.NoAcct_Rows - p.NoGroup_Rows - p.Included_Rows
-    p["Diff_Amt"]  = (p.Raw_Amt - p.NoAcct_Amt - p.NoGroup_Amt - p.Included_Amt).round(2)
-    p["Excl_Expected_Rows"] = p.NoAcct_Rows + p.NoGroup_Rows
-    p["Excl_NonZero_Rows"]  = p.Excl_Expected_Rows - p.Excl_Zero_Rows
-    return p.drop(columns=["Excl_Zero_Amt"])                   # zero rows sum to 0 by definition
-
-def excluded(label, sheets=None):
-    """Every row that did not land in Included, including blank / zero-value rows."""
-    d, _ = prep(label, sheets)
-    seq      = F.row_number().over(Window.partitionBy("__S").orderBy("__R"))   # position within raw sheet
-    reason   = F.when(~F.col("__ok"), "No Account #").otherwise("No Group")
-    row_type = F.when(F.col("__V") == 0, "Zero / Blank").otherwise("Non-zero")
-    return (d.withColumn("__N", seq)
-             .filter(~(F.col("__ok") & F.col("__GV")))
-             .orderBy("__S", "__N")
-             .select(F.lit(label).alias("File"), F.col("__S").alias("Sheet"),
-                     F.col("__A").alias("Account"), F.col("__G").alias("Group"),
-                     reason.alias("Reason"), row_type.alias("Row_Type"),
-                     F.col("__V").alias("Amount"), F.col("__N").alias("Raw_Row_Seq"))
-             .toPandas())
-
-def add_excl_check(summary, excl):
-    """Attach actual Excluded-tab row count / amount and compare to the recon expectation."""
-    g = (excl.groupby(["File", "Sheet"])
-             .agg(Excluded_Sheet_Rows=("Amount", "size"), Excluded_Sheet_Amt=("Amount", "sum"))
-             .reset_index())
-    out = summary.merge(g, on=["File", "Sheet"], how="left")
-    out["Excluded_Sheet_Rows"] = out.Excluded_Sheet_Rows.fillna(0).astype(int)
-    out["Excluded_Sheet_Amt"]  = out.Excluded_Sheet_Amt.fillna(0.0)
-    out["Excl_Count_Diff"] = out.Excluded_Sheet_Rows - out.Excl_Expected_Rows                     # must be 0
-    out["Excl_Amt_Diff"]   = (out.Excluded_Sheet_Amt - (out.NoAcct_Amt + out.NoGroup_Amt)).round(2)  # must be 0
-    return out
-
-def ssum(df, col): return float(df.agg(F.coalesce(F.sum(col), F.lit(0.0))).first()[0])
-
-# =====================================================================
-# PART 1: YTD  (raw -> included -> final BS / IS parquet)
-# =====================================================================
-ytd_excl = pd.concat([excluded(l) for l in YTD_LABELS], ignore_index=True)
-
-ytd = pd.concat([recon(l) for l in YTD_LABELS], ignore_index=True)
-fs = [fin_sum(r.Sheet, r.File) for r in ytd.itertuples()]
-ytd["Final_Amt"]            = [x[0] for x in fs]
-ytd["Final_minus_Included"] = (ytd.Final_Amt - ytd.Included_Amt).round(2)
-ytd["Entity_minus_Total"]   = [round(x[1] - x[0], 2) for x in fs]
-ytd = add_excl_check(ytd, ytd_excl)
-ytd["Status"] = np.where((ytd.Diff_Rows == 0) & (ytd.Diff_Amt.abs() <= TOL)
-                         & (ytd.Final_minus_Included.abs() <= TOL) & (ytd.Entity_minus_Total.abs() <= TOL)
-                         & (ytd.Excl_Count_Diff == 0) & (ytd.Excl_Amt_Diff.abs() <= TOL),
-                         "PASS", "FAIL")
-
-# =====================================================================
-# PART 2: QTD
-#   2a raw -> included for every raw file QTD touches
-#   2b (CY included - matched PY) vs final QTD parquet
-# =====================================================================
-qtd_excl  = pd.concat([excluded(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
-
-qtd_files = pd.concat([recon(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
-qtd_files = add_excl_check(qtd_files, qtd_excl)
-qtd_files["Status"] = np.where((qtd_files.Diff_Rows == 0) & (qtd_files.Diff_Amt.abs() <= TOL)
-                               & (qtd_files.Excl_Count_Diff == 0) & (qtd_files.Excl_Amt_Diff.abs() <= TOL),
-                               "PASS", "FAIL")
-
-rows = []
-for cur, pri in QTD_PAIRS.items():
-    c, _ = prep(cur, QTD_SHEETS)
-    p, _ = prep(pri, QTD_SHEETS if SRC[pri]["kind"] == "links" else None)
-    cy   = c.filter(F.col("__ok") & F.col("__GV"))
-    pa   = p.filter("__ok").groupBy("__A").agg(F.sum("__V").alias("d"))
-    unm  = pa.join(c.filter("__ok").select("__A").distinct(), "__A", "left_anti")      # PY acct not in CY
-    dup  = cy.groupBy("__A").agg(F.countDistinct("__G").alias("g")).filter("g > 1").count()
-    cy_amt  = ssum(cy, "__V")
-    matched = ssum(pa.join(cy.select("__A").distinct(), "__A", "left_semi"), "d")
-    ft, fe  = fin_sum("QTD", cur)
-    rows.append({"CY": cur, "PY": pri, "CY_Included": cy_amt, "PY_Matched": matched,
-                 "Expected": cy_amt - matched, "Final": ft,
-                 "Final_minus_Expected": round(ft - (cy_amt - matched), 2),
-                 "Entity_minus_Total": round(fe - ft, 2),
-                 "PY_Unmatched_Keys": unm.count(), "PY_Unmatched_Amt": ssum(unm, "d"),
-                 "CY_Dup_Accts": dup})
-qtd_tie = pd.DataFrame(rows)
-qtd_tie["Status"] = np.where((qtd_tie.Final_minus_Expected.abs() <= TOL) & (qtd_tie.Entity_minus_Total.abs() <= TOL)
-                             & (qtd_tie.CY_Dup_Accts == 0), "PASS", "FAIL")
-
-# =====================================================================
-# UNLISTED COLUMNS (numeric cols in raw, not in entity list)
-# =====================================================================
-unl = pd.DataFrame([{"File": l, "Sheets": str(s) if s else "default", "Unlisted_Cols": len(ex),
-                     "Unlisted_Total": sum(ex.values()), "Names": ", ".join(ex)[:500]}
-                    for l, s in {**{x: None for x in YTD_LABELS}, **QTD_FILES}.items()
-                    for ex in [prep(l, s)[1]]])
-unl["Status"] = np.where(unl.Unlisted_Cols > 0, "WARN", "PASS")
-
-# =====================================================================
-# OUTPUT
-# =====================================================================
-write_excel(data={"P1_YTD": ytd, "P1_YTD_Excluded": ytd_excl,
-                  "P2a_QTD_Files": qtd_files, "P2b_QTD_TieOut": qtd_tie, "P2_QTD_Excluded": qtd_excl,
-                  "Unlisted_Cols": unl}, path=VALID_XLSX)
-
-for name, t in [("P1 YTD", ytd), ("P2a QTD raw files", qtd_files), ("P2b QTD tie-out", qtd_tie), ("Unlisted", unl)]:
-    print(f"{name}: {t.Status.value_counts().to_dict()}")
-    display(spark.createDataFrame(t.astype(str)))
-
