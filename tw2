@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 import calendar
@@ -47,7 +46,7 @@ NUMBER_FORMAT = "#,##0;(#,##0);-"
 PERCENT_FORMAT = "0%;(0%);-"
 
 INPUT_NAMES = ("TB_Final_BS", "TB_Final_IS_YTD", "TB_Final_QTD") ## Edit Input Dataframe Name as needed
-GROUPING_PATH_NAMES = ("GROUPING_PATH_BS", "GROUPING_PATH_IS") ## Notebook variables holding grouping file paths
+GROUPING_NAMES = {"BS": "GROUPING_BS", "IS": "GROUPING_IS"} ## Edit grouping dataset names as needed (IS used for YTD + QTD)
 ENTITY_SKIP_PREFIXES = ("__sheet__", "row_count_", DATE_COLUMN_PREFIX)
 
 SUMMARY_HEADER_ROW = 11
@@ -520,14 +519,13 @@ def _norm(value: Any) -> str:
     return " ".join(str(value).split()).casefold()
 
 
-@lru_cache(maxsize=None)
-def read_grouping(path: str, sheet: str) -> tuple[tuple[str, str], ...]:
-    """(Grouping Total, Group) from cols A:B in file order. Col C ignored."""
-    ws = load_template(path)[sheet]
+def read_grouping(source: Any, name: str) -> tuple[tuple[str, str], ...]:
+    """(Grouping Total, Group) from first two columns, row order kept. Other cols ignored."""
+    df = convert_to_pandas(source, name).iloc[:, :2]
     return tuple(
-        (str(total or "").strip(), str(group).strip())
-        for total, group in ws.iter_rows(min_row=2, max_col=2, values_only=True)
-        if group and str(group).strip()
+        (str(total).strip() if pd.notna(total) else "", str(group).strip())
+        for total, group in df.itertuples(index=False, name=None)
+        if pd.notna(group) and str(group).strip()
     )
 
 
@@ -1506,7 +1504,7 @@ def run(
     template_path: str | Path,
     output_directory: str | Path,
     sources: dict[str, Any],
-    grouping_paths: dict[str, Any],
+    groupings: dict[str, Any],
 ) -> None:
     _selfcheck()
     configs = build_sheet_configs()
@@ -1528,7 +1526,8 @@ def run(
         print(f"\nPreparing {config.sheet_id}...")
 
         grouping = read_grouping(
-            str(grouping_paths[config.grouping_sheet]), config.grouping_sheet
+            groupings[config.grouping_sheet],
+            GROUPING_NAMES[config.grouping_sheet],
         )
         dataframe, display_roles, raw_roles, raw_df = prepare_data(
             config, sources, grouping
@@ -1587,7 +1586,7 @@ def main() -> None:
     # Runtime inputs remain external; this script only processes them.
     runtime = globals()
     required_names = (
-        "TEMPLATE_PATH", "OUTPUT_DIRECTORY", *GROUPING_PATH_NAMES, *INPUT_NAMES
+        "TEMPLATE_PATH", "OUTPUT_DIRECTORY", *GROUPING_NAMES.values(), *INPUT_NAMES
     )
     missing = [name for name in required_names if runtime.get(name) is None]
 
@@ -1605,10 +1604,7 @@ def main() -> None:
             "TB_Final_IS_YTD": runtime["TB_Final_IS_YTD"],
             "TB_Final_QTD": runtime["TB_Final_QTD"],
         },
-        grouping_paths={
-            "BS": runtime["GROUPING_PATH_BS"],
-            "IS": runtime["GROUPING_PATH_IS"],
-        },
+        groupings={key: runtime[name] for key, name in GROUPING_NAMES.items()},
     )
 
 
