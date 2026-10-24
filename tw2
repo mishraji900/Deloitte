@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 import calendar
@@ -12,7 +13,7 @@ import pandas as pd
 from openpyxl.formatting.rule import FormulaRule
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.styles.differential import DifferentialStyle
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.cell import absolute_coordinate
 from openpyxl.worksheet.formula import ArrayFormula
 
@@ -21,7 +22,6 @@ from openpyxl.worksheet.formula import ArrayFormula
 # ============================================================================
 
 ACCOUNT_GROUP_COLUMN = "Account Grouping"
-PARENT_COLUMN = "Grouping Total"
 YES_VALUE = "Yes"
 NO_VALUE = "No"
 PROCEDURE_TEXT = "Please Fill Procedures Box."
@@ -86,6 +86,7 @@ THIN_BORDER = Border(
     top=THIN_SIDE, bottom=THIN_SIDE,
 )
 TOTAL_BORDER = Border(top=MEDIUM_SIDE, bottom=MEDIUM_SIDE)
+SUBTOTAL_BORDER = Border(top=THIN_SIDE, bottom=Side(style="double", color=BLACK))
 
 HEADER_FILL = PatternFill(fill_type="solid", fgColor=GRAY)
 PROCEDURE_FILL = PatternFill(fill_type="solid", fgColor=LIGHT_GRAY)
@@ -530,20 +531,18 @@ def read_grouping(source: Any, name: str) -> tuple[tuple[str, str], ...]:
 
 
 def apply_grouping(df: pd.DataFrame, grouping) -> pd.DataFrame:
-    """Order rows like grouping file, tag parent total.
-    Unlisted groups go last; listed groups with no data are dropped."""
+    """Order rows like grouping file. Unlisted groups go last."""
     inf = float("inf")
-    pos = {_norm(group): (i, total) for i, (total, group) in enumerate(grouping)}
-    hit = df[ACCOUNT_GROUP_COLUMN].map(lambda s: pos.get(_norm(s), (inf, "")))
-    df = df.assign(
-        _pos=hit.map(lambda x: x[0]),
-        **{PARENT_COLUMN: hit.map(lambda x: x[1])},
-    )
-    unlisted = df.loc[df["_pos"] == inf, ACCOUNT_GROUP_COLUMN].tolist()
+    pos: dict[str, int] = {}
+    for i, (_, group) in enumerate(grouping):
+        pos.setdefault(_norm(group), i)
+    key = df[ACCOUNT_GROUP_COLUMN].map(lambda s: pos.get(_norm(s), inf))
+    unlisted = df.loc[key == inf, ACCOUNT_GROUP_COLUMN].tolist()
     if unlisted:
         print(f"Not in grouping file (appended last): {unlisted}")
     return (
-        df.sort_values("_pos", kind="stable")
+        df.assign(_pos=key)
+        .sort_values("_pos", kind="stable")
         .drop(columns="_pos")
         .reset_index(drop=True)
     )
@@ -565,42 +564,51 @@ def sum_formula(column: str, rows: list[int]) -> str:
 def plan_rows(
     dataframe: pd.DataFrame,
     first_row: int,
+    grouping,
 ) -> tuple[list[int], list[tuple[int, str, list[int]]], int]:
     """-> (sheet row per df row, [(total_row, label, member_rows)], grand_total_row).
-    Nesting from file alone: an UPPERCASE total (TOTAL CURRENT ASSETS) also sums
-    every non-uppercase subtotal (Total other current assets) since the last uppercase total."""
-    parents = dataframe[PARENT_COLUMN].tolist()
-    detail_rows, totals, pending, members_block, row = [], [], [], [], first_row
+    Blocks follow grouping file order. A group name that is itself a Grouping Total
+    (rows `T2 D`, `T2 T1`) makes total T1 a member of T2. Blank row after every total."""
+    idx = {_norm(g): i for i, g in enumerate(dataframe[ACCOUNT_GROUP_COLUMN])}
+    labels = {_norm(t) for t, _ in grouping if t}
+    detail_rows = [0] * len(dataframe)
+    placed, blocks, row = set(), [], first_row
 
-    for i, parent in enumerate(parents):
-        detail_rows.append(row)
-        members_block.append(row)
-        row += 1
-        if i + 1 == len(parents) or parents[i + 1] != parent:
-            if parent:
-                members = list(members_block)
-                if parent.isupper():
-                    members += pending
-                    pending = []
-                else:
-                    pending.append(row)
-                totals.append((row, parent, members))
+    for total, items in groupby(grouping, key=lambda x: x[0]):
+        groups = [g for _, g in items]
+        own = []
+        for g in groups:
+            i = idx.get(_norm(g))
+            if i is not None and i not in placed:
+                detail_rows[i] = row
+                placed.add(i)
+                own.append(row)
                 row += 1
-            members_block = []
+        kids = [_norm(g) for g in groups if _norm(g) in labels and _norm(g) not in idx]
+        if total and (own or kids):
+            blocks.append((row, total, own, kids))
+            row += 2                                  # total row + blank row
 
+    for i in range(len(dataframe)):                   # groups not in grouping file
+        if i not in placed:
+            detail_rows[i] = row
+            row += 1
+
+    where = {_norm(label): r for r, label, _, _ in blocks}
+    totals = [
+        (r, label, own + [where[k] for k in kids if k in where])
+        for r, label, own, kids in blocks
+    ]
     return detail_rows, totals, row
 
 
 def _selfcheck() -> None:
-    df = pd.DataFrame({PARENT_COLUMN: (
-        ["Total other current assets"] * 2 + ["TOTAL CURRENT ASSETS"] * 2 + [""]
-    )})
-    rows, totals, grand = plan_rows(df, 14)
-    assert rows == [14, 15, 17, 18, 20] and grand == 21
-    assert totals == [
-        (16, "Total other current assets", [14, 15]),
-        (19, "TOTAL CURRENT ASSETS", [17, 18, 16]),
-    ]
+    grouping = [("T1", "A"), ("T1", "B"), ("T1", "C"), ("T2", "D"), ("T2", "T1")]
+    df = pd.DataFrame({ACCOUNT_GROUP_COLUMN: ["A", "B", "C", "D", "E"]})
+    rows, totals, grand = plan_rows(df, 14, grouping)
+    assert rows == [14, 15, 16, 19, 22] and grand == 23
+    assert totals == [(17, "T1", [14, 15, 16]), (20, "T2", [19, 17])]
+    assert sum_formula("C", [19, 17]) == "=SUM(C17,C19)"
     assert sum_formula("C", [14, 15, 17, 18, 20]) == "=SUM(C14:C15,C17:C18,C20)"
 
 
@@ -815,6 +823,7 @@ def write_summary_sheet(
     dataframe: pd.DataFrame,
     display_roles: dict[str, str],
     comparisons: list[ComparisonBlock],
+    grouping,
 ) -> None:
     # ── Remove old merges (row-10 block labels + any merge in data area) ───
     for merged_range in list(worksheet.merged_cells.ranges):
@@ -932,7 +941,7 @@ def write_summary_sheet(
 
     # ── Detail rows ────────────────────────────────────────────────────────
     first_row = config.first_data_row
-    detail_rows, totals, total_row = plan_rows(dataframe, first_row)
+    detail_rows, totals, total_row = plan_rows(dataframe, first_row, grouping)
     last_data_row = total_row - 1
 
     for row_number, (_, source_row) in zip(detail_rows, dataframe.iterrows()):
@@ -965,8 +974,19 @@ def write_summary_sheet(
         )
         worksheet.row_dimensions[row_number].height = 18
 
-    # ── Group total rows: amount cols only, no variance/flag/yes-list ──────
+    # ── Group total rows: single top / double bottom border, amount cols only,
+    #    no variance/flag/yes-list. Blank row follows each total. ───────────
+    skip_cols = config.spacer_columns | {
+        column_index_from_string(item.yes_list_column)
+        for item in comparisons if item.yes_list_column
+    }
+    subtotal_rows = {sub_row for sub_row, _, _ in totals}
+    spacer_rows = {sub_row + 1 for sub_row in subtotal_rows}
+
     for sub_row, label, members in totals:
+        for col in range(2, config.max_data_column + 1):
+            if col not in skip_cols:
+                worksheet.cell(row=sub_row, column=col).border = SUBTOTAL_BORDER
         put(
             worksheet, f"B{sub_row}", label,
             font=BOLD_FONT, fill=PROCEDURE_FILL, alignment=LEFT_ALIGN,
@@ -974,7 +994,7 @@ def write_summary_sheet(
         for column in config.role_to_excel_column.values():
             put(
                 worksheet, f"{column}{sub_row}",
-                sum_formula(column, members),
+                sum_formula(column, members) if members else 0,
                 font=BOLD_FONT, fill=PROCEDURE_FILL,
                 alignment=RIGHT_ALIGN, number_format=NUMBER_FORMAT,
             )
@@ -1046,6 +1066,8 @@ def write_summary_sheet(
         min_col=2,
         max_col=config.max_data_column,
     ):
+        if row[0].row in subtotal_rows or row[0].row in spacer_rows:
+            continue
         for cell in row:
             if cell.column not in config.spacer_columns and cell.border == Border():
                 cell.border = THIN_BORDER
@@ -1544,6 +1566,7 @@ def run(
             dataframe,
             display_roles,
             comparisons,
+            grouping,
         )
 
         render_legal_entity_sheets(
