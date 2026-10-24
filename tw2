@@ -1,3 +1,1599 @@
+# Databricks notebook source
+# DBTITLE 0,Journal Entry Read-In and Mapping
+# MAGIC %md
+# MAGIC # Overview
+# MAGIC ---
+# MAGIC # =====================================================================
+# MAGIC # Broadridge FY27 Consolidated Analytical Review
+# MAGIC # =====================================================================
+# MAGIC Consolidated analytics are performed quarterly to identify significant period-over-period fluctuations in balance sheet and income statement accounts. Currently, the audit team manually updates balances from the trial balance, calculates variances, applies investigation thresholds, and performs legal entity-level analysis for accounts requiring further investigation. This process is time-consuming, repetitive, and susceptible to manual errors.
+# MAGIC
+# MAGIC The proposed automation will populate the consolidated analytics workpaper directly from the trial balance, calculate the required period-over-period variances, apply predefined thresholds, and identify accounts that require additional investigation.
+# MAGIC
+# MAGIC Required Comparative Periods
+# MAGIC
+# MAGIC Balance Sheet
+# MAGIC
+# MAGIC The automation will calculate variances between the current-quarter balances and:
+# MAGIC - Prior year-end balances
+# MAGIC - Prior-quarter balances
+# MAGIC - Prior-year same-quarter balances
+# MAGIC
+# MAGIC Income Statement
+# MAGIC
+# MAGIC The automation will calculate variances between:
+# MAGIC - Current quarter-to-date (QTD) results and the prior-quarter QTD results
+# MAGIC - Current quarter QTD results and the prior-year same-quarter QTD results
+# MAGIC - Current year-to-date (YTD) results and the prior-year same-quarter YTD results
+# MAGIC
+# MAGIC
+# MAGIC # =====================================================================
+# MAGIC
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC # 1. Initialize Environment
+# MAGIC ---
+
+# COMMAND ----------
+
+# DBTITLE 1,Initialize
+# MAGIC %run /Workspace/Shared/centralized_analytics/init_cp
+
+# COMMAND ----------
+
+# DBTITLE 1,Install libraries
+# MAGIC %%bash
+# MAGIC pip install \
+# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/pyod.git" \
+# MAGIC     "git+https://$AUDIT_ANALYTICS_GITHUB_TOKEN@github.com/Deloitte-US/cdm_tools.git" \
+# MAGIC     --quiet \
+# MAGIC     --index-url https://pypi.org/simple
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ##### Refer to below PyOD overview and CDM Tools documentations in GitHub.
+# MAGIC
+# MAGIC - [**PyOD**](https://psychic-adventure-prk2wj9.pages.github.io/): Overview in generic data transformations, file operations, and workflows
+# MAGIC - [**CDM Tools**](https://legendary-adventure-o7zy2on.pages.github.io/): Tools for validating and verifying CDM behavior
+
+# COMMAND ----------
+
+# DBTITLE 1,Import methods
+import datetime
+from pathlib import Path
+
+from pyspark.sql import functions as F, types as T
+
+from pyod.config import DataFrame
+from pyod.fs import find, read, read_excel, write
+from pyod.column import cast_dtype
+from pyod.dataframe import aggregate, diagnose, map_columns
+from pyod.logging import logger
+
+from cdm_tools import read_table
+from cdm_tools.models import GeneralLedgerDetail, TrialBalance, ChartOfAccounts
+from cdm_tools.analytics import JournalEntryTesting
+
+# COMMAND ----------
+
+# This cell is for the user to run all the prerequisite codes above this line.
+# Please note that the user should scroll to the initialization section to initialize the notebook, else it would be waiting for all commands to run and it might time out and cause errors.
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #2. Define Parameters
+# MAGIC ---
+# MAGIC
+# MAGIC Provide inputs required for journal entry reconciliation and downstream analytic(s).
+
+# COMMAND ----------
+
+# DBTITLE 1,Parameters
+OUTPUT_DIRECTORY: str = "SPEC-DATAPREP/FY27/Consolidated Analytical Review"
+
+MATERIALITY: int = 63370000
+Performance_Materiality: int = 50370000
+CTT: int = 3168500
+
+# Source Omnia exports (inside a zip) + the empty template + the final output path.
+excel_path_03312026: str = "User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/3.31.2026_Omnia_Export.xlsx"
+excel_path_12312025: str = 'User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/12312025_Omnia_Export.xlsx'
+excel_path_06302025: str = 'User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/06302025_Omnia_Export.xlsx'
+excel_path_03312025: str = 'User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/03312025_Omnia_Export_Copy1.xlsx'
+excel_path_03312025_2: str = 'User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/TB_Report_-_LE_Close_USD_P3_FY25_2.xlsx'
+grouping_list: str = "User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/BR_cons_group_Copy2.xlsx"
+
+TEMPLATE_PATH = "User Imported Data/EFT_UP/FY27/Consolidated Analytical Review/Consolidated_Analytical_Review_template.xlsx"
+Validation = {}
+
+# COMMAND ----------
+
+def Ctrl_Totals(df, column_names):
+    agg_exprs = [F.sum(F.col(c)).alias(c) for c in column_names]
+    result_df = df.agg(*agg_exprs, F.count("*").alias("count"))
+    return result_df
+DISABLE_DISPLAY=False
+
+ready_for_logs = DISABLE_DISPLAY
+def display_mask(*args, **kwargs):
+    # Apply your masking or logging behavior here.
+    pass
+
+
+# Capture the original display function once, before replacing it.
+if "_original_display" not in globals():
+    _original_display = display
+
+
+def display_router(*args, **kwargs):
+    # This condition is evaluated every time display() is called.
+    if ready_for_logs:
+        return display_mask(*args, **kwargs)
+
+    return _original_display(*args, **kwargs)
+
+
+display = display_router
+
+def clean_df(df):
+    """
+    The function performs the following operations on the DataFrame:
+    1) Replace dot (.) with underscore (_) in all field names
+    2) Removes the leading and trailing spaces from all field names
+    3) Removes the leading and trailing spaces from all field values
+    """
+    new_columns = [
+        F.trim(F.expr(f"`{c}`")).alias(c.replace(".", "_").strip()) for c in df.columns
+    ]
+    return df.select(new_columns)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC #3. Omnia Export Readin
+# MAGIC ---
+
+# COMMAND ----------
+
+cp.fs.ls('User Imported Data/EFT_UP/FY27/Consolidated Analytical Review',True)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Preparing TB BS and TB IS YTD For formating Automation
+
+# COMMAND ----------
+
+TB_03312026 = read_excel(excel_path_03312026, sheet_name=["Balance Sheet TB Links", "Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_12312025 = read_excel(excel_path_12312025, sheet_name=["Balance Sheet TB Links", "Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_06302025 = read_excel(excel_path_06302025, sheet_name=["Balance Sheet TB Links", "Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_03312025 = read_excel(excel_path_03312025, sheet_name=["Balance Sheet TB Links", "Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+
+
+TB_03312026 = TB_03312026.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+
+TB_12312025 = TB_12312025.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+
+TB_06302025 = TB_06302025.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+
+TB_03312025 = TB_03312025.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+print("\nCount:",TB_03312026.count())
+print("\nCount:",TB_12312025.count())
+print("\nCount:",TB_06302025.count())
+print("\nCount:",TB_03312025.count())
+
+
+# COMMAND ----------
+
+Columns_03312026 = [ 'DL275: Broadridge Business Process Outsourcing, LLC - DLT Repo Intraday Cust', '_1', 'HB011: Signal Agency Limited', '_2', 'HB015: Broadridge Financial Solutions, Inc_', '_3', 'HB018: BR REC, LLC', '_4', 'HB020: Broadridge (Suisse) S_A_', '_5', 'HB025: Broadridge Securities Processing Solutions, LLC', '_6', 'HB026: Broadridge BPO Holding LLC', '_7', 'HB035: Broadridge Output Solutions, LLC', '_8', 'HB036: QED Financial Systems, Inc', '_9', 'HB037: Broadridge Mail, LLC', '_10', 'HB050: Broadridge ICS (Canada) ULC', '_11', 'HB051: Broadridge Customer Communications Canada, ULC', '_12', 'HB052: BR (Canada) Holdings, Inc', '_13', 'HB053: DOJLD', '_14', 'HB054: 4Sight Financial Software Ltd', '_15', 'HB055: Broadridge Trading Transfer Corporation', '_16', 'HB056: 4Sight IT Services, LTD', '_17', 'HB058: 4Sight Financial Software Inc_', '_18', 'HB060: Broadridge Investor Communications Solutions, Inc_', '_19', 'HB062: ActivePath Solutions Ltd_', '_20', 'HB070: Broadridge Financial Solutions (Canada) Corp', '_21', 'HB073: Advisorstream Ltd', '_22', 'HB075: Broadridge Nederland III B_V_', '_23', 'HB080: Broadridge Software ULC', '_24', 'HB081: Broadridge Technologies ULC', '_25', 'HB085: Broadridge Investor Communications Corporation', '_26', 'HB090: Broadridge Nederland II B_V_', '_27', 'HB095: Broadridge (Australia) Pty_ Ltd_', '_28', 'HB105: Broadridge Financial Solutions International, Ltd_', '_29', 'HB107: Broadridge (Deutschland) GmbH', '_30', 'HB108: Fund Buyer Focus, Ltd_ (In Liquidation)', '_31', 'HB110: Broadridge Nederland I B_V_', '_32', 'HB118: Broadridge UK Holdco Limited', '_33', 'HB119: Broadridge Acquisition FinCo Limited', '_34', 'HB120: Broadridge Financial Solutions Ltd_ (UK)', '_35', 'HB121: Broadridge Analytics Solutions Limited', '_36', 'HB122: Broadridge Analytics Solutions Limited (German Branch)', '_37', 'HB123: ClearStructure Financial Technology Limited', '_38', 'HB124: FundsLibrary Limited (In Liquidation)', '_39', 'HB128: Message Automation Limited', '_40', 'HB129: Systemwire Limited', '_41', 'HB130: Broadridge Asia Pacific Limited', '_42', 'HB135: Broadridge Czech Republic s_r_o_', '_43', 'HB140: Broadridge Financial Solutions (India) Private Limited', '_44', 'HB141: Summit Disclosure Solutions India Pvt Ltd', '_45', 'HB142: Rockall Technologies Ltd', '_46', 'HB150: Broadridge Wealth Aggregation and Insight Inc', '_47', 'HB155: Access Data Corporation', '_48', 'HB160: BR NYC Solutions, Inc_', '_49', 'HB165: Broadridge Corporate Issuer Solutions, LLC', '_50', 'HB175: Broadridge City Networks (UK) Ltd_', '_51', 'HB185: Broadridge (Singapore) Private Limited', '_52', 'HB200: Broadridge (Japan) Ltd_', '_53', 'HB230: Matrix Settlement & Clearance Services, LLC', '_54', 'HB235: Broadridge Retirement and Workplace Inc_', '_55', 'HB236: Broadridge Ireland Limited', '_56', 'HB237: FI360, Inc_', '_57', 'HB240: Broadridge Managed Solutions, Inc_', '_58', 'HB245: Paladyne Asia Limited', '_59', 'HB250: Paladyne Europe Limited', '_60', 'HB255: Paladyne Systems Cayman (St Petersburg branch)', '_61', 'HB260: Broadridge Financial Solutions Ltd (South Africa Foreign Branch)', '_62', 'HB261: Broadridge Financial Solutions Ltd (Belgium Branch)', '_63', 'HB265: Broadridge SPS LLC', '_64', 'HB270: Broadridge Rus LLC', '_65', 'HB280: Broadridge France SAS', '_66', 'HB285: Matrix Trust Company', '_67', 'HB290: Broadridge Poland Sp_ Z_O_O_', '_68', 'HB295: Newkirk', '_69', 'HB300: Broadridge Fixed Income Liquidity Solutions, LLC', '_70', 'HB400: Broadridge Sweden Holdings AB', '_71', 'HB401: Itiviti Holding AB', '_72', 'HB402: Itiviti AB', '_73', 'HB403: Itiviti PreferenceCo AB', '_74', 'HB404: Itiviti Group Holding AB', '_75', 'HB405: Broadridge Trading and Connectivity Solutions AB', '_76', 'HB406: Ullink UK Holdco 1 Limited', '_77', 'HB407: Ullink UK Holdco 2 Limited', '_78', 'HB409: Broadridge Trading and Connectivity Solutions Holdings SAS', '_79', 'HB410: Broadridge Trading and Connectivity Solutions SAS', '_80', 'HB411: Ullink Inc_', '_81', 'HB413: Broadridge Connectivity Solutions Philippines Inc_', '_82', 'HB414: Broadridge Trading and Connectivity Solutions Inc_', '_83', 'HB415: Ullink NYFIX Australia Pty Ltd', '_84', 'HB416: Broadridge Trading and Connectivity Solutions Japan K_K_', '_85', 'HB417: Broadridge Trading and Connectivity Solutions Limited', '_86', 'HB418: Itiviti FIX City Limited', '_87', 'HB421: Broadridge Trading and Connectivity Solutions Do Brasil LTDA', '_88', 'HB422: Broadridge Trading and Connectivity Solutions SRL', '_89', 'HB423: Broadridge Trading and Connectivity Solutions (UK) Ltd_', '_90', 'HB424: Broadridge Trading and Connectivity Solutions Pte_ Ltd', '_91', 'HB426: Broadridge Trading and Connectivity Solutions Hong Kong Limited', '_92', 'HB427: Broadridge Trading and Connectivity Solutions Operations SAS', '_93', 'HB428: Itiviti UK Services Ltd', '_94', 'HB429: Broadridge Trading And Connectivity Solutions India Private Limited', '_95', 'HB430: CameronTec AB', '_96', 'HB432: Itiviti USA Inc_', '_97', 'HB435: Itiviti Group Canada Inc', '_98', 'HB436: Itiviti Software East AB', '_99', 'HB437: Itiviti Software East AB (Russian Branch)', '_100', 'HB438: Broadridge Trading and Connectivity Solutions S_R_L_', '_101', 'HB439: Broadridge Trading and Connectivity Solutions Pty Ltd', '_102', 'HB440: Itiviti Asia Limited', '_103', 'HB441: Itiviti UK Ltd', '_104', 'HB442: Tbricks AB', '_105', 'HB445: Broadridge Trading and Connectivity Solutions Spain S_L_', '_106', "HB600: Int'l Disc'd Legal Entities", '_107', 'LT275: Broadridge Business Process Outsourcing, LLC - LTX Bond Trading Solut', '_108', 'MF275: Broadridge Business Process Outsourcing, LLC - Mutual Fund Processing', '_109', 'OP275: Broadridge Business Process Outsourcing, LLC - Operations Outsourcing', '_110', 'UK408: Ullink UK Holdco 3 Limited UK', '_111', 'US408: Ullink UK Holdco 3 Limited US', '_112', 'Elimination', '_113', 'HB016: Broadridge Holdings, LLC', '_114', 'HB310: Acolin Group (HoldCo) Limited', '_115', 'HB311: Acolin Group Limited', '_116', 'HB312: Acolin (UK) Limited', '_117', 'HB313: Accelerando associates GmbH', '_118', 'HB314: Acolin Europe AG', '_119', 'HB315: Acolin Netherlands BV', '_120', 'HB316: Accelerando Associates International SL', '_121', 'HB317: Acolin Fund Services AG', '_122', 'HB318: Acolin Holding AG', '_123', 'HB319: Acolin InfoTech AG', '_124', 'HB320: Acolin Luxembourg', '_125', 'HB321: Acolin Slovakia s_r_o', '_126', 'HB322: Acolin d_o_o_ Beograd', '_127', 'HB017: 605 Studios, LLC', '_128', 'HB156: AdvisorTarget LLC', '_129', 'HB330: CQGI MA, LLC', '_130', 'HB331: CQG Australia Pty Ltd', '_131', 'HB332: Shenzhen CQG Financial and Economic Technology Co_, LTD', '_132', 'HB333: CQG Hong Kong Ltd', '_133', 'HB334: CQG Singapore Pte Ltd', '_134', 'HB335: CQG UK Limited', '_135', 'HB336: CQGI Ukraine, LLC', '_136', 'EE140: Broadridge\nFinancial Solutions\n(India) Private\nLimited (Reclass)', '_137', 'HB047: Broadridge\nCanada Holdco 1\nULC', '_138', 'HB048: Broadridge\nCanada Holdco 2\nULC', '_139', 'HB049: Broadridge\nCanada Holdco LP', '_140', 'HB316: Acolin\nIntelligence']
+
+# COMMAND ----------
+
+Columns_03312026 = [item for item in Columns_03312026 if not item.startswith("_")]
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_03312026
+TB_03312026 = TB_03312026.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn("account_first_item",F.split(F.col("Acct"), r"\.").getItem(0)).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+
+TB_03312026 = TB_03312026.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_03312026 = TB_03312026.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_03312026 = TB_03312026.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_03312026
+    ),
+    F.lit(0.0)
+)
+TB_03312026 = TB_03312026.withColumn("Total Amount", total_expression)
+TB_03312026 = TB_03312026.select('Account','Account Grouping','Total Amount',"__sheet__",*Columns_03312026)
+print(TB_03312026.count(),"\n")
+TB_03312026 = (
+    TB_03312026
+    .groupBy("Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_03312026
+        ),
+    )
+)
+print(TB_03312026.count(),"\n")
+TB_03312026 = TB_03312026.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+
+
+# COMMAND ----------
+
+display(TB_03312026)
+
+# COMMAND ----------
+
+Columns_12312025 = ['DL275: Broadridge Business Process Outsourcing, LLC - DLT Repo Intraday Cust', '_1', 'HB011: Signal Agency Limited', '_2', 'HB015: Broadridge Financial Solutions, Inc_', '_3', 'HB018: BR REC, LLC', '_4', 'HB020: Broadridge (Suisse) S_A_', '_5', 'HB025: Broadridge Securities Processing Solutions, LLC', '_6', 'HB026: Broadridge BPO Holding LLC', '_7', 'HB035: Broadridge Output Solutions, LLC', '_8', 'HB036: QED Financial Systems, Inc', '_9', 'HB037: Broadridge Mail, LLC', '_10', 'HB050: Broadridge ICS (Canada) ULC', '_11', 'HB051: Broadridge Customer Communications Canada, ULC', '_12', 'HB052: BR (Canada) Holdings, Inc', '_13', 'HB053: DOJLD', '_14', 'HB054: 4Sight Financial Software Ltd', '_15', 'HB055: Broadridge Trading Transfer Corporation', '_16', 'HB056: 4Sight IT Services, LTD', '_17', 'HB058: 4Sight Financial Software Inc_', '_18', 'HB060: Broadridge Investor Communications Solutions, Inc_', '_19', 'HB062: ActivePath Solutions Ltd_', '_20', 'HB070: Broadridge Financial Solutions (Canada) Corp', '_21', 'HB073: Advisorstream Ltd', '_22', 'HB075: Broadridge Nederland III B_V_', '_23', 'HB080: Broadridge Software ULC', '_24', 'HB081: Broadridge Technologies ULC', '_25', 'HB085: Broadridge Investor Communications Corporation', '_26', 'HB090: Broadridge Nederland II B_V_', '_27', 'HB095: Broadridge (Australia) Pty_ Ltd_', '_28', 'HB105: Broadridge Financial Solutions International, Ltd_', '_29', 'HB107: Broadridge (Deutschland) GmbH', '_30', 'HB108: Fund Buyer Focus, Ltd_ (In Liquidation)', '_31', 'HB110: Broadridge Nederland I B_V_', '_32', 'HB118: Broadridge UK Holdco Limited', '_33', 'HB119: Broadridge Acquisition FinCo Limited', '_34', 'HB120: Broadridge Financial Solutions Ltd_ (UK)', '_35', 'HB121: Broadridge Analytics Solutions Limited', '_36', 'HB122: Broadridge Analytics Solutions Limited (German Branch)', '_37', 'HB123: ClearStructure Financial Technology Limited', '_38', 'HB124: FundsLibrary Limited (In Liquidation)', '_39', 'HB128: Message Automation Limited', '_40', 'HB129: Systemwire Limited', '_41', 'HB130: Broadridge Asia Pacific Limited', '_42', 'HB135: Broadridge Czech Republic s_r_o_', '_43', 'HB140: Broadridge Financial Solutions (India) Private Limited', '_44', 'HB141: Summit Disclosure Solutions India Pvt Ltd', '_45', 'HB142: Rockall Technologies Ltd', '_46', 'HB150: Broadridge Wealth Aggregation and Insight Inc', '_47', 'HB155: Access Data Corporation', '_48', 'HB160: BR NYC Solutions, Inc_', '_49', 'HB165: Broadridge Corporate Issuer Solutions, LLC', '_50', 'HB175: Broadridge City Networks (UK) Ltd_', '_51', 'HB185: Broadridge (Singapore) Private Limited', '_52', 'HB200: Broadridge (Japan) Ltd_', '_53', 'HB230: Matrix Settlement & Clearance Services, LLC', '_54', 'HB235: Broadridge Retirement and Workplace Inc_', '_55', 'HB236: Broadridge Ireland Limited', '_56', 'HB237: FI360, Inc_', '_57', 'HB240: Broadridge Managed Solutions, Inc_', '_58', 'HB245: Paladyne Asia Limited', '_59', 'HB250: Paladyne Europe Limited', '_60', 'HB255: Paladyne Systems Cayman (St Petersburg branch)', '_61', 'HB260: Broadridge Financial Solutions Ltd (South Africa Foreign Branch)', '_62', 'HB261: Broadridge Financial Solutions Ltd (Belgium Branch)', '_63', 'HB265: Broadridge SPS LLC', '_64', 'HB270: Broadridge Rus LLC', '_65', 'HB280: Broadridge France SAS', '_66', 'HB285: Matrix Trust Company', '_67', 'HB290: Broadridge Poland Sp_ Z_O_O_', '_68', 'HB295: Newkirk', '_69', 'HB300: Broadridge Fixed Income Liquidity Solutions, LLC', '_70', 'HB400: Broadridge Sweden Holdings AB', '_71', 'HB401: Itiviti Holding AB', '_72', 'HB402: Itiviti AB', '_73', 'HB403: Itiviti PreferenceCo AB', '_74', 'HB404: Itiviti Group Holding AB', '_75', 'HB405: Broadridge Trading and Connectivity Solutions AB', '_76', 'HB406: Ullink UK Holdco 1 Limited', '_77', 'HB407: Ullink UK Holdco 2 Limited', '_78', 'HB409: Broadridge Trading and Connectivity Solutions Holdings SAS', '_79', 'HB410: Broadridge Trading and Connectivity Solutions SAS', '_80', 'HB411: Ullink Inc_', '_81', 'HB413: Broadridge Connectivity Solutions Philippines Inc_', '_82', 'HB414: Broadridge Trading and Connectivity Solutions Inc_', '_83', 'HB415: Ullink NYFIX Australia Pty Ltd', '_84', 'HB416: Broadridge Trading and Connectivity Solutions Japan K_K_', '_85', 'HB417: Broadridge Trading and Connectivity Solutions Limited', '_86', 'HB418: Itiviti FIX City Limited', '_87', 'HB421: Broadridge Trading and Connectivity Solutions Do Brasil LTDA', '_88', 'HB422: Broadridge Trading and Connectivity Solutions SRL', '_89', 'HB423: Broadridge Trading and Connectivity Solutions (UK) Ltd_', '_90', 'HB424: Broadridge Trading and Connectivity Solutions Pte_ Ltd', '_91', 'HB426: Broadridge Trading and Connectivity Solutions Hong Kong Limited', '_92', 'HB427: Broadridge Trading and Connectivity Solutions Operations SAS', '_93', 'HB428: Itiviti UK Services Ltd', '_94', 'HB429: Broadridge Trading And Connectivity Solutions India Private Limited', '_95', 'HB430: CameronTec AB', '_96', 'HB432: Itiviti USA Inc_', '_97', 'HB435: Itiviti Group Canada Inc', '_98', 'HB436: Itiviti Software East AB', '_99', 'HB437: Itiviti Software East AB (Russian Branch)', '_100', 'HB438: Broadridge Trading and Connectivity Solutions S_R_L_', '_101', 'HB439: Broadridge Trading and Connectivity Solutions Pty Ltd', '_102', 'HB440: Itiviti Asia Limited', '_103', 'HB441: Itiviti UK Ltd', '_104', 'HB442: Tbricks AB', '_105', 'HB445: Broadridge Trading and Connectivity Solutions Spain S_L_', '_106', "HB600: Int'l Disc'd Legal Entities", '_107', 'LT275: Broadridge Business Process Outsourcing, LLC - LTX Bond Trading Solut', '_108', 'MF275: Broadridge Business Process Outsourcing, LLC - Mutual Fund Processing', '_109', 'OP275: Broadridge Business Process Outsourcing, LLC - Operations Outsourcing', '_110', 'UK408: Ullink UK Holdco 3 Limited UK', '_111', 'US408: Ullink UK Holdco 3 Limited US', '_112', 'Elimination', '_113', 'HB016: Broadridge Holdings, LLC', '_114', 'HB310: Acolin Group (HoldCo) Limited', '_115', 'HB311: Acolin Group Limited', '_116', 'HB312: Acolin (UK) Limited', '_117', 'HB313: Accelerando associates GmbH', '_118', 'HB314: Acolin Europe AG', '_119', 'HB315: Acolin Netherlands BV', '_120', 'HB316: Accelerando Associates International SL', '_121', 'HB317: Acolin Fund Services AG', '_122', 'HB318: Acolin Holding AG', '_123', 'HB319: Acolin InfoTech AG', '_124', 'HB320: Acolin Luxembourg', '_125', 'HB321: Acolin Slovakia s_r_o', '_126', 'HB322: Acolin d_o_o_ Beograd', '_127', 'HB017: 605 Studios, LLC', '_128', 'HB156: AdvisorTarget LLC', '_129', 'HB330: CQGI MA, LLC', '_130', 'HB331: CQG Australia Pty Ltd', '_131', 'HB332: Shenzhen CQG Financial and Economic Technology Co_, LTD', '_132', 'HB333: CQG Hong Kong Ltd', '_133', 'HB334: CQG Singapore Pte Ltd', '_134', 'HB335: CQG UK Limited', '_135', 'HB336: CQGI Ukraine, LLC', '_136', 'EE140: Broadridge\nFinancial Solutions\n(India) Private\nLimited (Reclass)', '_137', 'HB047: Broadridge\nCanada Holdco 1\nULC', '_138', 'HB048: Broadridge\nCanada Holdco 2\nULC', '_139', 'HB049: Broadridge\nCanada Holdco LP', '_140', 'HB316: Acolin\nIntelligence']
+
+# COMMAND ----------
+
+Columns_12312025 = [item for item in Columns_12312025 if not item.startswith("_")]
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_12312025
+TB_12312025 = TB_12312025.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn(
+    "account_first_item",
+    F.split(F.col("Acct"), r"\.").getItem(0),
+).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+TB_12312025 = TB_12312025.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_12312025 = TB_12312025.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_12312025 = TB_12312025.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_12312025
+    ),
+    F.lit(0.0)
+)
+TB_12312025 = TB_12312025.withColumn("Total Amount", total_expression)
+TB_12312025 = TB_12312025.select("Account",'Account Grouping','Total Amount',"__sheet__",*Columns_12312025)
+print(TB_12312025.count(),"\n")
+TB_12312025 = (
+    TB_12312025
+    .groupBy("Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_12312025
+        ),
+    )
+)
+print(TB_12312025.count(),"\n")
+TB_12312025 = TB_12312025.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+
+
+# COMMAND ----------
+
+display(TB_12312025)
+
+# COMMAND ----------
+
+Columns_06302025 = ['DL275: Broadridge Business Process Outsourcing, LLC - DLT Repo Intraday Cust', '_1', 'HB011: Signal Agency Limited', '_2', 'HB015: Broadridge Financial Solutions, Inc_', '_3', 'HB018: BR REC, LLC', '_4', 'HB020: Broadridge (Suisse) S_A_', '_5', 'HB025: Broadridge Securities Processing Solutions, LLC', '_6', 'HB026: Broadridge BPO Holding LLC', '_7', 'HB035: Broadridge Output Solutions, LLC', '_8', 'HB036: QED Financial Systems, Inc', '_9', 'HB037: Broadridge Mail, LLC', '_10', 'HB050: Broadridge ICS (Canada) ULC', '_11', 'HB051: Broadridge Customer Communications Canada, ULC', '_12', 'HB052: BR (Canada) Holdings, Inc', '_13', 'HB053: DOJLD', '_14', 'HB054: 4Sight Financial Software Ltd', '_15', 'HB055: Broadridge Trading Transfer Corporation', '_16', 'HB056: 4Sight IT Services, LTD', '_17', 'HB058: 4Sight Financial Software Inc_', '_18', 'HB060: Broadridge Investor Communications Solutions, Inc_', '_19', 'HB062: ActivePath Solutions Ltd_', '_20', 'HB070: Broadridge Financial Solutions (Canada) Corp', '_21', 'HB073: Advisorstream Ltd', '_22', 'HB075: Broadridge Nederland III B_V_', '_23', 'HB080: Broadridge Software ULC', '_24', 'HB081: Broadridge Technologies ULC', '_25', 'HB085: Broadridge Investor Communications Corporation', '_26', 'HB090: Broadridge Nederland II B_V_', '_27', 'HB095: Broadridge (Australia) Pty_ Ltd_', '_28', 'HB105: Broadridge Financial Solutions International, Ltd_', '_29', 'HB107: Broadridge (Deutschland) GmbH', '_30', 'HB108: Fund Buyer Focus, Ltd_ (In Liquidation)', '_31', 'HB110: Broadridge Nederland I B_V_', '_32', 'HB118: Broadridge UK Holdco Limited', '_33', 'HB119: Broadridge Acquisition FinCo Limited', '_34', 'HB120: Broadridge Financial Solutions Ltd_ (UK)', '_35', 'HB121: Broadridge Analytics Solutions Limited', '_36', 'HB122: Broadridge Analytics Solutions Limited (German Branch)', '_37', 'HB123: ClearStructure Financial Technology Limited', '_38', 'HB124: FundsLibrary Limited (In Liquidation)', '_39', 'HB128: Message Automation Limited', '_40', 'HB129: Systemwire Limited', '_41', 'HB130: Broadridge Asia Pacific Limited', '_42', 'HB135: Broadridge Czech Republic s_r_o_', '_43', 'HB140: Broadridge Financial Solutions (India) Private Limited', '_44', 'HB141: Summit Disclosure Solutions India Pvt Ltd', '_45', 'HB142: Rockall Technologies Ltd', '_46', 'HB150: Broadridge Wealth Aggregation and Insight Inc', '_47', 'HB155: Access Data Corporation', '_48', 'HB160: BR NYC Solutions, Inc_', '_49', 'HB165: Broadridge Corporate Issuer Solutions, LLC', '_50', 'HB175: Broadridge City Networks (UK) Ltd_', '_51', 'HB185: Broadridge (Singapore) Private Limited', '_52', 'HB200: Broadridge (Japan) Ltd_', '_53', 'HB230: Matrix Settlement & Clearance Services, LLC', '_54', 'HB235: Broadridge Retirement and Workplace Inc_', '_55', 'HB236: Broadridge Ireland Limited', '_56', 'HB237: FI360, Inc_', '_57', 'HB240: Broadridge Managed Solutions, Inc_', '_58', 'HB245: Paladyne Asia Limited', '_59', 'HB250: Paladyne Europe Limited', '_60', 'HB255: Paladyne Systems Cayman (St Petersburg branch)', '_61', 'HB260: Broadridge Financial Solutions Ltd (South Africa Foreign Branch)', '_62', 'HB261: Broadridge Financial Solutions Ltd (Belgium Branch)', '_63', 'HB265: Broadridge SPS LLC', '_64', 'HB270: Broadridge Rus LLC', '_65', 'HB280: Broadridge France SAS', '_66', 'HB285: Matrix Trust Company', '_67', 'HB290: Broadridge Poland Sp_ Z_O_O_', '_68', 'HB295: Newkirk', '_69', 'HB300: Broadridge Fixed Income Liquidity Solutions, LLC', '_70', 'HB400: Broadridge Sweden Holdings AB', '_71', 'HB401: Itiviti Holding AB', '_72', 'HB402: Itiviti AB', '_73', 'HB403: Itiviti PreferenceCo AB', '_74', 'HB404: Itiviti Group Holding AB', '_75', 'HB405: Broadridge Trading and Connectivity Solutions AB', '_76', 'HB406: Ullink UK Holdco 1 Limited', '_77', 'HB407: Ullink UK Holdco 2 Limited', '_78', 'HB409: Broadridge Trading and Connectivity Solutions Holdings SAS', '_79', 'HB410: Broadridge Trading and Connectivity Solutions SAS', '_80', 'HB411: Ullink Inc_', '_81', 'HB413: Broadridge Connectivity Solutions Philippines Inc_', '_82', 'HB414: Broadridge Trading and Connectivity Solutions Inc_', '_83', 'HB415: Ullink NYFIX Australia Pty Ltd', '_84', 'HB416: Broadridge Trading and Connectivity Solutions Japan K_K_', '_85', 'HB417: Broadridge Trading and Connectivity Solutions Limited', '_86', 'HB418: Itiviti FIX City Limited', '_87', 'HB421: Broadridge Trading and Connectivity Solutions Do Brasil LTDA', '_88', 'HB422: Broadridge Trading and Connectivity Solutions SRL', '_89', 'HB423: Broadridge Trading and Connectivity Solutions (UK) Ltd_', '_90', 'HB424: Broadridge Trading and Connectivity Solutions Pte_ Ltd', '_91', 'HB426: Broadridge Trading and Connectivity Solutions Hong Kong Limited', '_92', 'HB427: Broadridge Trading and Connectivity Solutions Operations SAS', '_93', 'HB428: Itiviti UK Services Ltd', '_94', 'HB429: Broadridge Trading And Connectivity Solutions India Private Limited', '_95', 'HB430: CameronTec AB', '_96', 'HB432: Itiviti USA Inc_', '_97', 'HB435: Itiviti Group Canada Inc', '_98', 'HB436: Itiviti Software East AB', '_99', 'HB437: Itiviti Software East AB (Russian Branch)', '_100', 'HB438: Broadridge Trading and Connectivity Solutions S_R_L_', '_101', 'HB439: Broadridge Trading and Connectivity Solutions Pty Ltd', '_102', 'HB440: Itiviti Asia Limited', '_103', 'HB441: Itiviti UK Ltd', '_104', 'HB442: Tbricks AB', '_105', 'HB445: Broadridge Trading and Connectivity Solutions Spain S_L_', '_106', "HB600: Int'l Disc'd Legal Entities", '_107', 'LT275: Broadridge Business Process Outsourcing, LLC - LTX Bond Trading Solut', '_108', 'MF275: Broadridge Business Process Outsourcing, LLC - Mutual Fund Processing', '_109', 'OP275: Broadridge Business Process Outsourcing, LLC - Operations Outsourcing', '_110', 'UK408: Ullink UK Holdco 3 Limited UK', '_111', 'US408: Ullink UK Holdco 3 Limited US', '_112', 'Elimination', '_113', 'HB016: Broadridge Holdings, LLC', '_114', 'HB310: Acolin Group (HoldCo) Limited', '_115', 'HB311: Acolin Group Limited', '_116', 'HB312: Acolin (UK) Limited', '_117', 'HB313: Accelerando associates GmbH', '_118', 'HB314: Acolin Europe AG', '_119', 'HB315: Acolin Netherlands BV', '_120', 'HB316: Accelerando Associates International SL', '_121', 'HB317: Acolin Fund Services AG', '_122', 'HB318: Acolin Holding AG', '_123', 'HB319: Acolin InfoTech AG', '_124', 'HB320: Acolin Luxembourg', '_125', 'HB321: Acolin Slovakia s_r_o', '_126', 'HB322: Acolin d_o_o_ Beograd', '_127', 'HB017: 605 Studios, LLC', '_128', 'HB156: AdvisorTarget LLC', '_129', 'HB330: CQGI MA, LLC', '_130', 'HB331: CQG Australia Pty Ltd', '_131', 'HB332: Shenzhen CQG Financial and Economic Technology Co_, LTD', '_132', 'HB333: CQG Hong Kong Ltd', '_133', 'HB334: CQG Singapore Pte Ltd', '_134', 'HB335: CQG UK Limited', '_135', 'HB336: CQGI Ukraine, LLC', '_136', 'EE140: Broadridge\nFinancial Solutions\n(India) Private\nLimited (Reclass)', '_137', 'HB047: Broadridge\nCanada Holdco 1\nULC', '_138', 'HB048: Broadridge\nCanada Holdco 2\nULC', '_139', 'HB049: Broadridge\nCanada Holdco LP', '_140', 'HB316: Acolin\nIntelligence']
+
+# COMMAND ----------
+
+Columns_06302025 = [item for item in Columns_06302025 if not item.startswith("_")]
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_06302025
+TB_06302025 = TB_06302025.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn(
+    "account_first_item",
+    F.split(F.col("Acct"), r"\.").getItem(0),
+).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+TB_06302025 = TB_06302025.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_06302025 = TB_06302025.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_06302025 = TB_06302025.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_06302025
+    ),
+    F.lit(0.0)
+)
+TB_06302025 = TB_06302025.withColumn("Total Amount", total_expression)
+TB_06302025 = TB_06302025.select('Account','Account Grouping','Total Amount',"__sheet__",*Columns_06302025)
+print(TB_06302025.count(),"\n")
+TB_06302025 = (
+    TB_06302025
+    .groupBy("Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_06302025
+        ),
+    )
+)
+print(TB_06302025.count(),"\n")
+TB_06302025 = TB_06302025.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+
+
+# COMMAND ----------
+
+display(TB_06302025)
+
+# COMMAND ----------
+
+manual_mapping = read_excel("User Imported Data/EFT_UP/FY27/Scoping Automation/Manual_Mapping.xlsx", sheet_name=["Sheet1"],
+                       header=0, naming_convention="neutral", trim=True)
+manual_mapping = manual_mapping.drop('__sheet__').withColumnRenamed('Account Grp CY',"Account CY").withColumnRenamed('Account Grp PY Exact Match',"Account PY")
+display(manual_mapping)
+
+# COMMAND ----------
+
+# DBTITLE 1,YTD Join
+from functools import reduce
+import re
+
+from pyspark.sql import Window
+from pyspark.sql import functions as F
+
+
+def _col(column_name):
+    escaped_name = column_name.replace("`", "``")
+    return F.col(f"`{escaped_name}`")
+
+
+def _strip_plural(token): 
+    safe_endings = ("ss", "us", "is", "as", "ous")
+
+    if len(token) <= 2 or not token.endswith("s"):
+        return token
+
+    if token.endswith(safe_endings):
+        return token
+
+    return token[:-1]
+
+
+def account_key(value):
+    if value is None:
+        return ""
+
+    text = str(value).casefold().strip()
+    text = text.replace("'", "").replace("\u2019", "")
+    text = text.replace("&", " and ")
+    text = re.sub(r"[-\u2013\u2014]", " ", text)
+    text = re.sub(r"\bvalutaion\b", "valuation", text)
+    text = re.sub(r"\bvalutations\b", "valuation", text)
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    tokens = sorted(text.split())
+    tokens = [_strip_plural(token) for token in tokens]
+
+    return " ".join(tokens)
+
+
+def spark_account_key(column_name, alias_map=None):
+    step = F.lower(F.trim(_col(column_name).cast("string")))
+
+    step = F.regexp_replace(step, r"['\u2019]", "")
+    step = F.regexp_replace(step, r"&", " and ")
+    step = F.regexp_replace(step, r"[-\u2013\u2014]", " ")
+    step = F.regexp_replace(
+        step,
+        r"(?i)\bvalutaions?\b",
+        "valuation",
+    )
+    step = F.regexp_replace(step, r"[^a-z0-9 ]+", " ")
+    step = F.trim(F.regexp_replace(step, r"\s+", " "))
+
+    tokens = F.array_sort(F.split(step, " "))
+
+    tokens_singular = F.transform(
+        tokens,
+        lambda token: F.when(
+            (F.length(token) > 2)
+            & token.endswith("s")
+            & (~token.endswith("ss"))
+            & (~token.endswith("us"))
+            & (~token.endswith("is"))
+            & (~token.endswith("as"))
+            & (~token.endswith("ous")),
+            F.regexp_replace(token, "s$", ""),
+        ).otherwise(token),
+    )
+
+    normalized_key = F.concat_ws(" ", tokens_singular)
+
+    if alias_map:
+        mapping_expression = F.create_map(
+            *[
+                item
+                for source_key, target_key in alias_map.items()
+                for item in (
+                    F.lit(source_key),
+                    F.lit(target_key),
+                )
+            ]
+        )
+
+        normalized_key = F.coalesce(
+            mapping_expression[normalized_key],
+            normalized_key,
+        )
+
+    return normalized_key
+
+
+def _spark_account_is_valid(column_name):
+    source = _col(column_name)
+
+    return (
+        source.isNotNull()
+        & (F.trim(source.cast("string")) != F.lit(""))
+    )
+
+
+def _collect_account_keys(dataframe, account_column):
+    return [
+        row["account_value"]
+        for row in (
+            dataframe
+            .select(
+                _col(account_column)
+                .cast("string")
+                .alias("account_value")
+            )
+            .filter(
+                _col(account_column).isNotNull()
+                & (
+                    F.trim(
+                        _col(account_column).cast("string")
+                    )
+                    != ""
+                )
+            )
+            .distinct()
+            .collect()
+        )
+    ]
+
+
+def _build_fuzzy_alias_map(canonical_keys, comparison_keys):
+    canonical_by_normalized_key = {}
+
+    for key in canonical_keys:
+        normalized = account_key(key)
+
+        if normalized and normalized not in canonical_by_normalized_key:
+            canonical_by_normalized_key[normalized] = normalized
+
+    alias_map = {}
+
+    for key in set(comparison_keys):
+        normalized = account_key(key)
+
+        if normalized in canonical_by_normalized_key:
+            alias_map[normalized] = canonical_by_normalized_key[
+                normalized
+            ]
+
+    return alias_map
+
+
+def _build_manual_alias_map(
+    manual_mapping,
+    canonical_column="Account CY",
+    comparison_column="Account PY",
+):
+    if manual_mapping is None:
+        return {}
+
+    required_columns = {
+        canonical_column,
+        comparison_column,
+    }
+
+    missing_columns = required_columns - set(
+        manual_mapping.columns
+    )
+
+    if missing_columns:
+        raise KeyError(
+            f"Manual mapping is missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+
+    rows = (
+        manual_mapping
+        .select(
+            F.trim(
+                _col(canonical_column).cast("string")
+            ).alias("__canonical_account"),
+            F.trim(
+                _col(comparison_column).cast("string")
+            ).alias("__comparison_account"),
+        )
+        .filter(
+            F.col("__canonical_account").isNotNull()
+            & (F.col("__canonical_account") != "")
+            & F.col("__comparison_account").isNotNull()
+            & (F.col("__comparison_account") != "")
+        )
+        .distinct()
+        .collect()
+    )
+
+    alias_map = {}
+
+    for row in rows:
+        comparison_key = account_key(
+            row["__comparison_account"]
+        )
+        canonical_key = account_key(
+            row["__canonical_account"]
+        )
+
+        if comparison_key and canonical_key:
+            if comparison_key != canonical_key:
+                alias_map[comparison_key] = canonical_key
+
+    return alias_map
+
+
+def _add_account_occurrence_number(
+    dataframe,
+    account_column,
+    row_id_column,
+    alias_map,
+):
+    if account_column not in dataframe.columns:
+        raise KeyError(
+            f"{account_column!r} is missing from the DataFrame"
+        )
+
+    if row_id_column not in dataframe.columns:
+        raise KeyError(
+            f"{row_id_column!r} is missing from the DataFrame"
+        )
+
+    prepared = (
+        dataframe
+        .filter(_spark_account_is_valid(account_column))
+        .withColumn(
+            "__account_key",
+            spark_account_key(
+                account_column,
+                alias_map,
+            ),
+        )
+        .withColumn(
+            "__row_id",
+            _col(row_id_column).cast("long"),
+        )
+        .withColumn(
+            "__source_tiebreaker",
+            F.monotonically_increasing_id(),
+        )
+    )
+
+    occurrence_window = (
+        Window
+        .partitionBy("__account_key")
+        .orderBy(
+            F.col("__row_id").asc_nulls_last(),
+            F.col("__source_tiebreaker").asc(),
+        )
+    )
+
+    return prepared.withColumn(
+        "__account_occurrence",
+        F.row_number().over(occurrence_window),
+    )
+
+
+def _prepare_dataframe(
+    dataframe,
+    source_suffix,
+    account_column,
+    sheet_column,
+    row_id_column,
+    alias_map,
+):
+    prepared = _add_account_occurrence_number(
+        dataframe=dataframe,
+        account_column=account_column,
+        row_id_column=row_id_column,
+        alias_map=alias_map,
+    )
+
+    value_columns = [
+        column_name
+        for column_name in dataframe.columns
+        if column_name not in {
+            account_column,
+            sheet_column,
+        }
+    ]
+
+    if sheet_column in dataframe.columns:
+        source_sheet = _col(sheet_column)
+    else:
+        source_sheet = F.lit(str(source_suffix))
+
+    return prepared.select(
+        "__account_key",
+        "__account_occurrence",
+        _col(account_column).alias(
+            f"__account_name_{source_suffix}"
+        ),
+        source_sheet.alias(
+            f"__sheet_{source_suffix}"
+        ),
+        *[
+            _col(column_name).alias(
+                f"{column_name}_{source_suffix}"
+            )
+            for column_name in value_columns
+        ],
+    )
+
+
+def full_outer_join_all(
+    dataframes,
+    account_column="Account Grouping",
+    sheet_column="__sheet__",
+    row_id_column="row_id",
+    manual_mapping=None,
+    manual_canonical_column="Account CY",
+    manual_comparison_column="Account PY",
+):
+    if not dataframes:
+        raise ValueError(
+            "dataframes must contain at least one DataFrame"
+        )
+
+    suffixes = [
+        str(source_suffix)
+        for source_suffix, _ in dataframes
+    ]
+
+    if len(suffixes) != len(set(suffixes)):
+        raise ValueError(
+            "Each DataFrame must have a unique suffix"
+        )
+
+    # Confirm the input columns before joining.
+    for suffix, dataframe in dataframes:
+        print(f"{suffix} input columns: {dataframe.columns}")
+
+    canonical_dataframe = dataframes[0][1]
+
+    canonical_keys = _collect_account_keys(
+        canonical_dataframe,
+        account_column,
+    )
+
+    comparison_keys = []
+
+    for _, dataframe in dataframes[1:]:
+        comparison_keys.extend(
+            _collect_account_keys(
+                dataframe,
+                account_column,
+            )
+        )
+
+    alias_map = _build_fuzzy_alias_map(
+        canonical_keys=canonical_keys,
+        comparison_keys=comparison_keys,
+    )
+
+    if manual_mapping is not None:
+        alias_map.update(
+            _build_manual_alias_map(
+                manual_mapping=manual_mapping,
+                canonical_column=manual_canonical_column,
+                comparison_column=manual_comparison_column,
+            )
+        )
+
+    prepared_dataframes = [
+        _prepare_dataframe(
+            dataframe=dataframe,
+            source_suffix=str(source_suffix),
+            account_column=account_column,
+            sheet_column=sheet_column,
+            row_id_column=row_id_column,
+            alias_map=alias_map,
+        )
+        for source_suffix, dataframe in dataframes
+    ]
+
+    result = prepared_dataframes[0]
+
+    for right_dataframe in prepared_dataframes[1:]:
+        result = result.join(
+            right_dataframe,
+            on=[
+                "__account_key",
+                "__account_occurrence",
+            ],
+            how="full_outer",
+        )
+
+    account_name_columns = [
+        f"__account_name_{suffix}"
+        for suffix in suffixes
+    ]
+
+    sheet_name_columns = [
+        f"__sheet_{suffix}"
+        for suffix in suffixes
+    ]
+
+    output_columns = []
+
+    for source_suffix, dataframe in dataframes:
+        source_value_columns = [
+            column_name
+            for column_name in dataframe.columns
+            if column_name not in {
+                account_column,
+                sheet_column,
+            }
+        ]
+
+        for column_name in source_value_columns:
+            output_name = (
+                f"{column_name}_{source_suffix}"
+            )
+
+            if output_name not in output_columns:
+                output_columns.append(output_name)
+
+    print(f"Output value columns: {output_columns}")
+
+    if not output_columns:
+        raise ValueError(
+            "No non-key columns were found. "
+            "Check the input DataFrame schemas."
+        )
+
+    final_columns = [
+        F.coalesce(
+            *[
+                _col(column_name)
+                for column_name in account_name_columns
+            ]
+        ).alias(account_column),
+        F.coalesce(
+            *[
+                _col(column_name)
+                for column_name in sheet_name_columns
+            ]
+        ).alias(sheet_column),
+    ]
+
+    final_columns.extend(
+        _col(column_name)
+        for column_name in output_columns
+    )
+
+    return result.select(*final_columns)
+
+
+# Optional manual mapping input.
+# Expected columns:
+#   Account CY
+#   Account PY
+
+TB_Final = full_outer_join_all(
+    dataframes=[
+        ("03312026", TB_03312026),
+        ("12312025", TB_12312025),
+        ("06302025", TB_06302025),
+    ],
+    account_column="Account Grouping",
+    sheet_column="__sheet__",
+    row_id_column="row_count",
+    manual_mapping=manual_mapping,
+)
+
+
+display(TB_Final)
+
+
+# COMMAND ----------
+
+Validation["IS-BS Totals"] = TB_Final.toPandas()
+
+# COMMAND ----------
+
+TB_Final_BS = TB_Final.filter(col('__sheet__').isin("BS"))
+TB_Final_IS_YTD = TB_Final.filter(col('__sheet__').isin("IS"))
+
+
+# COMMAND ----------
+
+write(TB_Final_BS, Path(OUTPUT_DIRECTORY) / "TB_Final_BS.parquet", mode='overwrite', register=True)
+TB_Final_BS = read(Path(OUTPUT_DIRECTORY) / "TB_Final_BS.parquet")
+display(TB_Final_BS)
+
+# COMMAND ----------
+
+write(TB_Final_IS_YTD, Path(OUTPUT_DIRECTORY) / "TB_Final_IS_YTD.parquet", mode='overwrite', register=True)
+TB_Final_IS_YTD = read(Path(OUTPUT_DIRECTORY) / "TB_Final_IS_YTD.parquet")
+display(TB_Final_IS_YTD)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Preparing TB IS QTD Balances
+
+# COMMAND ----------
+
+TB_03312026_QTD = read_excel(excel_path_03312026, sheet_name=["Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_12312025_QTD = read_excel(excel_path_12312025, sheet_name=["Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_06302025_QTD = read_excel(excel_path_06302025, sheet_name=["Income Statement TB Links"],
+                       header=1, naming_convention="neutral", trim=True)
+TB_09302025_QTD = read_excel('User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/Broadridge_-_Risk_Assessment.zip/TB_09_30_FY26.xlsx', sheet_name=["3) 9.30.2025"],
+                       header=8, naming_convention="neutral", trim=True)
+TB_03312025_QTD = read_excel(excel_path_03312025_2, sheet_name=["Sheet2"],
+                       header=0, naming_convention="neutral", trim=True)
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_03312026_QTD
+TB_03312026_QTD = TB_03312026_QTD.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+TB_03312026_QTD = TB_03312026_QTD.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn("account_first_item",F.split(F.col("Acct"), r"\.").getItem(0)).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+
+TB_03312026_QTD = TB_03312026_QTD.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_03312026_QTD = TB_03312026_QTD.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_03312026_QTD = TB_03312026_QTD.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_03312026
+    ),
+    F.lit(0.0)
+)
+TB_03312026_QTD = TB_03312026_QTD.withColumn("Total Amount", total_expression)
+TB_03312026_QTD = TB_03312026_QTD.select('Account','Account Grouping','Total Amount',"__sheet__",*Columns_03312026)
+print(TB_03312026_QTD.count(),"\n")
+TB_03312026_QTD = (
+    TB_03312026_QTD
+    .groupBy("Account","Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_03312026
+        ),
+    )
+)
+print(TB_03312026_QTD.count(),"\n")
+TB_03312026_QTD = TB_03312026_QTD.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+Validation["TB_03312026_IS"] = TB_03312026_QTD.toPandas()
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_12312025_QTD
+TB_12312025_QTD = TB_12312025_QTD.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+TB_12312025_QTD = TB_12312025_QTD.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn("account_first_item",F.split(F.col("Acct"), r"\.").getItem(0)).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+
+TB_12312025_QTD = TB_12312025_QTD.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_12312025_QTD = TB_12312025_QTD.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_12312025_QTD = TB_12312025_QTD.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_12312025
+    ),
+    F.lit(0.0)
+)
+TB_12312025_QTD = TB_12312025_QTD.withColumn("Total Amount", total_expression)
+TB_12312025_QTD = TB_12312025_QTD.select('Account','Account Grouping','Total Amount',"__sheet__",*Columns_12312025)
+print(TB_12312025_QTD.count(),"\n")
+TB_12312025_QTD = (
+    TB_12312025_QTD
+    .groupBy("Account","Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_12312025
+        ),
+    )
+)
+print(TB_12312025_QTD.count(),"\n")
+TB_12312025_QTD = TB_12312025_QTD.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+Validation["TB_12312025_IS"] = TB_12312025_QTD.toPandas()
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_06302025_QTD
+TB_06302025_QTD = TB_06302025_QTD.withColumn(
+    "row_id",
+    F.monotonically_increasing_id()
+)
+TB_06302025_QTD = TB_06302025_QTD.withColumnRenamed('Account',"Description").withColumnRenamed("Linked TB Account #","Acct").withColumn("account_first_item",F.split(F.col("Acct"), r"\.").getItem(0)).withColumn('Account',F.concat_ws(': ',col('account_first_item'),col('Description')))
+
+TB_06302025_QTD = TB_06302025_QTD.withColumn(
+    "Account Grouping",
+    F.when(
+        F.col("Acct").isNull() | (F.col("Acct") == ""),
+        F.col("Description")
+    ).otherwise(None)
+)
+window_spec = (
+    Window
+    .orderBy(F.col("row_id"))
+    .rowsBetween(Window.unboundedPreceding, Window.currentRow)
+)
+TB_06302025_QTD = TB_06302025_QTD.withColumn(
+        "Account Grouping",
+        F.last("Account Grouping", ignorenulls=True).over(window_spec)
+    ).withColumn(
+        "Account",
+        F.upper(col('Account'))
+    )
+TB_06302025_QTD = TB_06302025_QTD.filter(~(F.col("Acct").isNull() | (F.col("Acct") == "")))
+
+
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_06302025
+    ),
+    F.lit(0.0)
+)
+TB_06302025_QTD = TB_06302025_QTD.withColumn("Total Amount", total_expression)
+TB_06302025_QTD = TB_06302025_QTD.select('Account','Account Grouping','Total Amount',"__sheet__",*Columns_06302025)
+print(TB_06302025_QTD.count(),"\n")
+TB_06302025_QTD = (
+    TB_06302025_QTD
+    .groupBy("Account","Account Grouping","__sheet__")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_06302025
+        ),
+    )
+)
+print(TB_06302025_QTD.count(),"\n")
+TB_06302025_QTD = TB_06302025_QTD.withColumn('__sheet__',F.when(col('__sheet__').isin("Balance Sheet TB Links"),lit('BS')).otherwise(lit("IS")))
+Validation["TB_06302025_IS"] = TB_06302025_QTD.toPandas()
+
+
+# COMMAND ----------
+
+Columns_09302025_QTD = ['HB015: Broadridge\nFinancial Solutions,\nInc_', 'HB020: Broadridge\n(Suisse) S_A_', 'HB025: Broadridge\nSecurities Processing\nSolutions, LLC', 'HB026: Broadridge\nBPO Holding LLC', 'HB035: Broadridge\nOutput Solutions,\nLLC', 'HB050: Broadridge\nICS (Canada) ULC', 'HB051: Broadridge\nCustomer\nCommunications\nCanada, ULC', 'HB052: BR (Canada)\nHoldings, Inc', 'HB053: DOJLD', 'HB054: 4Sight\nFinancial Software\nLtd', 'HB055: Broadridge\nTrading Transfer\nCorporation', 'HB058: 4Sight\nFinancial Software\nInc_', 'HB060: Broadridge\nInvestor\nCommunications\nSolutions, Inc_', 'HB062: ActivePath\nSolutions Ltd_', 'HB070: Broadridge\nFinancial Solutions\n(Canada) Corp', 'HB073: Advisorstream\nLtd', 'HB075: Broadridge\nNederland III B_V_', 'HB080: Broadridge\nSoftware ULC', 'HB081: Broadridge\nTechnologies ULC', 'HB085: Broadridge\nInvestor\nCommunications\nCorporation', 'HB090: Broadridge\nNederland II B_V_', 'HB095: Broadridge\n(Australia) Pty_ Ltd_', 'HB105: Broadridge\nFinancial Solutions\nInternational, Ltd_', 'HB107: Broadridge\n(Deutschland) GmbH', 'HB108: Fund Buyer\nFocus, Ltd_ (In\nLiquidation)', 'HB110: Broadridge\nNederland I B_V_', 'HB120: Broadridge\nFinancial Solutions\nLtd_ (UK)', 'HB121: Broadridge\nAnalytics Solutions\nLimited', 'HB124: FundsLibrary\nLimited (In\nLiquidation)', 'HB129: Systemwire\nLimited', 'HB130: Broadridge\nAsia Pacific Limited', 'HB135: Broadridge\nCzech Republic s_r_o_', 'HB140: Broadridge\nFinancial Solutions\n(India) Private\nLimited', 'HB141: Summit\nDisclosure Solutions\nIndia Pvt Ltd', 'HB150: Broadridge\nWealth Aggregation\nand Insight Inc', 'HB155: Access Data\nCorporation', 'HB160: BR NYC\nSolutions, Inc_', 'HB165: Broadridge\nCorporate Issuer\nSolutions, LLC', 'HB175: Broadridge\nCity Networks (UK)\nLtd_', 'HB185: Broadridge\n(Singapore) Private\nLimited', 'HB200: Broadridge\n(Japan) Ltd_', 'HB230: Matrix\nSettlement &\nClearance Services,\nLLC', 'HB235: Broadridge\nRetirement and\nWorkplace Inc_', 'HB236: Broadridge\nIreland Limited', 'HB237: FI360, Inc_', 'HB240: Broadridge\nManaged Solutions,\nInc_', 'HB250: Paladyne\nEurope Limited', 'HB260: Broadridge\nFinancial Solutions\nLtd (South Africa\nForeign Branch)', 'HB265: Broadridge\nSPS LLC', 'HB270: Broadridge\nRus LLC', 'HB280: Broadridge\nFrance SAS', 'HB285: Matrix Trust\nCompany', 'HB290: Broadridge\nPoland Sp_ Z_O_O_', 'HB295: Newkirk', 'HB300: Broadridge\nFixed Income\nLiquidity Solutions,\nLLC', 'HB400: Broadridge\nSweden Holdings AB', 'HB401: Itiviti Holding\nAB', 'HB402: Itiviti AB', 'HB403: Itiviti\nPreferenceCo AB', 'HB404: Itiviti Group\nHolding AB', 'HB405: Broadridge\nTrading and\nConnectivity\nSolutions AB', 'HB406: Ullink UK\nHoldco 1 Limited', 'HB407: Ullink UK\nHoldco 2 Limited', 'HB409: Broadridge\nTrading and\nConnectivity\nSolutions Holdings\nSAS', 'HB410: Broadridge\nTrading and\nConnectivity\nSolutions SAS', 'HB411: Ullink Inc_', 'HB413: Broadridge\nConnectivity\nSolutions Philippines\nInc_', 'HB414: Broadridge\nTrading and\nConnectivity\nSolutions Inc_', 'HB415: Ullink NYFIX\nAustralia Pty Ltd', 'HB416: Broadridge\nTrading and\nConnectivity\nSolutions Japan K_K_', 'HB417: Broadridge\nTrading and\nConnectivity\nSolutions Limited', 'HB418: Itiviti FIX City\nLimited', 'HB421: Broadridge\nTrading and\nConnectivity\nSolutions Do Brasil\nLTDA', 'HB422: Broadridge\nTrading and\nConnectivity\nSolutions SRL', 'HB423: Broadridge\nTrading and\nConnectivity\nSolutions (UK) Ltd_', 'HB424: Broadridge\nTrading and\nConnectivity\nSolutions Pte_ Ltd', 'HB426: Broadridge\nTrading and\nConnectivity\nSolutions Hong Kong\nLimited', 'HB428: Itiviti UK\nServices Ltd', 'HB429: Broadridge\nTrading And\nConnectivity\nSolutions India\nPrivate Limited', 'HB435: Itiviti Group\nCanada Inc', 'HB436: Itiviti\nSoftware East AB', 'HB437: Itiviti\nSoftware East AB\n(Russian Branch)', 'HB438: Broadridge\nTrading and\nConnectivity\nSolutions S_R_L_', 'HB439: Broadridge\nTrading and\nConnectivity\nSolutions Pty Ltd', 'HB441: Itiviti UK Ltd', 'HB445: Broadridge\nTrading and\nConnectivity\nSolutions Spain S_L_', "HB600: Int'l Disc'd\nLegal Entities", 'MF275: Broadridge\nBusiness Process\nOutsourcing, LLC -\nMutual Fund\nProcessing', 'US408: Ullink UK\nHoldco 3 Limited US', 'Elimination'] 
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_09302025_QTD
+TB_09302025_QTD = TB_09302025_QTD.withColumn("BALANCE SHEET",F.upper(col('BALANCE SHEET')))
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_09302025_QTD
+    ),
+    F.lit(0.0)
+)
+TB_09302025_QTD = TB_09302025_QTD.withColumn("Total Amount", total_expression)
+TB_09302025_QTD = TB_09302025_QTD.select('BALANCE SHEET','Total Amount',*Columns_09302025_QTD)
+print(TB_09302025_QTD.count(),"\n")
+TB_09302025_QTD = (
+    TB_09302025_QTD
+    .groupBy("BALANCE SHEET")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_09302025_QTD
+        ),
+    )
+)
+print(TB_09302025_QTD.count(),"\n")
+TB_09302025_QTD = TB_09302025_QTD.withColumnRenamed("BALANCE SHEET","Account")
+Validation["TB_09302025_IS"] = TB_09302025_QTD.toPandas()
+
+# COMMAND ----------
+
+Columns_03312025_QTD = ['HB015: Broadridge\nFinancial Solutions,\nInc_', 'HB020: Broadridge\n(Suisse) S_A_', 'HB025: Broadridge\nSecurities Processing\nSolutions, LLC', 'HB026: Broadridge\nBPO Holding LLC', 'HB035: Broadridge\nOutput Solutions,\nLLC', 'HB050: Broadridge\nICS (Canada) ULC', 'HB051: Broadridge\nCustomer\nCommunications\nCanada, ULC', 'HB052: BR (Canada)\nHoldings, Inc', 'HB053: DOJLD', 'HB054: 4Sight\nFinancial Software\nLtd', 'HB055: Broadridge\nTrading Transfer\nCorporation', 'HB058: 4Sight\nFinancial Software\nInc_', 'HB060: Broadridge\nInvestor\nCommunications\nSolutions, Inc_', 'HB062: ActivePath\nSolutions Ltd_', 'HB070: Broadridge\nFinancial Solutions\n(Canada) Corp', 'HB073: Advisorstream\nLtd', 'HB080: Broadridge\nSoftware ULC', 'HB081: Broadridge\nTechnologies ULC', 'HB085: Broadridge\nInvestor\nCommunications\nCorporation', 'HB090: Broadridge\nNederland II B_V_', 'HB095: Broadridge\n(Australia) Pty_ Ltd_', 'HB105: Broadridge\nFinancial Solutions\nInternational, Ltd_', 'HB107: Broadridge\n(Deutschland) GmbH', 'HB108: Fund Buyer\nFocus, Ltd_ (In\nLiquidation)', 'HB120: Broadridge\nFinancial Solutions\nLtd_ (UK)', 'HB121: Broadridge\nAnalytics Solutions\nLimited', 'HB123:\nClearStructure\nFinancial\nTechnology Limited', 'HB124: FundsLibrary\nLimited (In\nLiquidation)', 'HB128: Message\nAutomation Limited', 'HB129: Systemwire\nLimited', 'HB130: Broadridge\nAsia Pacific Limited', 'HB135: Broadridge\nCzech Republic s_r_o_', 'HB140: Broadridge\nFinancial Solutions\n(India) Private\nLimited', 'HB141: Summit\nDisclosure Solutions\nIndia Pvt Ltd', 'HB150: Broadridge\nWealth Aggregation\nand Insight Inc', 'HB155: Access Data\nCorporation', 'HB160: BR NYC\nSolutions, Inc_', 'HB165: Broadridge\nCorporate Issuer\nSolutions, LLC', 'HB175: Broadridge\nCity Networks (UK)\nLtd_', 'HB185: Broadridge\n(Singapore) Private\nLimited', 'HB200: Broadridge\n(Japan) Ltd_', 'HB230: Matrix\nSettlement &\nClearance Services,\nLLC', 'HB235: Broadridge\nRetirement and\nWorkplace Inc_', 'HB236: Broadridge\nIreland Limited', 'HB237: FI360, Inc_', 'HB240: Broadridge\nManaged Solutions,\nInc_', 'HB245: Paladyne\nAsia Limited', 'HB250: Paladyne\nEurope Limited', 'HB260: Broadridge\nFinancial Solutions\nLtd (South Africa\nForeign Branch)', 'HB265: Broadridge\nSPS LLC', 'HB270: Broadridge\nRus LLC', 'HB280: Broadridge\nFrance SAS', 'HB285: Matrix Trust\nCompany', 'HB290: Broadridge\nPoland Sp_ Z_O_O_', 'HB295: Newkirk', 'HB300: Broadridge\nFixed Income\nLiquidity Solutions,\nLLC', 'HB400: Broadridge\nSweden Holdings AB', 'HB401: Itiviti Holding\nAB', 'HB402: Itiviti AB', 'HB403: Itiviti\nPreferenceCo AB', 'HB404: Itiviti Group\nHolding AB', 'HB405: Broadridge\nTrading and\nConnectivity\nSolutions AB', 'HB406: Ullink UK\nHoldco 1 Limited', 'HB407: Ullink UK\nHoldco 2 Limited', 'HB409: Broadridge\nTrading and\nConnectivity\nSolutions Holdings\nSAS', 'HB410: Broadridge\nTrading and\nConnectivity\nSolutions SAS', 'HB413: Broadridge\nConnectivity\nSolutions Philippines\nInc_', 'HB414: Broadridge\nTrading and\nConnectivity\nSolutions Inc_', 'HB415: Ullink NYFIX\nAustralia Pty Ltd', 'HB416: Broadridge\nTrading and\nConnectivity\nSolutions Japan K_K_', 'HB417: Broadridge\nTrading and\nConnectivity\nSolutions Limited', 'HB418: Itiviti FIX City\nLimited', 'HB421: Broadridge\nTrading and\nConnectivity\nSolutions Do Brasil\nLTDA', 'HB422: Broadridge\nTrading and\nConnectivity\nSolutions SRL', 'HB423: Broadridge\nTrading and\nConnectivity\nSolutions (UK) Ltd_', 'HB424: Broadridge\nTrading and\nConnectivity\nSolutions Pte_ Ltd', 'HB426: Broadridge\nTrading and\nConnectivity\nSolutions Hong Kong\nLimited', 'HB428: Itiviti UK\nServices Ltd', 'HB429: Broadridge\nTrading And\nConnectivity\nSolutions India\nPrivate Limited', 'HB432: Itiviti USA\nInc_', 'HB435: Itiviti Group\nCanada Inc', 'HB436: Itiviti\nSoftware East AB', 'HB437: Itiviti\nSoftware East AB\n(Russian Branch)', 'HB438: Broadridge\nTrading and\nConnectivity\nSolutions S_R_L_', 'HB439: Broadridge\nTrading and\nConnectivity\nSolutions Pty Ltd', 'HB440: Itiviti Asia\nLimited', 'HB441: Itiviti UK Ltd', 'HB445: Broadridge\nTrading and\nConnectivity\nSolutions Spain S_L_', "HB600: Int'l Disc'd\nLegal Entities", 'MF275: Broadridge\nBusiness Process\nOutsourcing, LLC -\nMutual Fund\nProcessing', 'US408: Ullink UK\nHoldco 3 Limited US']
+
+# COMMAND ----------
+
+# DBTITLE 1,TB_03312025_QTD
+TB_03312025_QTD = TB_03312025_QTD.withColumn("Account",F.upper(col('Account')))
+total_expression = sum(
+    (
+        F.coalesce(F.col(column).cast("double"), F.lit(0.0))
+        for column in Columns_03312025_QTD
+    ),
+    F.lit(0.0)
+)
+TB_03312025_QTD = TB_03312025_QTD.withColumn("Total Amount", total_expression)
+TB_03312025_QTD = TB_03312025_QTD.select('Account','Total Amount',*Columns_03312025_QTD)
+print(TB_03312025_QTD.count(),"\n")
+TB_03312025_QTD = (
+    TB_03312025_QTD
+    .groupBy("Account")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_03312025_QTD
+        ),
+    )
+)
+print(TB_03312025_QTD.count(),"\n")
+Validation["TB_03312025_IS"] = TB_03312025_QTD.toPandas()
+
+
+# COMMAND ----------
+
+# DBTITLE 1,subtract_matching_columns
+# Code Generated by Sidekick is for learning and experimentation purposes only.
+# filename: subtract-normalized-columns.py
+
+import re
+from typing import Dict, List
+
+from pyspark.sql import DataFrame
+from pyspark.sql import functions as F
+
+
+def normalize_column_name(column_name: str) -> str:
+    """
+    Normalize a column name for matching purposes only.
+
+    Examples:
+        HB015: Broadridge Financial Solutions, Inc_
+        HB015: Broadridge
+        Financial Solutions,
+        Inc_
+
+    Both normalize to:
+        hb015broadridgefinancialsolutionsinc
+    """
+    if column_name is None:
+        raise ValueError("Column name cannot be None")
+
+    normalized_name = column_name.casefold()
+
+    # Remove all whitespace, newlines, punctuation, underscores,
+    # hyphens, colons, commas, periods, and other special characters.
+    normalized_name = re.sub(
+        r"[^a-z0-9]+",
+        "",
+        normalized_name,
+    )
+
+    return normalized_name
+
+
+def create_column_map(
+    dataset: DataFrame,
+    dataset_name: str,
+) -> Dict[str, str]:
+    """
+    Create a mapping:
+
+        normalized column name -> actual column name
+
+    The actual column names are not changed.
+    """
+    normalized_map: Dict[str, str] = {}
+
+    for actual_column_name in dataset.columns:
+        normalized_name = normalize_column_name(
+            actual_column_name
+        )
+
+        if not normalized_name:
+            raise ValueError(
+                f"Column {actual_column_name!r} in {dataset_name} "
+                "is empty after normalization."
+            )
+
+        if normalized_name in normalized_map:
+            previous_column_name = normalized_map[normalized_name]
+
+            raise ValueError(
+                f"Columns {previous_column_name!r} and "
+                f"{actual_column_name!r} in {dataset_name} "
+                f"normalize to the same name: {normalized_name!r}"
+            )
+
+        normalized_map[normalized_name] = actual_column_name
+
+    return normalized_map
+
+
+def subtract_matching_columns(
+    dataset1: DataFrame,
+    dataset2: DataFrame,
+    calculation_cols: List[str],
+    match_col: str = "Account",
+    null_dataset1_as_zero: bool = False,
+) -> DataFrame:
+    """
+    Calculate dataset1 - dataset2.
+
+    Column matching:
+        Column names are normalized only for comparison.
+
+    Output:
+        The output contains the same columns as dataset1.
+        For matched calculation columns, the output value is:
+
+            dataset1 value - dataset2 value
+
+        The exact original dataset1 column name is retained.
+
+    Dataset2 behavior:
+        - Duplicate match keys are summed.
+        - Null numeric values are treated as zero.
+        - Missing match keys are treated as zero deductions.
+
+    Dataset1 behavior:
+        - By default, null dataset1 values remain null.
+        - Set null_dataset1_as_zero=True to treat null dataset1
+          values as zero.
+    """
+    if not isinstance(dataset1, DataFrame):
+        raise TypeError("dataset1 must be a PySpark DataFrame")
+
+    if not isinstance(dataset2, DataFrame):
+        raise TypeError("dataset2 must be a PySpark DataFrame")
+
+    if not calculation_cols:
+        return dataset1
+
+    # Build normalized-to-actual-name mappings.
+    dataset1_columns = create_column_map(
+        dataset1,
+        "dataset1",
+    )
+
+    dataset2_columns = create_column_map(
+        dataset2,
+        "dataset2",
+    )
+
+    # Normalize the match column for lookup.
+    normalized_match_col = normalize_column_name(match_col)
+
+    if normalized_match_col not in dataset1_columns:
+        raise KeyError(
+            f"Match column {match_col!r} is missing from dataset1. "
+            f"Available columns: {dataset1.columns}"
+        )
+
+    if normalized_match_col not in dataset2_columns:
+        raise KeyError(
+            f"Match column {match_col!r} is missing from dataset2. "
+            f"Available columns: {dataset2.columns}"
+        )
+
+    # Retrieve the actual match-column names.
+    dataset1_match_col = dataset1_columns[normalized_match_col]
+    dataset2_match_col = dataset2_columns[normalized_match_col]
+
+    # Normalize all requested calculation columns.
+    requested_columns = []
+
+    for calculation_col in calculation_cols:
+        normalized_name = normalize_column_name(
+            calculation_col
+        )
+
+        if normalized_name not in dataset1_columns:
+            raise KeyError(
+                f"Calculation column {calculation_col!r} is missing "
+                f"from dataset1. Available columns: "
+                f"{dataset1.columns}"
+            )
+
+        if normalized_name not in requested_columns:
+            requested_columns.append(normalized_name)
+
+    # Match columns between dataset1 and dataset2.
+    # Keep both actual names so dataset1's name can be preserved.
+    matching_columns = []
+
+    for normalized_name in requested_columns:
+        if normalized_name in dataset2_columns:
+            matching_columns.append(
+                {
+                    "normalized_name": normalized_name,
+                    "dataset1_name": dataset1_columns[
+                        normalized_name
+                    ],
+                    "dataset2_name": dataset2_columns[
+                        normalized_name
+                    ],
+                }
+            )
+
+    # If no requested calculation column exists in dataset2,
+    # return dataset1 unchanged.
+    if not matching_columns:
+        return dataset1
+
+    # Temporary aliases prevent collisions with actual column names.
+    match_key_alias = "__sidekick_match_key"
+
+    deduction_aliases = {}
+
+    for index, item in enumerate(matching_columns):
+        deduction_aliases[item["normalized_name"]] = (
+            f"__sidekick_deduction_{index}"
+        )
+
+    # Select the dataset2 match key and numeric deduction columns.
+    deductions = dataset2.select(
+        F.col(dataset2_match_col).alias(match_key_alias),
+        *[
+            F.coalesce(
+                F.col(item["dataset2_name"]).cast("double"),
+                F.lit(0.0),
+            ).alias(
+                deduction_aliases[item["normalized_name"]]
+            )
+            for item in matching_columns
+        ],
+    )
+
+    # If dataset2 has multiple rows for the same match key,
+    # sum the values before subtracting.
+    deductions = deductions.groupBy(
+        match_key_alias
+    ).agg(
+        *[
+            F.sum(
+                F.col(
+                    deduction_aliases[item["normalized_name"]]
+                )
+            ).alias(
+                deduction_aliases[item["normalized_name"]]
+            )
+            for item in matching_columns
+        ]
+    )
+
+    left = dataset1.alias("dataset1")
+    right = deductions.alias("dataset2")
+
+    # Use null-safe equality so null match keys can match null keys.
+    joined = left.join(
+        right,
+        left[dataset1_match_col].eqNullSafe(
+            right[match_key_alias]
+        ),
+        how="left",
+    )
+
+    # Create expressions for dataset1 - dataset2.
+    difference_expressions = {}
+
+    for item in matching_columns:
+        normalized_name = item["normalized_name"]
+        dataset1_name = item["dataset1_name"]
+
+        dataset1_value = F.col(
+            f"dataset1.`{dataset1_name}`"
+        ).cast("double")
+
+        if null_dataset1_as_zero:
+            dataset1_value = F.coalesce(
+                dataset1_value,
+                F.lit(0.0),
+            )
+
+        dataset2_value = F.coalesce(
+            F.col(
+                f"dataset2.`{deduction_aliases[normalized_name]}`"
+            ),
+            F.lit(0.0),
+        )
+
+        difference_expressions[dataset1_name] = (
+            dataset1_value - dataset2_value
+        )
+
+    # Build the final output in dataset1's original column order.
+    output_columns = []
+
+    for actual_dataset1_name in dataset1.columns:
+        if actual_dataset1_name in difference_expressions:
+            # Use the exact actual column name from dataset1.
+            output_columns.append(
+                difference_expressions[
+                    actual_dataset1_name
+                ].alias(actual_dataset1_name)
+            )
+        else:
+            output_columns.append(
+                F.col(
+                    f"dataset1.`{actual_dataset1_name}`"
+                ).alias(actual_dataset1_name)
+            )
+
+    return joined.select(*output_columns)
+
+# COMMAND ----------
+
+TB_03312026_final_df = subtract_matching_columns(
+    dataset1=TB_03312026_QTD,
+    dataset2=TB_12312025_QTD,
+    match_col="Account",
+    calculation_cols=[*Columns_03312026,"Total Amount"],
+)
+display(TB_03312026_final_df)
+Validation["TB_03312026_QTD"] = TB_03312026_final_df.toPandas()
+
+
+# COMMAND ----------
+
+TB_12312025_final_df = subtract_matching_columns(
+    dataset1=TB_12312025_QTD,
+    dataset2=TB_09302025_QTD,
+    match_col="Account",
+    calculation_cols=[*Columns_12312025,"Total Amount"],
+)
+display(TB_12312025_final_df)
+Validation["TB_12312025_QTD"] = TB_12312025_final_df.toPandas()
+
+
+# COMMAND ----------
+
+TB_06302025_final_df = subtract_matching_columns(
+    dataset1=TB_06302025_QTD,
+    dataset2=TB_03312025_QTD,
+    match_col="Account",
+    calculation_cols=[*Columns_12312025,"Total Amount"],
+)
+display(TB_06302025_final_df)
+Validation["TB_06302025_QTD"] = TB_06302025_final_df.toPandas()
+
+
+# COMMAND ----------
+
+print(TB_03312026_final_df.count(),"\n")
+
+TB_03312026_final_df = (
+    TB_03312026_final_df
+    .groupBy("Account Grouping")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_03312026
+        ),
+    )
+)
+print(TB_03312026_final_df.count(),"\n")
+
+# COMMAND ----------
+
+print(TB_12312025_final_df.count(),"\n")
+
+TB_12312025_final_df = (
+    TB_12312025_final_df
+    .groupBy("Account Grouping")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_12312025
+        ),
+    )
+)
+print(TB_12312025_final_df.count(),"\n")
+
+# COMMAND ----------
+
+print(TB_06302025_final_df.count(),"\n")
+
+TB_06302025_final_df = (
+    TB_06302025_final_df
+    .groupBy("Account Grouping")
+    .agg(
+        F.count("*").alias("row_count"),
+        F.sum("Total Amount").alias("Total Amount"),
+        *(
+            F.sum(F.col(column)).alias(f"{column}")
+            for column in Columns_06302025
+        ),
+    )
+)
+print(TB_06302025_final_df.count(),"\n")
+
+# COMMAND ----------
+
+# DBTITLE 1,QTD Join
+TB_Final_QTD = full_outer_join_all(
+    dataframes=[
+        ("03312026", TB_03312026_final_df),
+        ("12312025", TB_12312025_final_df),
+        ("06302025", TB_06302025_final_df),
+    ],
+    account_column="Account Grouping",
+    sheet_column="__sheet__",
+    row_id_column="row_count",
+    manual_mapping=manual_mapping,
+)
+
+
+display(TB_Final_QTD)
+
+
+# COMMAND ----------
+
+from pyod.fs import write_excel
+write_excel(
+    data=Validation,
+    path=f"{OUTPUT_DIRECTORY}/Validation.xlsx",
+)
+
+# COMMAND ----------
+
+write(TB_Final_QTD, Path(OUTPUT_DIRECTORY) / "TB_Final_QTD.parquet", mode='overwrite', register=True)
+TB_Final_QTD = read(Path(OUTPUT_DIRECTORY) / "TB_Final_QTD.parquet")
+display(TB_Final_QTD)
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Automation Excel Formating and Automation starts Here
+
+# COMMAND ----------
+
+GROUPING_BS = read_excel(grouping_list, sheet_name=["BS"],header=0, naming_convention="neutral", trim=True)
+GROUPING_IS = read_excel(grouping_list, sheet_name=["IS"],header=0, naming_convention="neutral", trim=True)
+
+# COMMAND ----------
+
+# DBTITLE 1,Imports and Utils
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -111,15 +1707,19 @@ LEFT_WRAP = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
 RED_HIGHLIGHT_FILL = PatternFill(
     fill_type="solid",
-    fgColor="FFB3B3",   # ← swap this to whatever lighter red hex you prefer
+    fgColor="FFB3B3",   # â† swap this to whatever lighter red hex you prefer
 )
 
 RED_BOLD_VALUE_FONT = Font(
     name="Calibri",
     size=11,
     bold=True,
-    color="000000",     # ← black text
+    color="000000",     # â† black text
 )
+
+# COMMAND ----------
+
+# DBTITLE 1,Config
 # ============================================================================
 # CONFIGURATION OBJECTS
 # ============================================================================
@@ -325,6 +1925,10 @@ def build_sheet_configs() -> list[SheetConfig]:
             grouping_sheet="IS",
         ),
     ]
+
+# COMMAND ----------
+
+# DBTITLE 1,Data and Period Helpers
 # ============================================================================
 # DATA AND PERIOD HELPERS
 # ============================================================================
@@ -560,49 +2164,67 @@ def sum_formula(column: str, rows: list[int]) -> str:
         for a, b in runs
     ) + ")"
 
+import unicodedata
 
-def plan_rows(
-    dataframe: pd.DataFrame,
-    first_row: int,
-    grouping,
-) -> tuple[list[int], list[tuple[int, str, list[int]]], int]:
+_INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
+
+
+def _norm_2(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value)).translate(_INVISIBLE)
+    return " ".join(text.split()).casefold()
+
+def plan_rows(dataframe, first_row, grouping):
     """-> (sheet row per df row, [(total_row, label, member_rows)], grand_total_row).
-    Blocks follow grouping file order. A group name that is itself a Grouping Total
-    (rows `T2 D`, `T2 T1`) makes total T1 a member of T2. Blank row after every total."""
-    idx = {_norm(g): i for i, g in enumerate(dataframe[ACCOUNT_GROUP_COLUMN])}
-    labels = {_norm(t) for t, _ in grouping if t}
+    A Groups entry can be a TB account, a Grouping Total (computed row), or both.
+    Both parts are handled independently. Totals can nest to any depth."""
+    idx: dict[str, list[int]] = {}
+    for i, name in enumerate(dataframe[ACCOUNT_GROUP_COLUMN]):
+        idx.setdefault(_norm_2(name), []).append(i)
+    labels = {_norm_2(t) for t, _ in grouping if t}
+
     detail_rows = [0] * len(dataframe)
     placed, blocks, row = set(), [], first_row
 
     for total, items in groupby(grouping, key=lambda x: x[0]):
-        groups = [g for _, g in items]
-        own = []
-        for g in groups:
-            i = idx.get(_norm(g))
-            if i is not None and i not in placed:
-                detail_rows[i] = row
-                placed.add(i)
-                own.append(row)
-                row += 1
-        kids = [_norm(g) for g in groups if _norm(g) in labels and _norm(g) not in idx]
+        t_norm, own, kids = _norm_2(total), [], []
+        for _, g in items:
+            n = _norm_2(g)
+            for i in idx.get(n, []):                     # 1) actual TB account
+                if i not in placed:
+                    detail_rows[i] = row
+                    placed.add(i)
+                    own.append(row)
+                    row += 1
+            if n in labels and n != t_norm and n not in kids:   # 2) grouping total
+                kids.append(n)
         if total and (own or kids):
             blocks.append((row, total, own, kids))
-            row += 2                                  # total row + blank row
+            row += 2                                     # total row + blank row
 
-    for i in range(len(dataframe)):                   # groups not in grouping file
+    for i in range(len(dataframe)):                      # groups not in grouping file
         if i not in placed:
             detail_rows[i] = row
             row += 1
 
-    where = {_norm(label): r for r, label, _, _ in blocks}
+    names = [_norm_2(label) for _, label, _, _ in blocks]
+    repeated = sorted({n for n in names if names.count(n) > 1})
+    if repeated:
+        print(f"WARNING Grouping Total split into separate runs (keep rows together): {repeated}")
+
+    where = {_norm_2(label): r for r, label, _, _ in blocks}
+    unresolved = sorted({k for *_, kids in blocks for k in kids if k not in where})
+    if unresolved:
+        print(f"WARNING subtotal references with no rows (skipped in parent): {unresolved}")
+
     totals = [
-        (r, label, own + [where[k] for k in kids if k in where])
+        (r, label, list(dict.fromkeys(own + [where[k] for k in kids if k in where])))
         for r, label, own, kids in blocks
     ]
     return detail_rows, totals, row
 
 
 def _selfcheck() -> None:
+    # subtotal inside subtotal
     grouping = [("T1", "A"), ("T1", "B"), ("T1", "C"), ("T2", "D"), ("T2", "T1")]
     df = pd.DataFrame({ACCOUNT_GROUP_COLUMN: ["A", "B", "C", "D", "E"]})
     rows, totals, grand = plan_rows(df, 14, grouping)
@@ -611,6 +2233,32 @@ def _selfcheck() -> None:
     assert sum_formula("C", [19, 17]) == "=SUM(C17,C19)"
     assert sum_formula("C", [14, 15, 17, 18, 20]) == "=SUM(C14:C15,C17:C18,C20)"
 
+    # equity side: three levels, self-named rows, repeated child
+    grouping = [
+        ("OCI", "Pension"), ("Treasury Stock", "Treasury Stock"), ("APIC", "APIC"),
+        ("Total Equity", "OCI"), ("Total Equity", "Treasury Stock"),
+        ("Total Equity", "APIC"), ("Total Equity", "Common Stock"),
+        ("Total Equity", "OCI"),
+        ("TL", "Payable"),
+        ("TLSE", "Total Equity"), ("TLSE", "TL"),
+    ]
+    df = pd.DataFrame({ACCOUNT_GROUP_COLUMN:
+                       ["Pension", "Treasury Stock", "APIC", "Common Stock", "Payable"]})
+    rows, totals, grand = plan_rows(df, 14, grouping)
+    assert rows == [14, 17, 20, 23, 26] and grand == 31
+    assert totals == [
+        (15, "OCI", [14]), (18, "Treasury Stock", [17]), (21, "APIC", [20]),
+        (24, "Total Equity", [23, 15, 18, 21]),
+        (27, "TL", [26]), (29, "TLSE", [24, 27]),
+    ]
+
+    # name is BOTH a TB account and a grouping total: account row AND subtotal both roll up
+    for parent in ([("P", "X"), ("P", "B")], [("P", "X"), ("P", "X"), ("P", "B")]):
+        grouping = [("X", "A")] + parent
+        df = pd.DataFrame({ACCOUNT_GROUP_COLUMN: ["A", "X", "B"]})
+        rows, totals, grand = plan_rows(df, 14, grouping)
+        assert rows == [14, 17, 18] and grand == 21
+        assert totals == [(15, "X", [14]), (19, "P", [17, 18, 15])]
 
 def prepare_data(
     config: SheetConfig,
@@ -698,6 +2346,10 @@ def active_blocks(
             )
     return result
 
+
+# COMMAND ----------
+
+# DBTITLE 1,Excel Helper
 # ============================================================================
 # EXCEL WRITING HELPERS
 # ============================================================================
@@ -825,7 +2477,7 @@ def write_summary_sheet(
     comparisons: list[ComparisonBlock],
     grouping,
 ) -> None:
-    # ── Remove old merges (row-10 block labels + any merge in data area) ───
+    # â”€â”€ Remove old merges (row-10 block labels + any merge in data area) â”€â”€â”€
     for merged_range in list(worksheet.merged_cells.ranges):
         if (
             merged_range.min_row == SUMMARY_BLOCK_ROW
@@ -850,7 +2502,7 @@ def write_summary_sheet(
     for row in range(2, 5):
         for column in range(3, 10):  # C:I
             worksheet.cell(row=row, column=column).value = None
-    # ── Title and materiality section ──────────────────────────────────────
+    # â”€â”€ Title and materiality section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     put(worksheet, "B1", CLIENT_NAME, font=BOLD_FONT)
     put(worksheet, "B2", config.subtitle, font=BOLD_FONT)
     put(worksheet, "B3", PERIOD_LABEL, font=BOLD_FONT)
@@ -871,14 +2523,14 @@ def write_summary_sheet(
         THRESHOLD_PERCENT, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
         number_format=PERCENT_FORMAT)
 
-    # ── Procedure box ──────────────────────────────────────────────────────
+    # â”€â”€ Procedure box â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     put(
         worksheet, "B6", PROCEDURE_TEXT,
         font=NORMAL_FONT, fill=PROCEDURE_FILL, alignment=LEFT_WRAP,
     )
     worksheet.merge_cells(config.procedure_merge_range)
 
-    # ── Column-header rows (row 10 = block label, row 11 = sub-headers) ───
+    # â”€â”€ Column-header rows (row 10 = block label, row 11 = sub-headers) â”€â”€â”€
     put(
         worksheet, f"B{SUMMARY_HEADER_ROW}",
         "Account Description",
@@ -939,7 +2591,7 @@ def write_summary_sheet(
     worksheet.row_dimensions[SUMMARY_BLOCK_ROW].height = 30
     worksheet.row_dimensions[SUMMARY_HEADER_ROW].height = 42
 
-    # ── Detail rows ────────────────────────────────────────────────────────
+    # â”€â”€ Detail rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     first_row = config.first_data_row
     detail_rows, totals, total_row = plan_rows(dataframe, first_row, grouping)
     last_data_row = total_row - 1
@@ -974,8 +2626,8 @@ def write_summary_sheet(
         )
         worksheet.row_dimensions[row_number].height = 18
 
-    # ── Group total rows: single top / double bottom border, amount cols only,
-    #    no variance/flag/yes-list. Blank row follows each total. ───────────
+    # â”€â”€ Group total rows: single top / double bottom border, amount cols only,
+    #    no variance/flag/yes-list. Blank row follows each total. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     skip_cols = config.spacer_columns | {
         column_index_from_string(item.yes_list_column)
         for item in comparisons if item.yes_list_column
@@ -1000,7 +2652,7 @@ def write_summary_sheet(
             )
         worksheet.row_dimensions[sub_row].height = 18
 
-    # ── Accounts Flagged (Yes): one merged cell + one array formula/block ──
+    # â”€â”€ Accounts Flagged (Yes): one merged cell + one array formula/block â”€â”€
     # Same pattern as the LE sheet. Style BEFORE merge so border spreads.
     if len(dataframe):
         for item in comparisons:
@@ -1023,7 +2675,7 @@ def write_summary_sheet(
             )
             worksheet.merge_cells(f"{col}{first_row}:{col}{last_data_row}")
 
-    # ── Grand total row (detail rows only, no double count) ────────────────
+    # â”€â”€ Grand total row (detail rows only, no double count) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     put(
         worksheet, f"B{total_row}", config.total_label,
         font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_ALIGN,
@@ -1059,7 +2711,7 @@ def write_summary_sheet(
         alignment=CENTER_ALIGN,
     )
 
-    # ── Borders, auto-filter, conditional formatting ───────────────────────
+    # â”€â”€ Borders, auto-filter, conditional formatting â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for row in worksheet.iter_rows(
         min_row=config.first_data_row,
         max_row=total_row,
@@ -1238,7 +2890,7 @@ def write_legal_entity_sheet(
     account_count  = len(flagged_accounts)
     data_count     = len(legal_entity_df)
 
-    # ── Column widths ──────────────────────────────────────────────────────
+    # â”€â”€ Column widths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     account_start_columns = []
     cursor = LE_FIRST_DATA_COLUMN
 
@@ -1260,14 +2912,14 @@ def write_legal_entity_sheet(
     worksheet.column_dimensions["A"].width = 2
     worksheet.column_dimensions["B"].width = 45
 
-    # ── Title and threshold details ────────────────────────────────────────
+    # â”€â”€ Title and threshold details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     worksheet.merge_cells(
         start_row=LE_TITLE_ROW, start_column=2,
         end_row=LE_TITLE_ROW,   end_column=last_column,
     )
     put_rc(
         worksheet, LE_TITLE_ROW, 2,
-        f"{config.title_label} — Legal Entity Drill-Down",
+        f"{config.title_label} â€” Legal Entity Drill-Down",
         font=LE_TITLE_FONT, alignment=LEFT_WRAP,
     )
 
@@ -1300,7 +2952,7 @@ def write_legal_entity_sheet(
         font=BOLD_FONT, alignment=LEFT_WRAP,
     )
 
-    # ── Header rows ────────────────────────────────────────────────────────
+    # â”€â”€ Header rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     worksheet.merge_cells(
         start_row=LE_ACCOUNT_HEADER_ROW, start_column=2,
         end_row=LE_SUB_HEADER_ROW,       end_column=2,
@@ -1347,7 +2999,7 @@ def write_legal_entity_sheet(
         worksheet.cell(
             row=LE_SUB_HEADER_ROW, column=start_column + 5
         ).fill = le_yes_header_fill
-    # ── Data rows ──────────────────────────────────────────────────────────
+    # â”€â”€ Data rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     total_row = LE_DATA_START_ROW + data_count
 
     for row_offset, (_, source_row) in enumerate(
@@ -1392,7 +3044,7 @@ def write_legal_entity_sheet(
                 alignment=LEFT_WRAP,
             )
 
-    # ── Yes-list merged cells — one per account block ──────────────────────
+    # â”€â”€ Yes-list merged cells â€” one per account block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     for index, account in enumerate(flagged_accounts):
         start_column   = account_start_columns[index]
         yes_col        = start_column + 5
@@ -1408,7 +3060,7 @@ def write_legal_entity_sheet(
             f'=IFERROR(_xlfn.TEXTJOIN(CHAR(10), TRUE, '
             f'IF({inv_col_letter}{merge_top}:{inv_col_letter}{merge_bottom}'
             f'="{YES_VALUE}", '
-            f'$B${merge_top}:$B${merge_bottom}, "")), "—")',
+            f'$B${merge_top}:$B${merge_bottom}, "")), "â€”")',
         )
         top_left.font      = NORMAL_FONT
         top_left.border    = THIN_BORDER
@@ -1420,7 +3072,7 @@ def write_legal_entity_sheet(
             end_row=merge_bottom, end_column=yes_col,
         )
 
-    # ── Total row ──────────────────────────────────────────────────────────
+    # â”€â”€ Total row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     put_rc(
         worksheet, total_row, 2, TOTAL_LABEL,
         font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_WRAP,
@@ -1451,7 +3103,7 @@ def write_legal_entity_sheet(
                 alignment=RIGHT_ALIGN, number_format=number_format,
             )
 
-    # ── Conditional formatting — highlight Investigate = Yes ──────────────
+    # â”€â”€ Conditional formatting â€” highlight Investigate = Yes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     worksheet.conditional_formatting._cf_rules = {}
     for start_column in account_start_columns:
         inv_col = get_column_letter(start_column + 4)
@@ -1510,6 +3162,9 @@ def render_legal_entity_sheets(
             legal_entity_df,
         )
 
+# COMMAND ----------
+
+# DBTITLE 1,Output Creation
 # ============================================================================
 # WORKBOOK ORCHESTRATION
 # ============================================================================
@@ -1633,3 +3288,209 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# COMMAND ----------
+
+# Code Generated by Sidekick is for learning and experimentation purposes only.
+# filename: tb-validation-raw-to-final.py
+
+# ============ VALIDATION: RAW -> FINAL PARQUET ============
+from functools import reduce
+from pathlib import Path
+import numpy as np, pandas as pd
+from pyspark.sql import Window, functions as F
+from pyod.fs import read, read_excel, write_excel
+
+# ---------- CONFIG ----------
+TOL        = 0.01
+VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
+BS_SHEET   = "Balance Sheet TB Links"
+QTD_SHEETS = ("Income Statement TB Links",)
+LINK_SHEETS = ["Balance Sheet TB Links", "Income Statement TB Links"]
+META = {"Account", "Linked TB Account #", "__sheet__", "row_id"}
+
+SRC = {
+    "03312026": dict(path=excel_path_03312026, sheets=LINK_SHEETS, header=1, cols=Columns_03312026, kind="links"),
+    "12312025": dict(path=excel_path_12312025, sheets=LINK_SHEETS, header=1, cols=Columns_12312025, kind="links"),
+    "06302025": dict(path=excel_path_06302025, sheets=LINK_SHEETS, header=1, cols=Columns_06302025, kind="links"),
+    "09302025": dict(path="User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/"
+                          "Broadridge_-_Risk_Assessment.zip/TB_09_30_FY26.xlsx",
+                     sheets=["3) 9.30.2025"], header=8, cols=Columns_09302025_QTD, kind="plain", key="BALANCE SHEET"),
+    "03312025": dict(path=excel_path_03312025_2, sheets=["Sheet2"], header=0,
+                     cols=Columns_03312025_QTD, kind="plain", key="Account"),
+}
+YTD_LABELS = ["03312026", "12312025", "06302025"]
+QTD_PAIRS  = {"03312026": "12312025", "12312025": "09302025", "06302025": "03312025"}   # CY: PY
+QTD_FILES  = {"03312026": QTD_SHEETS, "12312025": QTD_SHEETS, "06302025": QTD_SHEETS,
+              "09302025": None, "03312025": None}
+
+FIN = {k: read(Path(OUTPUT_DIRECTORY) / f"{v}.parquet")
+       for k, v in {"BS": "TB_Final_BS", "IS": "TB_Final_IS_YTD", "QTD": "TB_Final_QTD"}.items()}
+
+# ---------- HELPERS ----------
+def bt(c): return F.col("`" + c.replace("`", "``") + "`")
+
+_cache = {}
+def prep(label, sheets=None):
+    """Raw Excel -> slim df: __A account, __G group, __S sheet, __V row net,
+    __ok has acct#, __GV group non-blank, __R raw row order.
+    Also returns unlisted non-zero numeric cols."""
+    k = (label, sheets)
+    if k in _cache: return _cache[k]
+    s = SRC[label]
+    raw = (read_excel(s["path"], sheet_name=list(sheets or s["sheets"]), header=s["header"],
+                      naming_convention="neutral", trim=True)
+           .withColumn("row_id", F.monotonically_increasing_id()))
+    net = reduce(lambda a, b: a + b, [F.coalesce(bt(c).cast("double"), F.lit(0.0)) for c in s["cols"]])
+
+    if s["kind"] == "links":
+        w, acct = Window.orderBy("row_id").rowsBetween(Window.unboundedPreceding, 0), F.col("Linked TB Account #")
+        d = (raw.withColumn("__ok", acct.isNotNull() & (acct != ""))
+                .withColumn("__A", F.upper(F.concat_ws(": ", F.split(acct, r"\.").getItem(0), F.col("Account"))))
+                .withColumn("__G", F.last(F.when(~F.col("__ok"), F.col("Account")), ignorenulls=True).over(w))
+                .withColumn("__S", F.when(F.col("__sheet__") == BS_SHEET, "BS").otherwise("IS")))
+    else:
+        d = (raw.withColumn("__ok", F.lit(True)).withColumn("__A", F.upper(bt(s["key"])))
+                .withColumn("__G", F.lit("-")).withColumn("__S", F.lit("IS")))
+
+    d = (d.withColumn("__GV", F.col("__G").isNotNull() & (F.trim(F.col("__G")) != ""))
+          .withColumn("__V", net)
+          .withColumn("__R", F.col("row_id")))
+
+    extra = [c for c in raw.columns if c not in s["cols"] and c not in META and c != s.get("key")]
+    ex = {}
+    if extra:
+        r = d.filter("__ok").agg(*[F.expr("sum(try_cast(`%s` as double))" % c.replace("`", "``")).alias(f"c{i}")
+                                   for i, c in enumerate(extra)]).first()
+        ex = {c: r[i] for i, c in enumerate(extra) if r[i]}
+    _cache[k] = (d.select("__A", "__G", "__S", "__V", "__ok", "__GV", "__R"), ex)
+    return _cache[k]
+
+def fin_sum(key, lab):
+    """Final parquet -> (Total Amount, sum of entity cols) for period lab."""
+    df, tc = FIN[key], f"Total Amount_{lab}"
+    ent = [c for c in df.columns if c.endswith(f"_{lab}") and not c.startswith(("Total Amount_", "row_count_"))]
+    r = df.agg(F.sum(bt(tc)), *[F.sum(bt(c)) for c in ent]).first()
+    return float(r[0] or 0.0), float(sum(x or 0.0 for x in r[1:]))
+
+def recon(label, sheets=None):
+    """Raw -> NoAcct -> NoGroup -> Included. Rows + amount per sheet. Diff must be 0.
+    Excluded tab is expected to hold NoAcct + NoGroup rows (zero / blank rows included)."""
+    d, _ = prep(label, sheets)
+    ok, gv, v = F.col("__ok"), F.col("__GV"), F.col("__V")
+    buckets = {"Raw": F.lit(True), "NoAcct": ~ok, "NoGroup": ok & ~gv, "Included": ok & gv,
+               "Excl_Zero": ~(ok & gv) & (v == 0)}            # informational: zero/blank rows inside Excluded
+    aggs = []
+    for k, c in buckets.items():
+        aggs += [F.sum(F.when(c, 1).otherwise(0)).alias(f"{k}_Rows"),
+                 F.sum(F.when(c, v).otherwise(0.0)).alias(f"{k}_Amt")]
+    p = d.groupBy("__S").agg(*aggs).toPandas().rename(columns={"__S": "Sheet"})
+    p.insert(0, "File", label)
+    p["Diff_Rows"] = p.Raw_Rows - p.NoAcct_Rows - p.NoGroup_Rows - p.Included_Rows
+    p["Diff_Amt"]  = (p.Raw_Amt - p.NoAcct_Amt - p.NoGroup_Amt - p.Included_Amt).round(2)
+    p["Excl_Expected_Rows"] = p.NoAcct_Rows + p.NoGroup_Rows
+    p["Excl_NonZero_Rows"]  = p.Excl_Expected_Rows - p.Excl_Zero_Rows
+    return p.drop(columns=["Excl_Zero_Amt"])                   # zero rows sum to 0 by definition
+
+def excluded(label, sheets=None):
+    """Every row that did not land in Included, including blank / zero-value rows."""
+    d, _ = prep(label, sheets)
+    seq      = F.row_number().over(Window.partitionBy("__S").orderBy("__R"))   # position within raw sheet
+    reason   = F.when(~F.col("__ok"), "No Account #").otherwise("No Group")
+    row_type = F.when(F.col("__V") == 0, "Zero / Blank").otherwise("Non-zero")
+    return (d.withColumn("__N", seq)
+             .filter(~(F.col("__ok") & F.col("__GV")))
+             .orderBy("__S", "__N")
+             .select(F.lit(label).alias("File"), F.col("__S").alias("Sheet"),
+                     F.col("__A").alias("Account"), F.col("__G").alias("Group"),
+                     reason.alias("Reason"), row_type.alias("Row_Type"),
+                     F.col("__V").alias("Amount"), F.col("__N").alias("Raw_Row_Seq"))
+             .toPandas())
+
+def add_excl_check(summary, excl):
+    """Attach actual Excluded-tab row count / amount and compare to the recon expectation."""
+    g = (excl.groupby(["File", "Sheet"])
+             .agg(Excluded_Sheet_Rows=("Amount", "size"), Excluded_Sheet_Amt=("Amount", "sum"))
+             .reset_index())
+    out = summary.merge(g, on=["File", "Sheet"], how="left")
+    out["Excluded_Sheet_Rows"] = out.Excluded_Sheet_Rows.fillna(0).astype(int)
+    out["Excluded_Sheet_Amt"]  = out.Excluded_Sheet_Amt.fillna(0.0)
+    out["Excl_Count_Diff"] = out.Excluded_Sheet_Rows - out.Excl_Expected_Rows                     # must be 0
+    out["Excl_Amt_Diff"]   = (out.Excluded_Sheet_Amt - (out.NoAcct_Amt + out.NoGroup_Amt)).round(2)  # must be 0
+    return out
+
+def ssum(df, col): return float(df.agg(F.coalesce(F.sum(col), F.lit(0.0))).first()[0])
+
+# =====================================================================
+# PART 1: YTD  (raw -> included -> final BS / IS parquet)
+# =====================================================================
+ytd_excl = pd.concat([excluded(l) for l in YTD_LABELS], ignore_index=True)
+
+ytd = pd.concat([recon(l) for l in YTD_LABELS], ignore_index=True)
+fs = [fin_sum(r.Sheet, r.File) for r in ytd.itertuples()]
+ytd["Final_Amt"]            = [x[0] for x in fs]
+ytd["Final_minus_Included"] = (ytd.Final_Amt - ytd.Included_Amt).round(2)
+ytd["Entity_minus_Total"]   = [round(x[1] - x[0], 2) for x in fs]
+ytd = add_excl_check(ytd, ytd_excl)
+ytd["Status"] = np.where((ytd.Diff_Rows == 0) & (ytd.Diff_Amt.abs() <= TOL)
+                         & (ytd.Final_minus_Included.abs() <= TOL) & (ytd.Entity_minus_Total.abs() <= TOL)
+                         & (ytd.Excl_Count_Diff == 0) & (ytd.Excl_Amt_Diff.abs() <= TOL),
+                         "PASS", "FAIL")
+
+# =====================================================================
+# PART 2: QTD
+#   2a raw -> included for every raw file QTD touches
+#   2b (CY included - matched PY) vs final QTD parquet
+# =====================================================================
+qtd_excl  = pd.concat([excluded(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+
+qtd_files = pd.concat([recon(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+qtd_files = add_excl_check(qtd_files, qtd_excl)
+qtd_files["Status"] = np.where((qtd_files.Diff_Rows == 0) & (qtd_files.Diff_Amt.abs() <= TOL)
+                               & (qtd_files.Excl_Count_Diff == 0) & (qtd_files.Excl_Amt_Diff.abs() <= TOL),
+                               "PASS", "FAIL")
+
+rows = []
+for cur, pri in QTD_PAIRS.items():
+    c, _ = prep(cur, QTD_SHEETS)
+    p, _ = prep(pri, QTD_SHEETS if SRC[pri]["kind"] == "links" else None)
+    cy   = c.filter(F.col("__ok") & F.col("__GV"))
+    pa   = p.filter("__ok").groupBy("__A").agg(F.sum("__V").alias("d"))
+    unm  = pa.join(c.filter("__ok").select("__A").distinct(), "__A", "left_anti")      # PY acct not in CY
+    dup  = cy.groupBy("__A").agg(F.countDistinct("__G").alias("g")).filter("g > 1").count()
+    cy_amt  = ssum(cy, "__V")
+    matched = ssum(pa.join(cy.select("__A").distinct(), "__A", "left_semi"), "d")
+    ft, fe  = fin_sum("QTD", cur)
+    rows.append({"CY": cur, "PY": pri, "CY_Included": cy_amt, "PY_Matched": matched,
+                 "Expected": cy_amt - matched, "Final": ft,
+                 "Final_minus_Expected": round(ft - (cy_amt - matched), 2),
+                 "Entity_minus_Total": round(fe - ft, 2),
+                 "PY_Unmatched_Keys": unm.count(), "PY_Unmatched_Amt": ssum(unm, "d"),
+                 "CY_Dup_Accts": dup})
+qtd_tie = pd.DataFrame(rows)
+qtd_tie["Status"] = np.where((qtd_tie.Final_minus_Expected.abs() <= TOL) & (qtd_tie.Entity_minus_Total.abs() <= TOL)
+                             & (qtd_tie.CY_Dup_Accts == 0), "PASS", "FAIL")
+
+# =====================================================================
+# UNLISTED COLUMNS (numeric cols in raw, not in entity list)
+# =====================================================================
+unl = pd.DataFrame([{"File": l, "Sheets": str(s) if s else "default", "Unlisted_Cols": len(ex),
+                     "Unlisted_Total": sum(ex.values()), "Names": ", ".join(ex)[:500]}
+                    for l, s in {**{x: None for x in YTD_LABELS}, **QTD_FILES}.items()
+                    for ex in [prep(l, s)[1]]])
+unl["Status"] = np.where(unl.Unlisted_Cols > 0, "WARN", "PASS")
+
+# =====================================================================
+# OUTPUT
+# =====================================================================
+write_excel(data={"P1_YTD": ytd, "P1_YTD_Excluded": ytd_excl,
+                  "P2a_QTD_Files": qtd_files, "P2b_QTD_TieOut": qtd_tie, "P2_QTD_Excluded": qtd_excl,
+                  "Unlisted_Cols": unl}, path=VALID_XLSX)
+
+for name, t in [("P1 YTD", ytd), ("P2a QTD raw files", qtd_files), ("P2b QTD tie-out", qtd_tie), ("Unlisted", unl)]:
+    print(f"{name}: {t.Status.value_counts().to_dict()}")
+    display(spark.createDataFrame(t.astype(str)))
+
+
+# COMMAND ----------
+
