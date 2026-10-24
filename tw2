@@ -1,805 +1,1693 @@
-# Databricks notebook source
-# MAGIC %md
-# MAGIC #Overview
-# MAGIC
-# MAGIC GL Revenue Data Cleaning - JE Sales Invoice / Credit Memo matching
-# MAGIC
-# MAGIC Version: 9.5 (serverless-safe: no dbutils.fs, no persist/cache, no iterative parquet loop)
+from __future__ import annotations
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # 1. Installing Libraries
-# MAGIC
-# MAGIC **Do not change any codes in this section**. Make sure to authenticate while this command is executed.
-
-# COMMAND ----------
-
-# DBTITLE 1,Set PYPI_TOKEN & CortexPy for Serverless Compute
-import os
-os.environ['PYPI_TOKEN'] = dbutils.secrets.get('all-users-scope', 'PYPI_TOKEN')
-cortexpy_package = dbutils.secrets.get("all-users-scope", "CORTEXPY_VERSION")
-os.environ["VERSION"] = cortexpy_package.split("==")[1].strip()
-
-# COMMAND ----------
-
-# DBTITLE 1,Install CortexPy
-pip install --index-url https://$PYPI_TOKEN@symphonyvsts.pkgs.visualstudio.com/_packaging/Cortex-PYPI/pypi/simple/ cortexpy==$VERSION --trusted-host symphonyvsts.pkgs.dev.azure.com --quiet
-
-# COMMAND ----------
-
-# DBTITLE 1,Restart Python Process
-dbutils.library.restartPython()
-
-# COMMAND ----------
-
-# DBTITLE 1,Initialization
-from cortexpy.context.entry_context import *
-from cortexpy.helper.utils import *
-from cortexpy.helper.enums import *
-from cortexpy.helper.logging_helper import *
-set_global_logger_level(logging.INFO)
-cp = get_context()
-logger = get_logger(__name__, logging.INFO)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #2. Importing Standard Functions
-# MAGIC
-# MAGIC **Do not change any codes in this section**.
-
-# COMMAND ----------
-
-# DBTITLE 1,Import Standard Functions
-# MAGIC %run /Workspace/CONTENT_LIBRARY/NOTEBOOKS/JEReadin/StandardFunctions
-
-# COMMAND ----------
-
-# DBTITLE 1,Widgets
-# output_path: scratch/intermediary path. output_path_et: final outputs path (also holds the pipeline breakpoint parquet files).
-dbutils.widgets.text(name="output_path", defaultValue="", label="Enter a path to save Intermediary outputs")
-output_path = dbutils.widgets.get('output_path')
-dbutils.widgets.text(name="output_path_et", defaultValue="", label="Enter a path to save the final outputs")
-output_path_et = dbutils.widgets.get('output_path_et')
-
-# "Yes" masks every display(df) call. Use df.display() to bypass the mask.
-dbutils.widgets.dropdown(
-    name="ready_for_logs", defaultValue="No", choices=["No", "Yes"],
-    label="Disable 'display's that generate the data previews?")
-ready_for_logs = False if dbutils.widgets.get("ready_for_logs") == "No" else True
-display = DataFrame.display if not ready_for_logs else display_mask
-
-dbutils.widgets.dropdown(
-    name="exclude_zero_lines", defaultValue="Yes", choices=["No", "Yes"],
-    label="Exclude records with zero amounts in the Final TB?")
-exclude_zero_lines = dbutils.widgets.get("exclude_zero_lines")
-
-dbutils.widgets.dropdown(
-    name="field_separator", defaultValue="Period", choices=["None", "Comma", "Period"],
-    label="Decimal separator for numeric fields (period, comma, or none)")
-field_seperator = dbutils.widgets.get('field_separator')
-
-dbutils.widgets.dropdown(
-    name="action", defaultValue="skip", choices=["write", "read", "skip"],
-    label="Breakpoint Action")
-action = dbutils.widgets.get("action")
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC #3. GL Read-in, Preparing and Mapping
-
-# COMMAND ----------
-
-# DBTITLE 1,Find Data
-cp.fs.ls('User Imported Data/EFT_UP/Securities Revenue FY26/', True)
-
-# COMMAND ----------
-
-# DBTITLE 1,Read-in JE Files (current quarter)
-JE_raw_1 = cp.pandas.read(
-    "User Imported Data/EFT_UP/Securities Revenue FY26/Q3_Revenue_GL_All_Entities.xlsx",
-    header=0, sheet_name="Sheet1", dtype="string").to_spark()
-JE_raw_1 = clean_df(JE_raw_1)
-display(JE_raw_1.limit(100))
-
-# COMMAND ----------
-
-# DBTITLE 1,Read-in prior-quarter unmatched (Sales Invoices only)
-JE_raw_2 = clean_df(cp.read('SPEC-DATAPREP/Securities/Q2_FY26_V4/et/P4_ALL_UNMATCHED_WITH_AA_COMMENT.parquet'))
-display(JE_raw_2.limit(100))
-
-# Only prior-year Sales Invoices carry forward. Non-SI rows are dropped on purpose.
-JE_raw_2 = JE_raw_2.filter(col('JE Category').isin("Sales Invoices"))
-
-je_raw_1_cols = [
-    "Company Description", "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name", "Month",
-    "Default Effective Date", "Posted Date", "JE Category", "Journal Description", "JE Line Number", "Line Description",
-    "Currency Code", "Je Source", "Ledger", "Account Description", "Invoice Reference", "Journal Line Vendor/Customer",
-    "Vendor/Customer Name", "Vendor PO#", "Vendor/Customer Number", "COA", "Company", "Business", "Location",
-    "Department/Cost Center", "Natural Account", "Product", "Revenue Type", "Intercompany", "Future1", "Future2",
-    "Accounted Dr", "Accounted Cr", "Entered Dr", "Entered CR", "Net Entered", "Net Accounted",
-]
-# select() also drops every extra column (row_id, USD*, AA Comment, helper cols ...)
-JE_raw_2_aligned = JE_raw_2.select(*je_raw_1_cols)
-
-# COMMAND ----------
-
-# DBTITLE 1,Stamp row_id once + export JE as Parquet
-# row_id is stamped ONCE here and then stored in parquet, so it is stable for the whole run.
-# Never regenerate it downstream: with no cache, a lazy plan may be re-evaluated and an
-# unstable id would make matched / unmatched sets disagree.
-# C = current quarter, P = prior-year carry-forward. Prefix keeps ids unique across both.
-from pyspark.sql import functions as F
-
-JE_raw_1 = JE_raw_1.withColumn("row_id", F.concat(F.lit("C"), F.monotonically_increasing_id().cast("string")))
-JE_raw_2_aligned = JE_raw_2_aligned.withColumn(
-    "row_id", F.concat(F.lit("P"), F.monotonically_increasing_id().cast("string")))
-
-cp.write(JE_raw_1, f'{output_path_et}/JE_raw.parquet', 'overwrite', register=True)
-JE_raw = cp.read(f'{output_path_et}/JE_raw.parquet')
-cp.write(JE_raw_2_aligned, f'{output_path_et}/JE_raw_2_aligned.parquet', 'overwrite', register=True)
-JE_raw_2_aligned = cp.read(f'{output_path_et}/JE_raw_2_aligned.parquet')
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC # 4. Matching pipeline
-# MAGIC
-# MAGIC P1: current quarter, exact amount, month lag 0-2.
-# MAGIC P2: P1 leftovers + prior-year Sales Invoices, same rules, adds CY/PY flag.
-# MAGIC P3: P2 leftovers, exact amount, month lag > 2, only PKs with equal sales/credit counts.
-# MAGIC P4: P3 leftovers, company+vendor key, net within tolerance, AA Comment.
-# MAGIC
-# MAGIC Pairing = one `applyInPandas` pass per pipeline (greedy over sorted candidates, per primary_key).
-# MAGIC Disk writes = 2 per pipeline (classified rows, paired pool). Nothing else is materialized.
-
-# COMMAND ----------
-
-# DBTITLE 1,Constants and config
+from dataclasses import dataclass
+from datetime import date, datetime
+from pathlib import Path
+from typing import Any
+import calendar
 import re
-import builtins
+
+import openpyxl
 import pandas as pd
-from pyspark.sql import functions as F, Window, types as T
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles.differential import DifferentialStyle
+from openpyxl.utils import get_column_letter
+from openpyxl.utils.cell import absolute_coordinate
+from openpyxl.worksheet.formula import ArrayFormula
 
-BASE_RAW_COLUMNS = [
-    "row_id",
-    "JE Batch Id", "Batch Name", "Batch Created By", "JE Header Name", "User Name",
-    "Month", "Default Effective Date", "Posted Date", "JE Category",
-    "Journal Description", "JE Line Number", "Line Description", "Currency Code",
-    "Je Source", "Ledger", "Account Description", "Invoice Reference",
-    "Journal Line Vendor/Customer", "Vendor/Customer Name", "Vendor PO#",
-    "Vendor/Customer Number", "COA", "Company", "Business",
-    "Client Sector Idenitifier", "Client Sector", "Location",
-    "Location Description", "Department/Cost Center", "Natural Account",
-    "Product", "Product Description", "Revenue Type", "Revenue Description",
-    "Intercompany", "Future1", "Future2", "Accounted Dr", "Accounted Cr",
-    "Net Accounted", "Entered Dr", "Entered CR", "Net Entered", "FX",
-    "USD DR", "USD CR", "USD NET", "Company Description",
-]
-# Year Flag / Source Quarter are recomputed per row in base_tag(); listed so they are not null-padded away.
-PIPE2_RAW_COLUMNS = BASE_RAW_COLUMNS + ["Year Flag", "Source Quarter"]
+# ============================================================================
+# CENTRAL SETTINGS
+# ============================================================================
 
-DECIMAL_TYPE = T.DecimalType(38, 6)
-EXACT_ZERO = F.lit(0).cast(DECIMAL_TYPE)
-P4_TOLERANCE = 1  # Pipeline 4 net tolerance (currency units)
+ACCOUNT_GROUP_COLUMN = "Account Grouping"
+YES_VALUE = "Yes"
+NO_VALUE = "No"
+PROCEDURE_TEXT = "Please Fill Procedures Box."
+TOTAL_LABEL = "Total"
+UNMAPPED_ACCOUNT = "Unmapped"
+DATE_COLUMN_PREFIX = "Total Amount_"
+DATE_FORMAT = "%m%d%Y"
+PY_MATCH_DAYS = 45
 
-# AA Comment labels - client facing text, written to the Unmatched_Items sheet.
-AA_ONE_TO_MANY = "One to Many"
-AA_EXACT_MATCH_SYNC = "Exact Match (There is a lag of more than two month)"
-AA_EXACT_MATCH_UNSYNC = "Exact match (Credit memo occures before sales invoice)"
-AA_APPROX_MATCH = "Upto $1 Difference"
-AA_ONLY_CREDITS = "Only Credit Memos Present in Vendor"
-AA_CLIENT_CONFIRM = "Need More Clarity. Audit Team to address."
+CLIENT_NAME = "Broadridge Financial Solutions, Inc." ## Edit Client Name as needed
+PERIOD_LABEL = "Q3-26" ## Edit Period Name as needed
+OUTPUT_FILE_NAME = f"Broadridge Consolidated Analytical Review {PERIOD_LABEL}.xlsx" ## Edit File Name as needed
+FISCAL_YEAR_END = (6, 30)
+
+## Edit Materiality as needed
+
+MATERIALITY = 59_500_000
+THRESHOLD_DOLLARS = 14_875_000
+THRESHOLD_PERCENT = 0.15
+
+NUMBER_FORMAT = "#,##0;(#,##0);-"
+PERCENT_FORMAT = "0%;(0%);-"
+
+INPUT_NAMES = ("TB_Final_BS", "TB_Final_IS_YTD", "TB_Final_QTD") ## Edit Input Dataframe Name as needed
+ENTITY_SKIP_PREFIXES = ("__sheet__", "row_count_", DATE_COLUMN_PREFIX)
+
+SUMMARY_HEADER_ROW = 11
+SUMMARY_BLOCK_ROW = 10
+SUMMARY_FIRST_DATA_ROW = 14
+SUMMARY_FREEZE_CELL = "C12"
+
+LE_TITLE_ROW = 1
+LE_SUBTITLE_ROW = 2
+LE_MATERIALITY_ROW = 4
+LE_FLAG_COUNT_ROW = 5
+LE_ACCOUNT_HEADER_ROW = 7
+LE_SUB_HEADER_ROW = 8
+LE_DATA_START_ROW = 9
+LE_FIRST_DATA_COLUMN = 3
+LE_COLUMNS_PER_ACCOUNT = 6
+LE_SPACER_WIDTH = 2
+LE_DOLLAR_THRESHOLD_CELL = "$E$4"
+LE_PERCENT_THRESHOLD_CELL = "$G$4"
 
 
-def to_date_clean(col_name: str):
-    raw = F.trim(F.col(col_name).cast("string"))
-    return F.coalesce(
-        F.to_date(raw, "MM/dd/yyyy"), F.to_date(raw, "M/d/yyyy"), F.to_date(raw, "yyyy-MM-dd"),
-        F.to_date(raw, "dd-MMM-yy"), F.to_date(raw, "dd-MMM-yyyy"), F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
+# ============================================================================
+# FORMATTING CONSTANTS
+# ============================================================================
+
+BLACK = "000000"
+GRAY = "BFBFBF"
+LIGHT_GRAY = "F2F2F2"
+GREEN = "92D050"
+LIGHT_BLUE = "DEEAF1"
+
+THIN_SIDE = Side(style="thin", color=BLACK)
+MEDIUM_SIDE = Side(style="medium", color=BLACK)
+
+THIN_BORDER = Border(
+    left=THIN_SIDE, right=THIN_SIDE,
+    top=THIN_SIDE, bottom=THIN_SIDE,
+)
+TOTAL_BORDER = Border(top=MEDIUM_SIDE, bottom=MEDIUM_SIDE)
+
+HEADER_FILL = PatternFill(fill_type="solid", fgColor=GRAY)
+PROCEDURE_FILL = PatternFill(fill_type="solid", fgColor=LIGHT_GRAY)
+LE_ACCOUNT_FILL = PatternFill(fill_type="solid", fgColor=LIGHT_BLUE)
+YES_HEADER_FILL = PatternFill(fill_type="solid", fgColor=GREEN)   # NEW
+
+YES_FILL = DifferentialStyle(
+    fill=PatternFill(fill_type="solid", fgColor=GREEN, bgColor=GREEN)
+)
+
+NORMAL_FONT = Font(name="Calibri", size=9)
+BOLD_FONT = Font(name="Calibri", size=9, bold=True)
+HEADER_FONT = Font(name="Calibri", size=9, bold=True, italic=True)
+RED_BOLD_FONT = Font(name="Calibri", size=9, bold=True, color="FF0000")
+LE_TITLE_FONT = Font(name="Calibri", size=12, bold=True)
+
+LEFT_ALIGN = Alignment(horizontal="left", vertical="center")
+RIGHT_ALIGN = Alignment(horizontal="right", vertical="center")
+CENTER_ALIGN = Alignment(horizontal="center", vertical="center")
+CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT_WRAP = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+RED_HIGHLIGHT_FILL = PatternFill(
+    fill_type="solid",
+    fgColor="FFB3B3",   # ← swap this to whatever lighter red hex you prefer
+)
+
+RED_BOLD_VALUE_FONT = Font(
+    name="Calibri",
+    size=11,
+    bold=True,
+    color="000000",     # ← black text
+)
+# ============================================================================
+# CONFIGURATION OBJECTS
+# ============================================================================
+
+@dataclass
+class ComparisonBlock:
+    merge_range: str
+    dollar_column: str
+    percent_column: str
+    flag_column: str
+    current_role: str
+    comparison_role: str
+    yes_list_column: str = ""
+
+
+@dataclass
+class SheetConfig:
+    sheet_id: str
+    output_sheet: str
+    subtitle: str
+    title_label: str
+    total_label: str
+    source_key: str
+    raw_amount_columns: tuple[str, ...]
+    role_to_excel_column: dict[str, str]
+    comparison_blocks: tuple[ComparisonBlock, ...]
+    legal_entity_sheet_names: dict[tuple[str, str], str]
+    materiality_dollar_anchor: str
+    materiality_percent_anchor: str
+    first_data_row: int
+    max_data_column: int
+    spacer_columns: set[int]
+    tickmark_column: str
+    materiality_label_column: str
+    materiality_value_column: str
+    procedure_merge_range: str
+    column_widths: dict[str, int]
+    classifier: str
+    all_comparison_blocks: tuple[ComparisonBlock, ...] | None = None
+
+    def __post_init__(self) -> None:
+        # If no separate block list is supplied, use all comparison blocks.
+        if self.all_comparison_blocks is None:
+            self.all_comparison_blocks = self.comparison_blocks
+
+
+def block(
+    merge_range: str,
+    dollar_column: str,
+    percent_column: str,
+    flag_column: str,
+    current_role: str,
+    comparison_role: str,
+    yes_list_column: str = "",  
+) -> ComparisonBlock:
+    return ComparisonBlock(
+        merge_range,
+        dollar_column,
+        percent_column,
+        flag_column,
+        current_role,
+        comparison_role,
+        yes_list_column,
     )
 
 
-# CURRENT_FY = max calendar year in either input. CURRENT_QUARTER = max quarter of that year in JE_raw (filename + period filter only).
-_yrs = (JE_raw.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))
-        .unionByName(JE_raw_2_aligned.select(F.year(to_date_clean("Default Effective Date")).alias("yr"))))
-_year_rows = [r["yr"] for r in _yrs.where(F.col("yr").isNotNull()).distinct().collect()]
-assert _year_rows, "Could not derive any year from Default Effective Date in the input data."
-_max_year = builtins.max(_year_rows)
-CURRENT_FY = f"FY{str(_max_year)[-2:]}"
-PRIOR_FY = f"FY{str(_max_year - 1)[-2:]}"
-
-_cq = (JE_raw.withColumn("_yr", F.year(to_date_clean("Default Effective Date")))
-       .withColumn("_q", F.quarter(to_date_clean("Default Effective Date")))
-       .where(F.col("_yr") == _max_year).select("_q").distinct().collect())
-CURRENT_QUARTER = f"Q{builtins.max([r['_q'] for r in _cq]) if _cq else 4}"
-print(f"[CONFIG] Current FY: {CURRENT_FY} | Prior FY: {PRIOR_FY} | Quarter: {CURRENT_QUARTER}")
-
-# COMMAND ----------
-
-# DBTITLE 1,Helpers
-def save(df, name: str):
-    """The ONLY disk write helper: write to output_path_et, return the read-back (lineage break)."""
-    if df is None:
-        return None
-    path = f"{output_path_et}/{name}.parquet"
-    cp.write(df, path, "overwrite", register=True)
-    print(f"  [WRITTEN] {path}")
-    return cp.read(path)
-
-
-def debug_count(label: str, df):
-    if ready_for_logs:  # skip the Spark job entirely when previews are off
-        return
-    display(spark.createDataFrame([(label, df.count())], ["Metric", "Count"]))
-
-
-def union_non_null(*dfs):
-    valid = [d for d in dfs if d is not None]
-    if not valid:
-        return None
-    out = valid[0]
-    for d in valid[1:]:
-        out = out.unionByName(d, allowMissingColumns=True)
-    return out
-
-
-def to_decimal_clean(col_name: str, precision: int = 38, scale: int = 6):
-    c = F.regexp_replace(F.trim(F.col(col_name).cast("string")), ",", "")
-    c = F.when(c.rlike(r"^\(.*\)$"), F.concat(F.lit("-"), F.regexp_replace(c, r"[()]", ""))).otherwise(c)
-    c = F.when(c == "", None).otherwise(c)
-    return c.cast(T.DecimalType(precision, scale))
-
-
-def month_from_business_column(month_col):
-    raw = F.trim(month_col.cast("string"))
-    return F.coalesce(
-        F.to_date(raw, "dd-MMM-yy"), F.to_date(raw, "dd-MMM-yyyy"),
-        F.to_date(F.concat(F.lit("01-"), raw), "dd-MMM-yy"),
-        F.to_date(F.concat(F.lit("01-"), raw), "dd-MMM-yyyy"),
-        F.to_date(raw, "MM/dd/yyyy"), F.to_date(raw, "yyyy-MM-dd"), F.to_date(raw, "yyyy-MM-dd HH:mm:ss"),
+def build_sheet_configs() -> list[SheetConfig]:
+    # Layout per block: $ var, % var, flag, "Accounts Flagged (Yes)", then spacer.
+    bs_blocks = (
+        block("H10:K10", "H", "I", "J", "current", "prior_year_end",      "K"),
+        block("M10:P10", "M", "N", "O", "current", "prior_quarter",       "P"),
+        block("R10:U10", "R", "S", "T", "current", "prior_year_same_qtr", "U"),
     )
 
-
-def ensure_required_columns(df, required_cols: list):
-    for c in required_cols:
-        if c not in df.columns:
-            df = df.withColumn(c, F.lit(None).cast("string"))
-    df = df.withColumn("Company Description",
-                       F.coalesce(F.col("Company Description").cast("string"), F.col("Company").cast("string")))
-    return df.select(*required_cols)
-
-
-def base_tag(df, required_cols: list):
-    """Conform to schema, derive clean helper columns, primary_key and is_valid_row. row_id is never regenerated."""
-    df = ensure_required_columns(df, required_cols)
-    return (
-        df
-        .withColumn("row_id", F.col("row_id").cast("string"))
-        .withColumn("invoice_ref_clean", F.trim(F.col("Invoice Reference")))
-        .withColumn("cat_clean", F.trim(F.upper(F.col("JE Category"))))
-        .withColumn("company_desc_clean", F.trim(F.upper(F.col("Company Description"))))
-        .withColumn("vendor_num_clean", F.trim(F.col("Vendor/Customer Number").cast("string")))
-        .withColumn("eff_dt", to_date_clean("Default Effective Date"))
-        .withColumn("Default Effective Date", F.col("eff_dt"))
-        .withColumn("Source Quarter", F.concat(F.lit("Q"), F.quarter(F.col("eff_dt")).cast("string")))
-        .withColumn("Year Flag", F.concat(F.lit("FY"), F.date_format(F.col("eff_dt"), "yy")))
-        .withColumn("month_dt", month_from_business_column(F.col("Month")))
-        .withColumn("entered_net_dec", to_decimal_clean("Net Entered"))
-        .withColumn("abs_entered_dec", F.abs(F.col("entered_net_dec")))
-        .withColumn("abs_entered_key", F.col("abs_entered_dec").cast("string"))
-        .withColumn("valid_company_desc", F.col("company_desc_clean").isNotNull() & (F.col("company_desc_clean") != ""))
-        .withColumn("valid_vendor_num", F.col("vendor_num_clean").isNotNull() & (F.col("vendor_num_clean") != ""))
-        .withColumn("primary_key", F.when(
-            F.col("valid_company_desc") & F.col("valid_vendor_num") & F.col("abs_entered_dec").isNotNull(),
-            F.concat_ws("_", F.col("company_desc_clean"), F.col("vendor_num_clean"), F.col("abs_entered_key"))))
-        .withColumn("is_valid_row",
-                    F.col("row_id").isNotNull() & F.col("entered_net_dec").isNotNull() & F.col("eff_dt").isNotNull()
-                    & F.col("month_dt").isNotNull() & F.col("primary_key").isNotNull())
+    is_ytd_blocks = (
+        block("F10:I10", "F", "G", "H", "current", "prior_year_same_qtr", "I"),
     )
 
+    is_qtd_blocks = (
+        block("G10:J10", "G", "H", "I", "current", "prior_quarter",       "J"),
+        block("L10:O10", "L", "M", "N", "current", "prior_year_same_qtr", "O"),
+    )
 
-# ---- pairing: one pass, per primary_key group, pure python ----------------------------------
-# Rule for every step: sales + credit == 0, sales_eff_dt <= credit_eff_dt, month lag accepted by the step.
-# Steps run in order; each step walks ALL candidates sorted by (lag, credit date, ids) and takes a pair
-# only if both rows are still free. No second pass needed: freeing rows never creates new candidates.
-# ponytail: O(sales x credits) per key; a hot key with thousands of same-amount rows is one slow task.
-MATCH_STEPS = [
-    ("NEXT_MONTH_EXACT", lambda lag: lag == 1),
-    ("SAME_MONTH_EXACT", lambda lag: lag == 0),
-    ("LAG_1_2_MONTH", lambda lag: 1 <= lag <= 2),
-]
-LAG_GT_2_STEPS = [("LAG_GT_2_MONTH", lambda lag: lag > 2)]
-
-PAIR_COLS = ["primary_key", "sales_row_id", "credit_row_id", "match_type", "pair_id", "year_pair_flag"]
-PAIR_SCHEMA = ", ".join(f"{c} string" for c in PAIR_COLS)
-
-
-def make_pairer(steps, cur_fy):
-    def pair(pdf):
-        import pandas as pd
-        S = pdf[pdf["cat"] == "SALES INVOICES"]
-        C = pdf[pdf["cat"] == "CREDIT MEMOS"]
-        used, out = set(), []
-        for label, lag_ok in steps:
-            cand = []
-            for s in S.itertuples():
-                if s.rid in used:
-                    continue
-                for c in C.itertuples():
-                    if c.rid in used or s.amt + c.amt != 0 or s.eff > c.eff:
-                        continue
-                    lag = (c.mon.year - s.mon.year) * 12 + c.mon.month - s.mon.month
-                    if lag_ok(lag):
-                        cand.append((lag, c.eff, c.rid, s.eff, s.rid, s.yf, c.yf))
-            cand.sort()
-            for lag, ceff, crid, seff, srid, syf, cyf in cand:
-                if srid in used or crid in used:
-                    continue
-                used.update((srid, crid))
-                flag = (("CY" if syf == cur_fy else "PY") + " Sales Inv with "
-                        + ("CY" if cyf == cur_fy else "PY") + " Credit Memo")
-                out.append((pdf["primary_key"].iat[0], srid, crid, label, f"{label}_{srid}_{crid}", flag))
-        return pd.DataFrame(out, columns=PAIR_COLS)
-    return pair
-
-
-def _selfcheck():
-    """Two sales both prefer the same credit - old loop needed 2 passes, this must pair both in one."""
-    from datetime import date as d
-    from decimal import Decimal as D
-    rows = [
-        ("K", "s1", "SALES INVOICES", D(5), d(2026, 1, 5), d(2026, 1, 1), "FY26"),
-        ("K", "s2", "SALES INVOICES", D(5), d(2026, 1, 6), d(2026, 1, 1), "FY26"),
-        ("K", "c1", "CREDIT MEMOS", D(-5), d(2026, 1, 20), d(2026, 1, 1), "FY26"),
-        ("K", "c2", "CREDIT MEMOS", D(-5), d(2026, 1, 25), d(2026, 1, 1), "FY26"),
+    return [
+        SheetConfig(
+            sheet_id="BS",
+            output_sheet="1) Balance Sheet",
+            subtitle="Balance Sheet Analytics",
+            title_label="Balance Sheet",
+            total_label="Total Balance Sheet",
+            source_key="TB_Final_BS",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_12312025",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_year_end": "D",
+                "prior_quarter": "E",
+                "prior_year_same_qtr": "F",
+            },
+            comparison_blocks=bs_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_year_end"): "BS LE - Cur vs PYE",
+                ("current", "prior_quarter"): "BS LE - Cur vs PQ",
+                ("current", "prior_year_same_qtr"): "BS LE - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$I$3",
+            materiality_percent_anchor="$I$4",
+            first_data_row=14,
+            max_data_column=23,                    # W = tickmark
+            spacer_columns={7, 12, 17, 22},        # G, L, Q, V
+            tickmark_column="W",
+            materiality_label_column="H",
+            materiality_value_column="I",
+            procedure_merge_range="B6:J8",
+            column_widths={
+                "A": 3, "B": 42, "C": 15, "D": 15, "E": 15, "F": 15,
+                "G": 3, "H": 17, "I": 11, "J": 22, "K": 28,   # K = yes-list 1
+                "L": 3, "M": 17, "N": 11, "O": 22, "P": 28,   # P = yes-list 2
+                "Q": 3, "R": 17, "S": 11, "T": 22, "U": 28,   # U = yes-list 3
+                "V": 3, "W": 10,
+            },
+            classifier="bs",
+        ),
+        SheetConfig(
+            sheet_id="IS_YTD",
+            output_sheet="3) Income Statement YTD",
+            subtitle="Income Statement YTD Analytics",
+            title_label="Income Statement YTD",
+            total_label="Total Income Statement YTD",
+            source_key="TB_Final_IS_YTD",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_year_same_qtr": "D",
+            },
+            comparison_blocks=is_ytd_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_year_same_qtr"): "IS LE - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$G$3",
+            materiality_percent_anchor="$G$4",
+            first_data_row=14,
+            max_data_column=11,                    # K = tickmark
+            spacer_columns={5, 10},                # E, J
+            tickmark_column="K",
+            materiality_label_column="F",
+            materiality_value_column="G",
+            procedure_merge_range="B6:H8",
+            column_widths={
+                "A": 3, "B": 42, "C": 15, "D": 15,
+                "E": 3, "F": 17, "G": 11, "H": 22, "I": 28,   # I = yes-list
+                "J": 3, "K": 10,
+            },
+            classifier="is",
+        ),
+        SheetConfig(
+            sheet_id="IS_QTD",
+            output_sheet="2) Income Statement QTD",
+            subtitle="Income Statement QTD Analytics",
+            title_label="Income Statement QTD",
+            total_label="Total Income Statement QTD",
+            source_key="TB_Final_QTD",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_12312025",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_quarter": "D",
+                "prior_year_same_qtr": "E",
+            },
+            comparison_blocks=is_qtd_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_quarter"): "IS LE QTD - Cur vs PQ",
+                ("current", "prior_year_same_qtr"): "IS LE QTD - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$H$3",
+            materiality_percent_anchor="$H$4",
+            first_data_row=14,
+            max_data_column=16,                    # P = tickmark
+            spacer_columns={6, 11},                # F, K
+            tickmark_column="P",
+            materiality_label_column="G",
+            materiality_value_column="H",
+            procedure_merge_range="B6:M8",
+            column_widths={
+                "A": 3, "B": 42, "C": 15, "D": 15, "E": 15,
+                "F": 3, "G": 17, "H": 11, "I": 22, "J": 28,   # J = yes-list 1
+                "K": 3, "L": 17, "M": 11, "N": 22, "O": 28,   # O = yes-list 2
+                "P": 10,
+            },
+            classifier="is_qtd",
+        ),
     ]
-    pdf = pd.DataFrame(rows, columns=["primary_key", "rid", "cat", "amt", "eff", "mon", "yf"])
-    out = make_pairer(MATCH_STEPS, "FY26")(pdf)
-    assert set(zip(out.sales_row_id, out.credit_row_id)) == {("s1", "c1"), ("s2", "c2")}, out
-    print("[SELFCHECK] pairer ok")
+# ============================================================================
+# DATA AND PERIOD HELPERS
+# ============================================================================
+
+def convert_to_pandas(source: Any, source_name: str) -> pd.DataFrame:
+    if hasattr(source, "toPandas"):
+        return source.toPandas()
+    if isinstance(source, pd.DataFrame):
+        return source.copy()
+    raise TypeError(f"{source_name} must be a pandas or Spark DataFrame.")
 
 
-_selfcheck()
+def parse_date(column_name: str) -> date:
+    return datetime.strptime(str(column_name)[-8:], DATE_FORMAT).date()
 
 
-def run_pipeline(src, cols, steps, pfx, year_flag, equal_guard=False):
-    """Classify -> pair -> split. Writes exactly 2 parquet files: {pfx}_CLASSIFIED and {pfx}_PAIRED."""
-    t = base_tag(src, cols)
+def subtract_months(value: date, months: int) -> date:
+    total_months = value.year * 12 + value.month - 1 - months
+    year, month = divmod(total_months, 12)
+    month += 1
+    return date(year, month, min(value.day, calendar.monthrange(year, month)[1]))
 
-    blank = F.col("invoice_ref_clean").isNull() | (F.trim(F.col("invoice_ref_clean")) == "")
-    is_si = F.col("cat_clean") == "SALES INVOICES"
-    is_cm = F.col("cat_clean") == "CREDIT MEMOS"
-    zero = F.col("entered_net_dec") == EXACT_ZERO
-    # invalid rows get a singleton window partition (no skew on null keys)
-    w = Window.partitionBy(F.coalesce(F.col("primary_key"), F.col("row_id")))
-    working = F.col("is_valid_row") & ~blank
-    t = t.withColumn("pk_row_count", F.sum(F.when(working, 1).otherwise(0)).over(w))
 
-    one, many = F.col("pk_row_count") == 1, F.col("pk_row_count") > 1
-    t = t.withColumn("bucket",
-        F.when(~F.col("is_valid_row"), "INVALID")
-         .when(blank, "EXC_1")
-         .when(one & ~(is_si | is_cm), "UNIQUE_OTHER")
-         .when(one & is_si, "UNIQUE_SALES")
-         .when(one & is_cm, "UNIQUE_CREDITS")
-         .when(many & (~(is_si | is_cm) | zero), "DUP_OTHER_OR_ZERO")
-         .otherwise("DUP_SI_CM"))
+def closest_date(target: date, dated_columns: dict[str, date]) -> str:
+    return min(
+        dated_columns,
+        key=lambda column: abs((dated_columns[column] - target).days),
+    )
 
-    if equal_guard:  # PK groups with unequal sales/credit counts skip matching
-        in_pool = F.col("bucket") == "DUP_SI_CM"
-        n_s = F.sum(F.when(in_pool & is_si, 1).otherwise(0)).over(w)
-        n_c = F.sum(F.when(in_pool & is_cm, 1).otherwise(0)).over(w)
-        t = t.withColumn("bucket", F.when(in_pool & (n_s != n_c), "DUP_UNEQUAL_COUNT").otherwise(F.col("bucket")))
 
-    t = t.drop("is_valid_row", "valid_company_desc", "valid_vendor_num")
-    C = save(t, f"{pfx}_CLASSIFIED")
-    b = lambda k: C.filter(F.col("bucket") == k)
+def most_recent_fiscal_year_end(
+    dated_columns: dict[str, date],
+    current_date: date,
+) -> str | None:
+    month, day = FISCAL_YEAR_END
+    candidates = {
+        column: value
+        for column, value in dated_columns.items()
+        if value.month == month and value.day == day and value < current_date
+    }
+    return max(candidates, key=candidates.get) if candidates else None
 
-    pool = b("DUP_SI_CM")
-    slim = (pool.select("primary_key", F.col("row_id").alias("rid"), F.col("cat_clean").alias("cat"),
-                        F.col("entered_net_dec").alias("amt"), F.col("eff_dt").alias("eff"),
-                        F.col("month_dt").alias("mon"), F.col("Year Flag").alias("yf"))
-                .groupBy("primary_key")
-                .applyInPandas(make_pairer(steps, CURRENT_FY), PAIR_SCHEMA))
-    side = lambda k: slim.select(F.col(k).alias("row_id"), "pair_id", "match_type",
-                                 F.col("year_pair_flag").alias("Year Pair Flag"))
-    paired = save(pool.join(side("sales_row_id").unionByName(side("credit_row_id")), "row_id", "left"),
-                  f"{pfx}_PAIRED")
 
-    matched = paired.filter(F.col("pair_id").isNotNull())
-    if not year_flag:
-        matched = matched.drop("Year Pair Flag")
-    rest = paired.filter(F.col("pair_id").isNull()).drop("pair_id", "match_type", "Year Pair Flag")
-
-    return {
-        "invalid": b("INVALID"), "exc1": b("EXC_1"),
-        "dup_other": b("DUP_OTHER_OR_ZERO"), "unique_other": b("UNIQUE_OTHER"),
-        "matched": matched,
-        "unmatched": union_non_null(b("UNIQUE_SALES"), b("UNIQUE_CREDITS"), b("DUP_UNEQUAL_COUNT"), rest),
+def log_classification(
+    label: str,
+    roles: dict[str, str],
+    dated: dict[str, date],
+    target_quarter: date | None = None,
+    target_pyq: date | None = None,
+    pyq_delta: int | None = None,
+    used_fallback: bool = False,
+) -> None:
+    role_labels = {
+        "current": "Current quarter",
+        "prior_year_end": "Prior year-end",
+        "prior_quarter": "Prior quarter",
+        "prior_year_same_qtr": "PY same quarter",
     }
 
-# COMMAND ----------
-
-# DBTITLE 1,AA Comment logic
-def assign_aa_comment(df, raw_df):
-    """First match wins. Needs match_type, cat_clean, company_desc_clean, vendor_num_clean, _pair_net_abs on df."""
-    nm = F.col("match_type")
-    cm = (nm == "NO_MATCH_FOUND") & (F.col("cat_clean") == "CREDIT MEMOS")
-    exact = F.col("_pair_net_abs") == EXACT_ZERO  # null -> falsy
-
-    # company+vendor grain (same key matching uses). ponytail: raw_df is JE_raw only (old behavior);
-    # union JE_raw_2_aligned if prior-year sales should count as "sales exist for this vendor".
-    stats = (raw_df
-             .withColumn("_co", F.trim(F.upper(F.col("Company Description"))))
-             .withColumn("_vn", F.trim(F.col("Vendor/Customer Number").cast("string")))
-             .withColumn("_cat", F.trim(F.upper(F.col("JE Category"))))
-             .groupBy("_co", "_vn")
-             .agg(F.countDistinct(F.when(F.col("_cat") == "SALES INVOICES", F.col("Invoice Reference"))).alias("sales_inv_count"),
-                  F.countDistinct(F.when(F.col("_cat") == "CREDIT MEMOS", F.col("Invoice Reference"))).alias("credit_memo_count")))
-    df = df.join(stats, (df["company_desc_clean"] == F.col("_co")) & (df["vendor_num_clean"] == F.col("_vn")), "left") \
-           .drop("_co", "_vn")
-    only_cm = cm & (F.col("sales_inv_count") == 0) & (F.col("credit_memo_count") > 0)
-
-    comment = (F.when(nm == "ONE_TO_MANY", F.lit(AA_ONE_TO_MANY))
-                .when((nm == "ONE_TO_ONE_DATE_SYNC") & exact, F.lit(AA_EXACT_MATCH_SYNC))
-                .when(nm == "ONE_TO_ONE_DATE_SYNC", F.lit(AA_APPROX_MATCH))
-                .when((nm == "ONE_TO_ONE_DATE_UNSYNC") & exact, F.lit(AA_EXACT_MATCH_UNSYNC))
-                .when(nm == "ONE_TO_ONE_DATE_UNSYNC", F.lit(AA_APPROX_MATCH))
-                .when(only_cm, F.lit(AA_ONLY_CREDITS))
-                .when(cm, F.lit(AA_CLIENT_CONFIRM)))
-    rule = (F.when(nm == "ONE_TO_MANY", F.lit("Rule1_OTM"))
-             .when((nm == "ONE_TO_ONE_DATE_SYNC") & exact, F.lit("Rule2a_DateSync_ExactMatch"))
-             .when(nm == "ONE_TO_ONE_DATE_SYNC", F.lit("Rule2a_DateSync_ApproxMatch"))
-             .when((nm == "ONE_TO_ONE_DATE_UNSYNC") & exact, F.lit("Rule2b_DateUnsync_ExactMatch"))
-             .when(nm == "ONE_TO_ONE_DATE_UNSYNC", F.lit("Rule2b_DateUnsync_ApproxMatch"))
-             .when(only_cm, F.lit("Rule3P1_OnlyCredits_CompanyVendor"))
-             .when(cm, F.lit("Rule3P4_ClientConfirm")))
-    return (df.withColumn("AA Comment", comment).withColumn("AA Rule", rule)
-              .drop("_pair_net_abs", "sales_inv_count", "credit_memo_count"))
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipelines 1-3
-print("PIPELINE 1 - current quarter exact match")
-P1 = run_pipeline(JE_raw, BASE_RAW_COLUMNS, MATCH_STEPS, "P1", year_flag=False)
-
-print("PIPELINE 2 - P1 leftovers + prior-year Sales Invoices")
-_keep = lambda d: d.select(*[c for c in BASE_RAW_COLUMNS if c in d.columns])  # drops every derived column
-P2_in = _keep(P1["unmatched"]).unionByName(_keep(JE_raw_2_aligned), allowMissingColumns=True)
-P2 = run_pipeline(P2_in, PIPE2_RAW_COLUMNS, MATCH_STEPS, "P2", year_flag=True)
-
-print("PIPELINE 3 - same PK, month lag > 2, equal-count guard")
-P3 = run_pipeline(P2["unmatched"], PIPE2_RAW_COLUMNS, LAG_GT_2_STEPS, "P3", year_flag=True, equal_guard=True)
-
-for _n, _p in (("P1", P1), ("P2", P2), ("P3", P3)):
-    debug_count(f"{_n} matched rows", _p["matched"])
-    debug_count(f"{_n} unmatched rows", _p["unmatched"])
-
-# COMMAND ----------
-
-# DBTITLE 1,Pipeline 4 - tolerance match on company+vendor key
-print("PIPELINE 4 - tolerance matching, key = company+vendor")
-
-p4 = (base_tag(P3["unmatched"], PIPE2_RAW_COLUMNS)
-      .drop("is_valid_row", "valid_company_desc", "valid_vendor_num")
-      .withColumn("p4_primary_key", F.concat_ws("_", F.col("company_desc_clean"), F.col("vendor_num_clean"))))
-
-_s = (p4.filter(F.col("cat_clean") == "SALES INVOICES")
-        .select("p4_primary_key", F.col("row_id").alias("sales_row_id"),
-                F.col("entered_net_dec").alias("sales_amt"), F.col("eff_dt").alias("sales_eff")))
-_c = (p4.filter(F.col("cat_clean") == "CREDIT MEMOS")
-        .select("p4_primary_key", F.col("row_id").alias("credit_row_id"),
-                F.col("entered_net_dec").alias("credit_amt"), F.col("eff_dt").alias("credit_eff")))
-
-cand = (_s.join(_c, "p4_primary_key")
-          .withColumn("net", F.abs(F.col("sales_amt") + F.col("credit_amt")))
-          .filter(F.col("net") <= F.lit(P4_TOLERANCE).cast(DECIMAL_TYPE)))
-
-# candidate pairs are distinct, so count(*) over a row's window == its number of candidates
-w_s, w_c = Window.partitionBy("sales_row_id"), Window.partitionBy("credit_row_id")
-cls = (cand
-       .withColumn("otm", (F.count("*").over(w_s) > 1) | (F.count("*").over(w_c) > 1))
-       .withColumn("sync", F.col("sales_eff") <= F.col("credit_eff")))  # <= : same-day pair is NOT "credit before sales"
-
-_side = lambda k: cls.select(F.col(k).alias("row_id"), "otm", "sync", "net")
-roles = (_side("sales_row_id").unionByName(_side("credit_row_id"))
-         .groupBy("row_id")
-         .agg(F.max("otm").alias("otm"), F.max("sync").alias("sync"),
-              F.min(F.when(~F.col("otm"), F.col("net"))).alias("_pair_net_abs")))
-
-# every p4 row exactly once (left join on deduped roles) -> row conservation by construction
-P4_ALL_UNMATCHED = (p4.join(roles, "row_id", "left")
-    .withColumn("match_type",
-        F.when(F.col("otm"), "ONE_TO_MANY")
-         .when(F.col("sync") == True, "ONE_TO_ONE_DATE_SYNC")    # noqa: E712 (Spark column compare)
-         .when(F.col("sync") == False, "ONE_TO_ONE_DATE_UNSYNC")  # noqa: E712
-         .otherwise("NO_MATCH_FOUND"))
-    .drop("otm", "sync"))
-
-P4_ALL_UNMATCHED_COMMENTED = save(assign_aa_comment(P4_ALL_UNMATCHED, JE_raw),
-                                  "P4_ALL_UNMATCHED_WITH_AA_COMMENT")
-
-debug_count("P4 unmatched with AA Comment", P4_ALL_UNMATCHED_COMMENTED)
-if not ready_for_logs:
-    display(P4_ALL_UNMATCHED_COMMENTED.groupBy("AA Comment").count().orderBy(F.desc("count")))
-    display(P4_ALL_UNMATCHED_COMMENTED.groupBy("AA Rule").count().orderBy(F.desc("count")))
-
-# COMMAND ----------
-
-# DBTITLE 1,Final Excel export
-print("FINAL EXCEL EXPORT")
-
-P1_ALL_MATCHED, P2_ALL_MATCHED, P3_ALL_MATCHED = P1["matched"], P2["matched"], P3["matched"]
-
-all_invalid = union_non_null(P1["invalid"], P2["invalid"], P3["invalid"])
-all_exc_1 = union_non_null(P1["exc1"], P2["exc1"], P3["exc1"])
-all_dup_other = union_non_null(P1["dup_other"], P2["dup_other"], P3["dup_other"])
-all_unique_other = union_non_null(P1["unique_other"], P2["unique_other"], P3["unique_other"])
+    print(f"\n--- {label} period classification ---")
+    for role, column in roles.items():
+        note = ""
+        if role == "prior_quarter" and target_quarter:
+            note = f" | target: {target_quarter}"
+        if role == "prior_year_same_qtr" and pyq_delta is not None:
+            note += f" | target: {target_pyq} | delta: {pyq_delta} days"
+            if used_fallback:
+                note += " | fallback used"
+        print(f"{role_labels.get(role, role)}: {column} [{dated[column]}]{note}")
+    print("------------------------------------\n")
 
 
-def export_to_excel(sheets: dict, path: str):
-    front = ["primary_key", "JE Category", "Net Entered", "Default Effective Date", "Source Quarter"]
-    drop = {"pair_id", "pk_row_count", "bucket", "row_id", "invoice_ref_clean", "cat_clean", "company_desc_clean",
-            "vendor_num_clean", "eff_dt", "month_dt", "entered_net_dec", "abs_entered_dec", "abs_entered_key",
-            "abs_usd_net", "p4_primary_key"}
+def classify_bs_periods(raw_columns: list[str]) -> dict[str, str]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
 
-    def prep(df):
-        df = df.drop(*[c for c in drop if c in df.columns])
-        pf = [c for c in front if c in df.columns]
-        return df.select(*(pf + [c for c in df.columns if c not in pf])).pandas_api()
+    if not others:
+        raise ValueError("BS needs at least two date columns.")
 
-    cp.pandas.to_excel(dataframes=[prep(d) for d in sheets.values()], sheet_names=list(sheets.keys()), path=path)
-    print(f"  [EXCEL] Written -> {path}")
+    prior_year_end = most_recent_fiscal_year_end(others, current_date)
+    if prior_year_end is None:
+        prior_year_end = closest_date(
+            date(current_date.year - 1, *FISCAL_YEAR_END),
+            others,
+        )
 
+    prior_quarter_target = subtract_months(current_date, 3)
+    prior_quarter = closest_date(prior_quarter_target, others)
 
-# Prior-year Sales Invoices that stayed unmatched with no AA Comment are not reported (not this quarter's problem).
-is_current_period = (
-    (F.upper(F.trim(F.col("Source Quarter"))) == F.lit(CURRENT_QUARTER))
-    & (F.upper(F.trim(F.col("Year Flag"))) == F.lit(CURRENT_FY))
-)
-has_aa_comment = F.col("AA Comment").isNotNull() & (F.trim(F.col("AA Comment")) != "")
-P4_ALL_UNMATCHED_COMMENTED = P4_ALL_UNMATCHED_COMMENTED.filter(is_current_period | has_aa_comment)
+    pyq_target = subtract_months(current_date, 12)
+    best_pyq = closest_date(pyq_target, others)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+    prior_year_same_qtr = (
+        prior_year_end if pyq_delta > PY_MATCH_DAYS else best_pyq
+    )
 
-export_to_excel(
-    sheets={
-        "INVALID_ROWS": all_invalid,
-        "BLANK_Vendor_Number": all_exc_1,
-        "Non Sales - Credit Pairs": all_dup_other,
-        "Other_Unique_PKs": all_unique_other,
-        "Same Quater Matched Pairs": P1_ALL_MATCHED,
-        "Prev to Curr Quater Match Pair": P2_ALL_MATCHED,
-        "Same PK Lag > 2 Month Match Pair": P3_ALL_MATCHED,
-        "Unmatched_Items": P4_ALL_UNMATCHED_COMMENTED,
-    },
-    path=f"{output_path_et}/Tradeweb Securities Data Final - {CURRENT_FY} {CURRENT_QUARTER}.xlsx",
-)
-
-# COMMAND ----------
-
-# DBTITLE 1,Row conservation check (informational)
-# Surplus vs JE_raw is expected: carry-forward rows are in the outputs, and PY unmatched sales
-# without an AA Comment are filtered out of Unmatched_Items.
-dfs = {
-    "all_invalid": all_invalid, "all_exc_1": all_exc_1, "all_dup_other": all_dup_other,
-    "all_unique_other": all_unique_other, "P1_ALL_MATCHED": P1_ALL_MATCHED,
-    "P2_ALL_MATCHED": P2_ALL_MATCHED, "P3_ALL_MATCHED": P3_ALL_MATCHED,
-    "P4_ALL_UNMATCHED_COMMENTED": P4_ALL_UNMATCHED_COMMENTED,
-}
-rows = [("Raw rows (JE_raw)", JE_raw.count())]
-total_out = 0
-for name, df in dfs.items():
-    n = df.count()
-    rows.append((name, n))
-    total_out += n
-rows.append(("Total out", total_out))
-display(spark.createDataFrame(rows, ["Dataset", "Count"]))
-print("[DONE] All pipelines complete.")
-
-# COMMAND ----------
-
-# DBTITLE 1,Account Description summary workbook
-from openpyxl import Workbook
-from openpyxl.styles import Border, Side, Font, Alignment, PatternFill
-
-COMPANIES = [
-    "Dealerweb LLC", "Institutional Cash Distributors LLC", "Tradeweb Direct LLC",
-    "Tradeweb Europe Limited", "Tradeweb LLC", "Tradeweb Markets LLC", "TW SEF",
-]
-DISPLAY_SUMMARIES = True
-
-SUMMARY_DATASETS = {
-    "Same Quarter Match": P1_ALL_MATCHED,
-    "Previous Quarter Match": P2_ALL_MATCHED.filter(is_current_period),
-    "Same PK Lag > 2 Month Match": P3_ALL_MATCHED.filter(is_current_period),
-    "Unmatched": P4_ALL_UNMATCHED_COMMENTED.filter(is_current_period),
-}
-
-# Key = output group, value = account descriptions rolled into it. Unlisted accounts get their own group.
-ACCOUNT_GROUPS = {
-    "Commissions": ["Commissions - Fixed", "Commissions - Variable"],
-    "Contra Revenue": ["Contra Revenue - Subscription Fees - Fixed",
-                       "Contra Revenue Commissions - Tech Credits - Variable",
-                       "Contra Revenue Commissions - Variable"],
-    "Other Revenue": ["Other Revenue - Fixed", "Other Revenue - Fixed - LSEG", "Other Revenue - Variable"],
-    "Subscription Fees": ["Subscription Fees - Fixed", "Subscription Fees - Fixed - LSEG",
-                          "Subscription Fees - Variable"],
-    "Transaction Fees": ["Transaction Fees - Fixed", "Transaction Fees - Variable"],
-}
+    roles = {
+        "current": current_column,
+        "prior_year_end": prior_year_end,
+        "prior_quarter": prior_quarter,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    log_classification(
+        "BS", roles, dated, prior_quarter_target,
+        pyq_target, pyq_delta, pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles
 
 
-def _normalize_text(value):
-    if value is None:
-        return ""
-    return re.sub(r"\s+", " ", str(value).strip().replace("–", "-").replace("—", "-")).upper()
+def classify_is_periods(
+    raw_columns: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
+
+    if not others:
+        raise ValueError("IS needs at least two date columns.")
+
+    pyq_target = subtract_months(current_date, 12)
+    best_pyq = closest_date(pyq_target, others)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+
+    if pyq_delta <= PY_MATCH_DAYS:
+        prior_year_same_qtr = best_pyq
+    else:
+        prior_year_same_qtr = most_recent_fiscal_year_end(
+            others, current_date
+        ) or closest_date(date(current_date.year - 1, *FISCAL_YEAR_END), others)
+
+    roles = {
+        "current": current_column,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    discarded = [column for column in others if column != prior_year_same_qtr]
+    log_classification(
+        "IS", roles, dated, target_pyq=pyq_target,
+        pyq_delta=pyq_delta, used_fallback=pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles, discarded
 
 
-GROUP_LOOKUP = {_normalize_text(m): g for g, ms in ACCOUNT_GROUPS.items() for m in ms}
+def classify_is_qtd_periods(
+    raw_columns: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
+
+    if len(others) < 2:
+        raise ValueError("IS QTD needs at least three date columns.")
+
+    prior_quarter_target = subtract_months(current_date, 3)
+    prior_quarter = closest_date(prior_quarter_target, others)
+
+    pyq_target = subtract_months(current_date, 12)
+    pyq_pool = {c: d for c, d in others.items() if c != prior_quarter}
+    pyq_pool = pyq_pool or others
+
+    best_pyq = closest_date(pyq_target, pyq_pool)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+
+    if pyq_delta <= PY_MATCH_DAYS:
+        prior_year_same_qtr = best_pyq
+    else:
+        prior_year_same_qtr = (
+            most_recent_fiscal_year_end(pyq_pool, current_date)
+            or closest_date(date(current_date.year - 1, *FISCAL_YEAR_END), pyq_pool)
+        )
+
+    roles = {
+        "current": current_column,
+        "prior_quarter": prior_quarter,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    discarded = [column for column in raw_columns if column not in roles.values()]
+    log_classification(
+        "IS QTD", roles, dated, prior_quarter_target,
+        pyq_target, pyq_delta, pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles, discarded
 
 
-def _group_name_for_account(account_desc):
-    return GROUP_LOOKUP.get(_normalize_text(account_desc), account_desc.strip() if account_desc else "Unmapped")
+def prepare_data(
+    config: SheetConfig,
+    sources: dict[str, Any],
+) -> tuple[pd.DataFrame, dict[str, str], dict[str, str], pd.DataFrame]:
+    df = convert_to_pandas(sources[config.source_key], config.source_key)
+
+    required_columns = [ACCOUNT_GROUP_COLUMN, *config.raw_amount_columns]
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"[{config.sheet_id}] Missing columns: {missing}")
+
+    df[ACCOUNT_GROUP_COLUMN] = (
+        df[ACCOUNT_GROUP_COLUMN]
+        .fillna(UNMAPPED_ACCOUNT)
+        .astype(str)
+        .str.strip()
+        .replace("", UNMAPPED_ACCOUNT)
+    )
+
+    # Convert only the required summary columns to numbers.
+    for column in config.raw_amount_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    raw_df = df.copy()
+
+    if config.classifier == "bs":
+        raw_roles = classify_bs_periods(list(config.raw_amount_columns))
+        discarded = []
+    elif config.classifier == "is_qtd":
+        raw_roles, discarded = classify_is_qtd_periods(
+            list(config.raw_amount_columns)
+        )
+    else:
+        raw_roles, discarded = classify_is_periods(
+            list(config.raw_amount_columns)
+        )
+
+    used_columns = [
+        column for column in config.raw_amount_columns
+        if column not in discarded
+    ]
+
+    grouped = (
+        df.groupby(ACCOUNT_GROUP_COLUMN, sort=False, as_index=False)
+        [list(config.raw_amount_columns)]
+        .sum()
+    )
+    grouped = grouped.drop(columns=discarded, errors="ignore")
+
+    rename_map = {
+        column: f"{parse_date(column).month}/"
+        f"{parse_date(column).day}/"
+        f"{parse_date(column).year}"
+        for column in used_columns
+    }
+
+    grouped = grouped.rename(columns=rename_map)
+    display_roles = {
+        role: rename_map[column]
+        for role, column in raw_roles.items()
+        if column in rename_map
+    }
+
+    return grouped, display_roles, raw_roles, raw_df
 
 
-def _safe_sheet_name(name: str) -> str:
-    cleaned = re.sub(r"[\[\]\:\*\?\/\\]", "_", str(name)).strip()
-    return cleaned[:31] if cleaned else "Sheet"
+def active_blocks(
+    config: SheetConfig,
+    raw_roles: dict[str, str],
+) -> list[ComparisonBlock]:
+    result = []
+    for comparison in config.comparison_blocks:
+        if raw_roles.get(comparison.current_role) != raw_roles.get(
+            comparison.comparison_role
+        ):
+            result.append(comparison)
+        else:
+            print(
+                f"Skipping {comparison.current_role} vs "
+                f"{comparison.comparison_role}: both use "
+                f"{raw_roles.get(comparison.current_role)}."
+            )
+    return result
+
+# ============================================================================
+# EXCEL WRITING HELPERS
+# ============================================================================
+
+def write_cell(
+    cell,
+    value: Any = None,
+    font=None,
+    fill=None,
+    border=None,
+    alignment=None,
+    number_format: str | None = None,
+) -> None:
+    cell.value = value
+    if font is not None:
+        cell.font = font
+    if fill is not None:
+        cell.fill = fill
+    if border is not None:
+        cell.border = border
+    if alignment is not None:
+        cell.alignment = alignment
+    if number_format is not None:
+        cell.number_format = number_format
 
 
-def _with_je_category(df):
-    if "JE Category" in df.columns:
-        return df.withColumn("JE Category", F.when(F.trim(F.col("JE Category")) == "", F.lit("Blank"))
-                             .otherwise(F.coalesce(F.trim(F.col("JE Category")), F.lit("Blank"))))
-    return df.withColumn("JE Category", F.lit("Unspecified"))
+def put(
+    worksheet,
+    reference: str,
+    value: Any = None,
+    **style,
+) -> None:
+    write_cell(worksheet[reference], value, **style)
 
 
-# ONE aggregation job per dataset (was ~200 collect() jobs). Amounts parsed with to_decimal_clean so
-# accounting-style "(123.45)" is not silently dropped.
-_aggs = []
-for _name, _df in SUMMARY_DATASETS.items():
-    _aggs.append(
-        _with_je_category(_df)
-        .withColumn("_co", F.upper(F.trim(F.col("Company Description"))))
-        .withColumn("_acct", F.trim(F.col("Account Description")))
-        .groupBy("_co", "_acct", "JE Category")
-        .agg(F.count("primary_key").alias("cnt"),
-             F.sum(to_decimal_clean("Entered Dr")).cast("double").alias("dr"),
-             F.sum(to_decimal_clean("Entered CR")).cast("double").alias("cr"),
-             F.sum(to_decimal_clean("Net Entered")).cast("double").alias("net"))
-        .withColumn("sheet", F.lit(_name)))
-AGG = union_non_null(*_aggs).toPandas()
-AGG[["dr", "cr", "net"]] = AGG[["dr", "cr", "net"]].fillna(0.0)
-AGG["cnt"] = AGG["cnt"].fillna(0).astype(int)
-
-SUMMARY_COLS = ["Sheet Name / Section", "JE Category", "Count", "Entered Dr", "Entered CR", "Net Entered"]
+def put_rc(
+    worksheet,
+    row: int,
+    column: int,
+    value: Any = None,
+    **style,
+) -> None:
+    write_cell(worksheet.cell(row=row, column=column), value, **style)
 
 
-def build_company_summary(company_desc: str):
-    """Rows: [Sheet Name / Section, JE Category, Count, Entered Dr, Entered CR, Net Entered]."""
-    comp = AGG[AGG["_co"] == company_desc.strip().upper()]
-    accts = sorted({a for a in comp["_acct"].dropna() if a.strip()})
-    grouped = {}
-    for a in accts:
-        grouped.setdefault(_group_name_for_account(a), []).append(a)
-    order = (["Total"] + [g for g in ACCOUNT_GROUPS if g in grouped]
-             + sorted(g for g in grouped if g not in ACCOUNT_GROUPS))
+def variance_formulas(
+    row: int,
+    config: SheetConfig,
+    comparisons: list[ComparisonBlock],
+) -> dict[str, str]:
+    current_column = config.role_to_excel_column["current"]
+    formulas = {}
+
+    for comparison in comparisons:
+        comparison_column = config.role_to_excel_column[
+            comparison.comparison_role
+        ]
+        dollar = comparison.dollar_column
+        percent = comparison.percent_column
+        flag = comparison.flag_column
+
+        formulas[f"{dollar}{row}"] = (
+            f"={current_column}{row}-{comparison_column}{row}"
+        )
+        formulas[f"{percent}{row}"] = (
+            f"=IFERROR({dollar}{row}/{comparison_column}{row},0)"
+        )
+        formulas[f"{flag}{row}"] = (
+            f'=IF(AND(ABS({dollar}{row})>{config.materiality_dollar_anchor},'
+            f'ABS({percent}{row})>{config.materiality_percent_anchor}),'
+            f'"{YES_VALUE}","{NO_VALUE}")'
+        )
+
+    return formulas
+
+
+def write_variance_cells(
+    worksheet,
+    formulas: dict[str, str],
+    comparisons: list[ComparisonBlock],
+    font,
+    border=None,
+) -> None:
+    percent_columns = {item.percent_column for item in comparisons}
+    flag_columns = {item.flag_column for item in comparisons}
+
+    for reference, formula in formulas.items():
+        column = re.sub(r"\d", "", reference)
+        put(
+            worksheet,
+            reference,
+            formula,
+            font=font,
+            border=border,
+            alignment=CENTER_ALIGN if column in flag_columns else RIGHT_ALIGN,
+            number_format=(
+                PERCENT_FORMAT if column in percent_columns else NUMBER_FORMAT
+            ),
+        )
+
+
+def apply_conditional_formatting(
+    worksheet,
+    comparisons: list[ComparisonBlock],
+    first_row: int,
+    last_row: int,
+) -> None:
+    worksheet.conditional_formatting._cf_rules = {}
+
+    for comparison in comparisons:
+        for row in range(first_row, last_row + 1):
+            reference = f"{comparison.flag_column}{row}"
+            formula = f'{absolute_coordinate(reference)}="{YES_VALUE}"'
+            rule = FormulaRule(formula=[formula], stopIfTrue=True)
+            rule.dxf = YES_FILL
+            rule.priority = 1
+            worksheet.conditional_formatting.add(reference, rule)
+
+
+def write_summary_sheet(
+    worksheet,
+    config: SheetConfig,
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    comparisons: list[ComparisonBlock],
+) -> None:
+    # ── Remove old merges (row-10 block labels + any merge in data area) ───
+    for merged_range in list(worksheet.merged_cells.ranges):
+        if (
+            merged_range.min_row == SUMMARY_BLOCK_ROW
+            or merged_range.max_row >= config.first_data_row
+        ):
+            worksheet.unmerge_cells(str(merged_range))
+
+    for row in worksheet.iter_rows(
+        min_row=config.first_data_row,
+        max_row=max(worksheet.max_row, config.first_data_row),
+        min_col=2,
+        max_col=config.max_data_column,
+    ):
+        for cell in row:
+            cell.value = None
+
+    for row in (SUMMARY_BLOCK_ROW, SUMMARY_HEADER_ROW):
+        for column in range(2, config.max_data_column + 1):
+            worksheet.cell(row=row, column=column).value = None
+
+    worksheet.sheet_view.showGridLines = False
+    for row in range(2, 5):
+        for column in range(3, 10):  # C:I
+            worksheet.cell(row=row, column=column).value = None
+    # ── Title and materiality section ──────────────────────────────────────
+    put(worksheet, "B1", CLIENT_NAME, font=BOLD_FONT)
+    put(worksheet, "B2", config.subtitle, font=BOLD_FONT)
+    put(worksheet, "B3", PERIOD_LABEL, font=BOLD_FONT)
+
+    put(worksheet, f"{config.materiality_label_column}2",
+        "Materiality", font=BOLD_FONT)
+    put(worksheet, f"{config.materiality_label_column}3",
+        "Threshold (in $)", font=BOLD_FONT)
+    put(worksheet, f"{config.materiality_label_column}4",
+        "Threshold (in %)", font=BOLD_FONT)
+    put(worksheet, f"{config.materiality_value_column}2",
+        MATERIALITY, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+        number_format=NUMBER_FORMAT)
+    put(worksheet, f"{config.materiality_value_column}3",
+        THRESHOLD_DOLLARS, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+        number_format=NUMBER_FORMAT)
+    put(worksheet, f"{config.materiality_value_column}4",
+        THRESHOLD_PERCENT, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+        number_format=PERCENT_FORMAT)
+
+    # ── Procedure box ──────────────────────────────────────────────────────
+    put(
+        worksheet, "B6", PROCEDURE_TEXT,
+        font=NORMAL_FONT, fill=PROCEDURE_FILL, alignment=LEFT_WRAP,
+    )
+    worksheet.merge_cells(config.procedure_merge_range)
+
+    # ── Column-header rows (row 10 = block label, row 11 = sub-headers) ───
+    put(
+        worksheet, f"B{SUMMARY_HEADER_ROW}",
+        "Account Description",
+        font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+    for role, col in config.role_to_excel_column.items():
+        put(
+            worksheet, f"{col}{SUMMARY_HEADER_ROW}",
+            display_roles[role],
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+
+    for item in comparisons:
+        put(
+            worksheet, f"{item.dollar_column}{SUMMARY_BLOCK_ROW}",
+            f"{display_roles[item.current_role]} vs "
+            f"{display_roles[item.comparison_role]}",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        worksheet.merge_cells(item.merge_range)
+
+        put(
+            worksheet, f"{item.dollar_column}{SUMMARY_HEADER_ROW}",
+            "$ Variance",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        put(
+            worksheet, f"{item.percent_column}{SUMMARY_HEADER_ROW}",
+            "% Variance",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        put(
+            worksheet, f"{item.flag_column}{SUMMARY_HEADER_ROW}",
+            "Further explain at\nLE level?",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        if item.yes_list_column:
+            put(
+                worksheet, f"{item.yes_list_column}{SUMMARY_HEADER_ROW}",
+                "Accounts Flagged\n(Yes)",
+                font=HEADER_FONT, fill=YES_HEADER_FILL,
+                border=THIN_BORDER, alignment=CENTER_WRAP,
+            )
+
+    put(
+        worksheet, f"{config.tickmark_column}{SUMMARY_HEADER_ROW}",
+        "Tickmark",
+        font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+
+    worksheet.row_dimensions[SUMMARY_BLOCK_ROW].height = 30
+    worksheet.row_dimensions[SUMMARY_HEADER_ROW].height = 42
+
+    # ── Detail rows ────────────────────────────────────────────────────────
+    first_row = config.first_data_row
+    last_data_row = config.first_data_row + len(dataframe) - 1
+
+    for row_number, (_, source_row) in enumerate(
+        dataframe.iterrows(), config.first_data_row
+    ):
+        put(
+            worksheet, f"B{row_number}",
+            source_row[ACCOUNT_GROUP_COLUMN],
+            font=NORMAL_FONT, alignment=LEFT_ALIGN,
+        )
+
+        for role, column in config.role_to_excel_column.items():
+            put(
+                worksheet,
+                f"{column}{row_number}",
+                float(source_row[display_roles[role]]),
+                font=NORMAL_FONT,
+                alignment=RIGHT_ALIGN,
+                number_format=NUMBER_FORMAT,
+            )
+
+        write_variance_cells(
+            worksheet,
+            variance_formulas(row_number, config, comparisons),
+            comparisons,
+            NORMAL_FONT,
+        )
+
+        put(
+            worksheet, f"{config.tickmark_column}{row_number}",
+            None, font=RED_BOLD_FONT, alignment=CENTER_ALIGN,
+        )
+        worksheet.row_dimensions[row_number].height = 18
+
+    # ── Accounts Flagged (Yes): one merged cell + one array formula/block ──
+    # Same pattern as the LE sheet. Style BEFORE merge so border spreads.
+    if len(dataframe):
+        for item in comparisons:
+            col = item.yes_list_column
+            if not col:
+                continue
+            flag_range = (
+                f"{item.flag_column}{first_row}:{item.flag_column}{last_data_row}"
+            )
+            cell = worksheet[f"{col}{first_row}"]
+            cell.value = ArrayFormula(
+                f"{col}{first_row}",
+                f'=_xlfn.TEXTJOIN(CHAR(10),TRUE,IF({flag_range}="{YES_VALUE}",'
+                f'$B${first_row}:$B${last_data_row},""))',
+            )
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(
+                wrap_text=True, vertical="top", horizontal="left"
+            )
+            worksheet.merge_cells(f"{col}{first_row}:{col}{last_data_row}")
+
+    # ── Total row ──────────────────────────────────────────────────────────
+    total_row = config.first_data_row + len(dataframe)
+    put(
+        worksheet, f"B{total_row}", config.total_label,
+        font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_ALIGN,
+    )
+
+    for column in config.role_to_excel_column.values():
+        value = (
+            f"=SUM({column}{config.first_data_row}:{column}{total_row - 1})"
+            if len(dataframe) else 0
+        )
+        put(
+            worksheet, f"{column}{total_row}", value,
+            font=BOLD_FONT, border=TOTAL_BORDER,
+            alignment=RIGHT_ALIGN, number_format=NUMBER_FORMAT,
+        )
+
+    write_variance_cells(
+        worksheet,
+        variance_formulas(total_row, config, comparisons),
+        comparisons,
+        BOLD_FONT,
+        TOTAL_BORDER,
+    )
+
+    for item in comparisons:
+        if item.yes_list_column:
+            put(
+                worksheet, f"{item.yes_list_column}{total_row}",
+                None, font=BOLD_FONT, border=TOTAL_BORDER,
+                alignment=CENTER_ALIGN,
+            )
+
+    put(
+        worksheet, f"{config.tickmark_column}{total_row}",
+        None, font=BOLD_FONT, border=TOTAL_BORDER,
+        alignment=CENTER_ALIGN,
+    )
+
+    # ── Borders, auto-filter, conditional formatting ───────────────────────
+    for row in worksheet.iter_rows(
+        min_row=config.first_data_row,
+        max_row=total_row,
+        min_col=2,
+        max_col=config.max_data_column,
+    ):
+        for cell in row:
+            if cell.column not in config.spacer_columns and cell.border == Border():
+                cell.border = THIN_BORDER
+
+    worksheet.auto_filter.ref = f"B11:{config.tickmark_column}{total_row}"
+    apply_conditional_formatting(
+        worksheet, comparisons, config.first_data_row, total_row
+    )
+
+
+# ============================================================================
+# LEGAL-ENTITY DRILLDOWN
+# ============================================================================
+
+def entity_columns_for_date(columns: list[str], suffix: str) -> list[str]:
+    return [
+        column for column in columns
+        if str(column).endswith(f"_{suffix}")
+        and not str(column).startswith(ENTITY_SKIP_PREFIXES)
+    ]
+
+
+def strip_date_suffix(column: str, suffix: str) -> str:
+    return column[:-(len(suffix) + 1)].rstrip("_").strip()
+
+
+def identify_flagged_accounts(
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    role_a: str,
+    role_b: str,
+) -> list[str]:
+    current = pd.to_numeric(
+        dataframe[display_roles[role_a]], errors="coerce"
+    ).fillna(0)
+    comparison = pd.to_numeric(
+        dataframe[display_roles[role_b]], errors="coerce"
+    ).fillna(0)
+
+    dollar_change = current - comparison
+    percent_change = dollar_change.div(
+        comparison.replace(0, float("nan"))
+    ).fillna(0)
+
+    flagged = (
+        dollar_change.abs().gt(THRESHOLD_DOLLARS)
+        & percent_change.abs().gt(THRESHOLD_PERCENT)
+    )
+    return dataframe.loc[flagged, ACCOUNT_GROUP_COLUMN].tolist()
+
+
+def build_legal_entity_dataframe(
+    raw_df: pd.DataFrame,
+    flagged_accounts: list[str],
+    raw_current_column: str,
+    raw_comparison_column: str,
+) -> pd.DataFrame:
+    current_suffix = raw_current_column.split("_")[-1]
+    comparison_suffix = raw_comparison_column.split("_")[-1]
+
+    current_entity_columns = entity_columns_for_date(
+        list(raw_df.columns), current_suffix
+    )
+    comparison_entity_columns = entity_columns_for_date(
+        list(raw_df.columns), comparison_suffix
+    )
+
+    current_labels = {
+        strip_date_suffix(column, current_suffix): column
+        for column in current_entity_columns
+    }
+    comparison_labels = {
+        strip_date_suffix(column, comparison_suffix): column
+        for column in comparison_entity_columns
+    }
+
+    entity_labels = sorted(
+        set(current_labels) | set(comparison_labels),
+        key=str.lower,
+    )
+
+    filtered = raw_df[
+        raw_df[ACCOUNT_GROUP_COLUMN].isin(flagged_accounts)
+    ].copy()
+
+    all_entity_columns = current_entity_columns + comparison_entity_columns
+    for column in all_entity_columns:
+        if column in filtered.columns:
+            filtered[column] = pd.to_numeric(
+                filtered[column], errors="coerce"
+            ).fillna(0)
+
+    available_columns = [
+        column for column in all_entity_columns
+        if column in filtered.columns
+    ]
+
+    grouped = (
+        filtered.groupby(ACCOUNT_GROUP_COLUMN, sort=False)[available_columns]
+        .sum()
+    )
 
     rows = []
-    for grp in order:
-        rows.append([f"Account Grouping: {grp}", None, None, None, None, None])
-        rows.append(["Sheet Name", "JE Category", "Count", "Entered Dr", "Entered CR", "Net Entered"])
-        g_tot = [0, 0.0, 0.0, 0.0]
-        members = None if grp == "Total" else grouped[grp]
-        for sheet in SUMMARY_DATASETS:
-            sub = comp[comp["sheet"] == sheet]
-            if members is not None:
-                sub = sub[sub["_acct"].isin(members)]
-            by_je = sub.groupby("JE Category", sort=True)[["cnt", "dr", "cr", "net"]].sum()
-            s_tot = [0, 0.0, 0.0, 0.0]
-            if len(by_je):
-                first = True
-                for je, r in by_je.iterrows():
-                    vals = [int(r["cnt"]), float(r["dr"]), float(r["cr"]), float(r["net"])]
-                    s_tot = [a + b for a, b in zip(s_tot, vals)]
-                    rows.append([sheet if first else "", je] + vals)
-                    first = False
+    for entity in entity_labels:
+        row = {"entity_label": entity}
+        has_value = False
+
+        for account in flagged_accounts:
+            if account not in grouped.index:
+                current_value = comparison_value = 0.0
             else:
-                rows.append([sheet, "No Data", 0, 0.0, 0.0, 0.0])
-            g_tot = [a + b for a, b in zip(g_tot, s_tot)]
-            rows.append([f"{sheet} Total", ""] + s_tot)
-        rows.append(["Group Total", ""] + g_tot)
-        rows.append([None] * 6)
-    if rows and all(v is None for v in rows[-1]):
-        rows.pop()
-    return rows
+                current_column = current_labels.get(entity)
+                comparison_column = comparison_labels.get(entity)
+                current_value = (
+                    float(grouped.loc[account, current_column])
+                    if current_column in grouped.columns else 0.0
+                )
+                comparison_value = (
+                    float(grouped.loc[account, comparison_column])
+                    if comparison_column in grouped.columns else 0.0
+                )
+
+            dollar_change = current_value - comparison_value
+            percent_change = (
+                dollar_change / comparison_value
+                if comparison_value != 0 else 0.0
+            )
+
+            row[f"{account}__current"] = current_value
+            row[f"{account}__comparison"] = comparison_value
+            row[f"{account}__dollar"] = dollar_change
+            row[f"{account}__percent"] = percent_change
+
+            has_value |= current_value != 0 or comparison_value != 0
+
+        if has_value:
+            rows.append(row)
+
+    return pd.DataFrame(rows)
 
 
-def _rows_to_display_df(rows):
-    schema = T.StructType([T.StructField(n, T.StringType()) for n in SUMMARY_COLS])
-    return spark.createDataFrame([[None if v is None else str(v) for v in r] for r in rows], schema)
+def write_legal_entity_sheet(
+    workbook,
+    sheet_name: str,
+    config: SheetConfig,
+    role_a: str,
+    role_b: str,
+    display_roles: dict[str, str],
+    flagged_accounts: list[str],
+    legal_entity_df: pd.DataFrame,
+) -> None:
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+
+    worksheet = workbook.create_sheet(title=sheet_name)
+    worksheet.sheet_view.showGridLines = False
+
+    if not flagged_accounts or legal_entity_df.empty:
+        put(
+            worksheet, "B1",
+            "No accounts exceeded materiality threshold for this comparison.",
+            font=BOLD_FONT,
+        )
+        return
+
+    date_a         = display_roles[role_a]
+    date_b         = display_roles[role_b]
+    account_count  = len(flagged_accounts)
+    data_count     = len(legal_entity_df)
+
+    # ── Column widths ──────────────────────────────────────────────────────
+    account_start_columns = []
+    cursor = LE_FIRST_DATA_COLUMN
+
+    for index in range(account_count):
+        account_start_columns.append(cursor)
+        for offset, width in enumerate((14, 14, 14, 11, 12, 28)):
+            worksheet.column_dimensions[
+                get_column_letter(cursor + offset)
+            ].width = width
+        cursor += LE_COLUMNS_PER_ACCOUNT
+
+        if index < account_count - 1:
+            worksheet.column_dimensions[
+                get_column_letter(cursor)
+            ].width = LE_SPACER_WIDTH
+            cursor += 1
+
+    last_column = cursor - 1
+    worksheet.column_dimensions["A"].width = 2
+    worksheet.column_dimensions["B"].width = 45
+
+    # ── Title and threshold details ────────────────────────────────────────
+    worksheet.merge_cells(
+        start_row=LE_TITLE_ROW, start_column=2,
+        end_row=LE_TITLE_ROW,   end_column=last_column,
+    )
+    put_rc(
+        worksheet, LE_TITLE_ROW, 2,
+        f"{config.title_label} — Legal Entity Drill-Down",
+        font=LE_TITLE_FONT, alignment=LEFT_WRAP,
+    )
+
+    worksheet.merge_cells(
+        start_row=LE_SUBTITLE_ROW, start_column=2,
+        end_row=LE_SUBTITLE_ROW,   end_column=last_column,
+    )
+    put_rc(
+        worksheet, LE_SUBTITLE_ROW, 2,
+        f"Comparison: {date_a} (Current) vs. {date_b} | "
+        f"Flagged accounts: {account_count} ",
+        font=NORMAL_FONT, alignment=LEFT_WRAP,
+    )
+
+    put_rc(worksheet, 4, 2, "Materiality:", font=BOLD_FONT)
+    put_rc(worksheet, 4, 3, MATERIALITY,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=NUMBER_FORMAT)
+    put_rc(worksheet, 4, 4, "Threshold ($):", font=BOLD_FONT)
+    put_rc(worksheet, 4, 5, THRESHOLD_DOLLARS,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=NUMBER_FORMAT)
+    put_rc(worksheet, 4, 6, "Threshold (%):", font=BOLD_FONT)
+    put_rc(worksheet, 4, 7, THRESHOLD_PERCENT,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=PERCENT_FORMAT)
+    put_rc(
+        worksheet, LE_FLAG_COUNT_ROW, 2,
+        f"Accounts exceeding threshold: {account_count}",
+        font=BOLD_FONT, alignment=LEFT_WRAP,
+    )
+
+    # ── Header rows ────────────────────────────────────────────────────────
+    worksheet.merge_cells(
+        start_row=LE_ACCOUNT_HEADER_ROW, start_column=2,
+        end_row=LE_SUB_HEADER_ROW,       end_column=2,
+    )
+    put_rc(
+        worksheet, LE_ACCOUNT_HEADER_ROW, 2,
+        "Legal Entity", font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+
+    for index, account in enumerate(flagged_accounts):
+        start_column = account_start_columns[index]
+        end_column   = start_column + LE_COLUMNS_PER_ACCOUNT - 1
+
+        worksheet.merge_cells(
+            start_row=LE_ACCOUNT_HEADER_ROW, start_column=start_column,
+            end_row=LE_ACCOUNT_HEADER_ROW,   end_column=end_column,
+        )
+        put_rc(
+            worksheet, LE_ACCOUNT_HEADER_ROW, start_column,
+            account, font=HEADER_FONT, fill=LE_ACCOUNT_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        for col in range(start_column + 1, end_column + 1):
+            worksheet.cell(
+                row=LE_ACCOUNT_HEADER_ROW, column=col
+            ).fill   = LE_ACCOUNT_FILL
+            worksheet.cell(
+                row=LE_ACCOUNT_HEADER_ROW, column=col
+            ).border = THIN_BORDER
+
+        headers = (
+            date_a, date_b, "$ Change", "% Change",
+            "Investigate", "Legal Entities\nFlagged (Yes)",
+        )
+        for offset, header in enumerate(headers):
+            put_rc(
+                worksheet, LE_SUB_HEADER_ROW, start_column + offset,
+                header, font=HEADER_FONT, fill=HEADER_FILL,
+                border=THIN_BORDER, alignment=CENTER_WRAP,
+            )
+    le_yes_header_fill = PatternFill(fill_type="solid", fgColor="92D050")
+    for start_column in account_start_columns:
+        worksheet.cell(
+            row=LE_SUB_HEADER_ROW, column=start_column + 5
+        ).fill = le_yes_header_fill
+    # ── Data rows ──────────────────────────────────────────────────────────
+    total_row = LE_DATA_START_ROW + data_count
+
+    for row_offset, (_, source_row) in enumerate(
+        legal_entity_df.iterrows(), LE_DATA_START_ROW
+    ):
+        put_rc(
+            worksheet, row_offset, 2, source_row["entity_label"],
+            font=NORMAL_FONT, border=THIN_BORDER, alignment=LEFT_WRAP,
+        )
+
+        for index, account in enumerate(flagged_accounts):
+            start_column = account_start_columns[index]
+
+            current    = source_row[f"{account}__current"]
+            comparison = source_row[f"{account}__comparison"]
+            dollar     = source_row[f"{account}__dollar"]
+            percent    = source_row[f"{account}__percent"]
+
+            for offset, (value, number_format) in enumerate(zip(
+                (current, comparison, dollar, percent),
+                (NUMBER_FORMAT, NUMBER_FORMAT, NUMBER_FORMAT, PERCENT_FORMAT),
+            )):
+                put_rc(
+                    worksheet, row_offset, start_column + offset,
+                    value, font=NORMAL_FONT, border=THIN_BORDER,
+                    alignment=RIGHT_ALIGN, number_format=number_format,
+                )
+
+            dollar_ref  = f"{get_column_letter(start_column + 2)}{row_offset}"
+            percent_ref = f"{get_column_letter(start_column + 3)}{row_offset}"
+            put_rc(
+                worksheet, row_offset, start_column + 4,
+                f'=IF(AND(ABS({dollar_ref})>{LE_DOLLAR_THRESHOLD_CELL},'
+                f'ABS({percent_ref})>{LE_PERCENT_THRESHOLD_CELL}),'
+                f'"{YES_VALUE}","{NO_VALUE}")',
+                font=NORMAL_FONT, border=THIN_BORDER, alignment=CENTER_ALIGN,
+            )
+
+            put_rc(
+                worksheet, row_offset, start_column + 5,
+                None, font=NORMAL_FONT, border=THIN_BORDER,
+                alignment=LEFT_WRAP,
+            )
+
+    # ── Yes-list merged cells — one per account block ──────────────────────
+    for index, account in enumerate(flagged_accounts):
+        start_column   = account_start_columns[index]
+        yes_col        = start_column + 5
+        inv_col_letter = get_column_letter(start_column + 4)
+        yes_col_letter = get_column_letter(yes_col)
+        merge_top      = LE_DATA_START_ROW
+        merge_bottom   = total_row - 1
+
+        # Style first so the border spreads over the merge.
+        top_left = worksheet.cell(row=merge_top, column=yes_col)
+        top_left.value = ArrayFormula(
+            f"{yes_col_letter}{merge_top}",
+            f'=IFERROR(_xlfn.TEXTJOIN(CHAR(10), TRUE, '
+            f'IF({inv_col_letter}{merge_top}:{inv_col_letter}{merge_bottom}'
+            f'="{YES_VALUE}", '
+            f'$B${merge_top}:$B${merge_bottom}, "")), "—")',
+        )
+        top_left.font      = NORMAL_FONT
+        top_left.border    = THIN_BORDER
+        top_left.alignment = Alignment(
+            wrap_text=True, vertical="top", horizontal="left"
+        )
+        worksheet.merge_cells(
+            start_row=merge_top,  start_column=yes_col,
+            end_row=merge_bottom, end_column=yes_col,
+        )
+
+    # ── Total row ──────────────────────────────────────────────────────────
+    put_rc(
+        worksheet, total_row, 2, TOTAL_LABEL,
+        font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_WRAP,
+    )
+
+    for index in range(account_count):
+        start_column = account_start_columns[index]
+        for offset in range(LE_COLUMNS_PER_ACCOUNT):
+            col = get_column_letter(start_column + offset)
+            if offset in (4, 5):          # Investigate + Yes-list: no total
+                value = number_format = None
+            elif offset == 3:             # % = total $ change / total comparison
+                dollar_col     = get_column_letter(start_column + 2)
+                comparison_col = get_column_letter(start_column + 1)
+                value = (
+                    f"=IFERROR({dollar_col}{total_row}"
+                    f"/{comparison_col}{total_row},0)"
+                )
+                number_format = PERCENT_FORMAT
+            else:
+                value = (
+                    f"=SUM({col}{LE_DATA_START_ROW}:{col}{total_row - 1})"
+                )
+                number_format = NUMBER_FORMAT
+            put_rc(
+                worksheet, total_row, start_column + offset,
+                value, font=BOLD_FONT, border=TOTAL_BORDER,
+                alignment=RIGHT_ALIGN, number_format=number_format,
+            )
+
+    # ── Conditional formatting — highlight Investigate = Yes ──────────────
+    worksheet.conditional_formatting._cf_rules = {}
+    for start_column in account_start_columns:
+        inv_col = get_column_letter(start_column + 4)
+        for row in range(LE_DATA_START_ROW, total_row):
+            ref  = f"{inv_col}{row}"
+            rule = FormulaRule(
+                formula=[f'{absolute_coordinate(ref)}="{YES_VALUE}"'],
+                stopIfTrue=True,
+            )
+            rule.dxf      = YES_FILL
+            rule.priority = 1
+            worksheet.conditional_formatting.add(ref, rule)
 
 
-def _apply_summary_format(ws, company_desc, rows):
-    thin, double = Side(border_style="thin", color="000000"), Side(border_style="double", color="000000")
-    title_font = Font(name="Calibri", sz=11, bold=True)
-    header_font = Font(name="Calibri", sz=9, bold=True, color="00FFFFFF")
-    section_font = Font(name="Calibri", sz=9, bold=True)
-    cell_font = Font(name="Calibri", sz=9)
-    subtotal_font = Font(name="Calibri", sz=9, bold=True)
-    header_fill = PatternFill("solid", fgColor="00000000")
-    subtotal_fill = PatternFill("solid", fgColor="00D9E1F2")
-    left_alignment = Alignment(wrap_text=False, vertical="center")
-    center_alignment = Alignment(wrap_text=True, vertical="center", horizontal="center")
-    cell_alignment = Alignment(wrap_text=True, vertical="center")
-    border_thin = Border(top=thin, left=thin, right=thin, bottom=thin)
-    border_subtotal = Border(top=thin, left=thin, right=thin, bottom=double)
-    CNT_FMT, USD_FMT = "#,##0;-#,##0", "$ #,##0.00;$ (#,##0.00)"
-
-    ws.sheet_view.showGridLines = False
-    ws.sheet_view.zoomScale = 100
-    ws.sheet_format.defaultRowHeight = 12
-    for col, width in zip("ABCDEFG", [2.4, 28, 24, 12, 16, 16, 16]):
-        ws.column_dimensions[col].width = width
-
-    ws["B2"] = f"Account Description Summary - {CURRENT_FY} {CURRENT_QUARTER}"
-    ws["B3"] = company_desc
-    for ref in ("B2", "B3"):
-        ws[ref].font, ws[ref].alignment = title_font, left_alignment
-
-    def numfmt(cell, col_idx):
-        if col_idx == 4:
-            cell.number_format = CNT_FMT
-        elif col_idx >= 5:
-            cell.number_format = USD_FMT
-
-    for idx, row_values in enumerate(rows):
-        r = 7 + idx
-        first = row_values[0]
-        for ci, v in enumerate(row_values, start=2):
-            c = ws.cell(row=r, column=ci, value=v)
-            c.font, c.alignment = cell_font, cell_alignment
-        if first is None:
+def render_legal_entity_sheets(
+    workbook,
+    config: SheetConfig,
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    raw_roles: dict[str, str],
+    raw_df: pd.DataFrame,
+    comparisons: list[ComparisonBlock],
+) -> None:
+    for comparison in comparisons:
+        sheet_name = config.legal_entity_sheet_names.get(
+            (comparison.current_role, comparison.comparison_role)
+        )
+        if not sheet_name:
             continue
-        for ci in range(2, 8):
-            c = ws.cell(row=r, column=ci)
-            if isinstance(first, str) and first.startswith("Account Grouping:"):
-                c.font, c.alignment = section_font, left_alignment
-            elif first == "Sheet Name":
-                c.font, c.fill, c.alignment, c.border = header_font, header_fill, center_alignment, border_thin
-            elif isinstance(first, str) and first.endswith(" Total") and first != "Group Total":
-                c.font, c.fill, c.border = subtotal_font, subtotal_fill, border_subtotal
-                c.alignment = cell_alignment if ci > 2 else left_alignment
-                numfmt(c, ci)
-            elif first == "Group Total":
-                c.font, c.fill, c.border = header_font, header_fill, border_subtotal
-                c.alignment = center_alignment if ci > 2 else left_alignment
-                numfmt(c, ci)
-            else:
-                c.font, c.border = cell_font, border_thin
-                numfmt(c, ci)
+
+        flagged_accounts = identify_flagged_accounts(
+            dataframe,
+            display_roles,
+            comparison.current_role,
+            comparison.comparison_role,
+        )
+
+        if flagged_accounts:
+            legal_entity_df = build_legal_entity_dataframe(
+                raw_df,
+                flagged_accounts,
+                raw_roles[comparison.current_role],
+                raw_roles[comparison.comparison_role],
+            )
+        else:
+            legal_entity_df = pd.DataFrame()
+
+        write_legal_entity_sheet(
+            workbook,
+            sheet_name,
+            config,
+            comparison.current_role,
+            comparison.comparison_role,
+            display_roles,
+            flagged_accounts,
+            legal_entity_df,
+        )
+
+# ============================================================================
+# WORKBOOK ORCHESTRATION
+# ============================================================================
+
+def load_template(path: str | Path):
+    return cp.openpyxl.read(str(path))
 
 
-def write_summary_workbook(path: str, show_displays: bool = False):
-    wb = Workbook()
-    wb.remove(wb.active)
-    for company in COMPANIES:
-        ws = wb.create_sheet(_safe_sheet_name(company.replace("Tradeweb ", "TW ").replace(" ", "")))
-        rows = build_company_summary(company)
-        _apply_summary_format(ws, company, rows)
-        if show_displays:
-            print(f"\nSummary for: {company}")
-            display(_rows_to_display_df(rows))
-    if "cp" in globals() and hasattr(cp, "openpyxl"):
-        cp.openpyxl.write(wb, path, register=True)
+def save_template(workbook, path: str | Path) -> None:
+    cp.openpyxl.write(workbook, str(path), register=True)
+
+
+def run(
+    template_path: str | Path,
+    output_directory: str | Path,
+    sources: dict[str, Any],
+) -> None:
+    configs = build_sheet_configs()
+    workbook = load_template(template_path)
+
+    missing_sheets = [
+        config.output_sheet
+        for config in configs
+        if config.output_sheet not in workbook.sheetnames
+    ]
+    if missing_sheets:
+        raise KeyError(
+            f"Missing required template worksheets: {missing_sheets}"
+        )
+
+    summaries = []
+
+    for config in configs:
+        print(f"\nPreparing {config.sheet_id}...")
+
+        dataframe, display_roles, raw_roles, raw_df = prepare_data(
+            config, sources
+        )
+        comparisons = (
+            active_blocks(config, raw_roles)
+            if config.classifier == "bs"
+            else list(config.comparison_blocks)
+        )
+
+        write_summary_sheet(
+            workbook[config.output_sheet],
+            config,
+            dataframe,
+            display_roles,
+            comparisons,
+        )
+
+        render_legal_entity_sheets(
+            workbook,
+            config,
+            dataframe,
+            display_roles,
+            raw_roles,
+            raw_df,
+            comparisons,
+        )
+
+        summaries.append({
+            "sheet": config.output_sheet,
+            "rows": len(dataframe),
+            "comparisons": [item.merge_range for item in comparisons],
+            "periods": display_roles,
+        })
+
+    try:
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+    except AttributeError:
+        pass
+
+    output_path = Path(output_directory)
+    output_path.mkdir(parents=True, exist_ok=True)
+    output_file = output_path / OUTPUT_FILE_NAME
+    save_template(workbook, output_file)
+
+    print("\nAll sheets written successfully.")
+    print(f"Output: {output_file}")
+    for summary in summaries:
+        print(f"{summary['sheet']}: {summary['rows']} accounts")
+        print(f"Comparisons: {summary['comparisons']}")
+        print(f"Periods: {summary['periods']}")
+
+
+def main() -> None:
+    # Runtime inputs remain external; this script only processes them.
+    runtime = globals()
+    required_names = ("TEMPLATE_PATH", "OUTPUT_DIRECTORY", *INPUT_NAMES)
+    missing = [name for name in required_names if runtime.get(name) is None]
+
+    if missing:
+        raise RuntimeError(
+            "Define these runtime inputs before calling main(): "
+            + ", ".join(missing)
+        )
+
+    run(
+        template_path=runtime["TEMPLATE_PATH"],
+        output_directory=runtime["OUTPUT_DIRECTORY"],
+        sources={
+            "TB_Final_BS": runtime["TB_Final_BS"],
+            "TB_Final_IS_YTD": runtime["TB_Final_IS_YTD"],
+            "TB_Final_QTD": runtime["TB_Final_QTD"],
+        },
+    )
+
+
+if __name__ == "__main__":
+    main()
+
+# Code Generated by Sidekick is for learning and experimentation purposes only.
+# filename: tb-validation-raw-to-final.py
+
+# ============ VALIDATION: RAW -> FINAL PARQUET ============
+from functools import reduce
+from pathlib import Path
+import numpy as np, pandas as pd
+from pyspark.sql import Window, functions as F
+from pyod.fs import read, read_excel, write_excel
+
+# ---------- CONFIG ----------
+TOL        = 0.01
+VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
+BS_SHEET   = "Balance Sheet TB Links"
+QTD_SHEETS = ("Income Statement TB Links",)
+LINK_SHEETS = ["Balance Sheet TB Links", "Income Statement TB Links"]
+META = {"Account", "Linked TB Account #", "__sheet__", "row_id"}
+
+SRC = {
+    "03312026": dict(path=excel_path_03312026, sheets=LINK_SHEETS, header=1, cols=Columns_03312026, kind="links"),
+    "12312025": dict(path=excel_path_12312025, sheets=LINK_SHEETS, header=1, cols=Columns_12312025, kind="links"),
+    "06302025": dict(path=excel_path_06302025, sheets=LINK_SHEETS, header=1, cols=Columns_06302025, kind="links"),
+    "09302025": dict(path="User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/"
+                          "Broadridge_-_Risk_Assessment.zip/TB_09_30_FY26.xlsx",
+                     sheets=["3) 9.30.2025"], header=8, cols=Columns_09302025_QTD, kind="plain", key="BALANCE SHEET"),
+    "03312025": dict(path=excel_path_03312025_2, sheets=["Sheet2"], header=0,
+                     cols=Columns_03312025_QTD, kind="plain", key="Account"),
+}
+YTD_LABELS = ["03312026", "12312025", "06302025"]
+QTD_PAIRS  = {"03312026": "12312025", "12312025": "09302025", "06302025": "03312025"}   # CY: PY
+QTD_FILES  = {"03312026": QTD_SHEETS, "12312025": QTD_SHEETS, "06302025": QTD_SHEETS,
+              "09302025": None, "03312025": None}
+
+FIN = {k: read(Path(OUTPUT_DIRECTORY) / f"{v}.parquet")
+       for k, v in {"BS": "TB_Final_BS", "IS": "TB_Final_IS_YTD", "QTD": "TB_Final_QTD"}.items()}
+
+# ---------- HELPERS ----------
+def bt(c): return F.col("`" + c.replace("`", "``") + "`")
+
+_cache = {}
+def prep(label, sheets=None):
+    """Raw Excel -> slim df: __A account, __G group, __S sheet, __V row net,
+    __ok has acct#, __GV group non-blank, __R raw row order.
+    Also returns unlisted non-zero numeric cols."""
+    k = (label, sheets)
+    if k in _cache: return _cache[k]
+    s = SRC[label]
+    raw = (read_excel(s["path"], sheet_name=list(sheets or s["sheets"]), header=s["header"],
+                      naming_convention="neutral", trim=True)
+           .withColumn("row_id", F.monotonically_increasing_id()))
+    net = reduce(lambda a, b: a + b, [F.coalesce(bt(c).cast("double"), F.lit(0.0)) for c in s["cols"]])
+
+    if s["kind"] == "links":
+        w, acct = Window.orderBy("row_id").rowsBetween(Window.unboundedPreceding, 0), F.col("Linked TB Account #")
+        d = (raw.withColumn("__ok", acct.isNotNull() & (acct != ""))
+                .withColumn("__A", F.upper(F.concat_ws(": ", F.split(acct, r"\.").getItem(0), F.col("Account"))))
+                .withColumn("__G", F.last(F.when(~F.col("__ok"), F.col("Account")), ignorenulls=True).over(w))
+                .withColumn("__S", F.when(F.col("__sheet__") == BS_SHEET, "BS").otherwise("IS")))
     else:
-        wb.save(path)
-    if show_displays:
-        display(spark.createDataFrame([(path,)], ["Workbook Path"]))
+        d = (raw.withColumn("__ok", F.lit(True)).withColumn("__A", F.upper(bt(s["key"])))
+                .withColumn("__G", F.lit("-")).withColumn("__S", F.lit("IS")))
 
+    d = (d.withColumn("__GV", F.col("__G").isNotNull() & (F.trim(F.col("__G")) != ""))
+          .withColumn("__V", net)
+          .withColumn("__R", F.col("row_id")))
 
-write_summary_workbook(f"{output_path_et}/Account_Description_Summary - {CURRENT_FY} {CURRENT_QUARTER}.xlsx",
-                       show_displays=DISPLAY_SUMMARIES)
+    extra = [c for c in raw.columns if c not in s["cols"] and c not in META and c != s.get("key")]
+    ex = {}
+    if extra:
+        r = d.filter("__ok").agg(*[F.expr("sum(try_cast(`%s` as double))" % c.replace("`", "``")).alias(f"c{i}")
+                                   for i, c in enumerate(extra)]).first()
+        ex = {c: r[i] for i, c in enumerate(extra) if r[i]}
+    _cache[k] = (d.select("__A", "__G", "__S", "__V", "__ok", "__GV", "__R"), ex)
+    return _cache[k]
 
-# COMMAND ----------
+def fin_sum(key, lab):
+    """Final parquet -> (Total Amount, sum of entity cols) for period lab."""
+    df, tc = FIN[key], f"Total Amount_{lab}"
+    ent = [c for c in df.columns if c.endswith(f"_{lab}") and not c.startswith(("Total Amount_", "row_count_"))]
+    r = df.agg(F.sum(bt(tc)), *[F.sum(bt(c)) for c in ent]).first()
+    return float(r[0] or 0.0), float(sum(x or 0.0 for x in r[1:]))
+
+def recon(label, sheets=None):
+    """Raw -> NoAcct -> NoGroup -> Included. Rows + amount per sheet. Diff must be 0.
+    Excluded tab is expected to hold NoAcct + NoGroup rows (zero / blank rows included)."""
+    d, _ = prep(label, sheets)
+    ok, gv, v = F.col("__ok"), F.col("__GV"), F.col("__V")
+    buckets = {"Raw": F.lit(True), "NoAcct": ~ok, "NoGroup": ok & ~gv, "Included": ok & gv,
+               "Excl_Zero": ~(ok & gv) & (v == 0)}            # informational: zero/blank rows inside Excluded
+    aggs = []
+    for k, c in buckets.items():
+        aggs += [F.sum(F.when(c, 1).otherwise(0)).alias(f"{k}_Rows"),
+                 F.sum(F.when(c, v).otherwise(0.0)).alias(f"{k}_Amt")]
+    p = d.groupBy("__S").agg(*aggs).toPandas().rename(columns={"__S": "Sheet"})
+    p.insert(0, "File", label)
+    p["Diff_Rows"] = p.Raw_Rows - p.NoAcct_Rows - p.NoGroup_Rows - p.Included_Rows
+    p["Diff_Amt"]  = (p.Raw_Amt - p.NoAcct_Amt - p.NoGroup_Amt - p.Included_Amt).round(2)
+    p["Excl_Expected_Rows"] = p.NoAcct_Rows + p.NoGroup_Rows
+    p["Excl_NonZero_Rows"]  = p.Excl_Expected_Rows - p.Excl_Zero_Rows
+    return p.drop(columns=["Excl_Zero_Amt"])                   # zero rows sum to 0 by definition
+
+def excluded(label, sheets=None):
+    """Every row that did not land in Included, including blank / zero-value rows."""
+    d, _ = prep(label, sheets)
+    seq      = F.row_number().over(Window.partitionBy("__S").orderBy("__R"))   # position within raw sheet
+    reason   = F.when(~F.col("__ok"), "No Account #").otherwise("No Group")
+    row_type = F.when(F.col("__V") == 0, "Zero / Blank").otherwise("Non-zero")
+    return (d.withColumn("__N", seq)
+             .filter(~(F.col("__ok") & F.col("__GV")))
+             .orderBy("__S", "__N")
+             .select(F.lit(label).alias("File"), F.col("__S").alias("Sheet"),
+                     F.col("__A").alias("Account"), F.col("__G").alias("Group"),
+                     reason.alias("Reason"), row_type.alias("Row_Type"),
+                     F.col("__V").alias("Amount"), F.col("__N").alias("Raw_Row_Seq"))
+             .toPandas())
+
+def add_excl_check(summary, excl):
+    """Attach actual Excluded-tab row count / amount and compare to the recon expectation."""
+    g = (excl.groupby(["File", "Sheet"])
+             .agg(Excluded_Sheet_Rows=("Amount", "size"), Excluded_Sheet_Amt=("Amount", "sum"))
+             .reset_index())
+    out = summary.merge(g, on=["File", "Sheet"], how="left")
+    out["Excluded_Sheet_Rows"] = out.Excluded_Sheet_Rows.fillna(0).astype(int)
+    out["Excluded_Sheet_Amt"]  = out.Excluded_Sheet_Amt.fillna(0.0)
+    out["Excl_Count_Diff"] = out.Excluded_Sheet_Rows - out.Excl_Expected_Rows                     # must be 0
+    out["Excl_Amt_Diff"]   = (out.Excluded_Sheet_Amt - (out.NoAcct_Amt + out.NoGroup_Amt)).round(2)  # must be 0
+    return out
+
+def ssum(df, col): return float(df.agg(F.coalesce(F.sum(col), F.lit(0.0))).first()[0])
+
+# =====================================================================
+# PART 1: YTD  (raw -> included -> final BS / IS parquet)
+# =====================================================================
+ytd_excl = pd.concat([excluded(l) for l in YTD_LABELS], ignore_index=True)
+
+ytd = pd.concat([recon(l) for l in YTD_LABELS], ignore_index=True)
+fs = [fin_sum(r.Sheet, r.File) for r in ytd.itertuples()]
+ytd["Final_Amt"]            = [x[0] for x in fs]
+ytd["Final_minus_Included"] = (ytd.Final_Amt - ytd.Included_Amt).round(2)
+ytd["Entity_minus_Total"]   = [round(x[1] - x[0], 2) for x in fs]
+ytd = add_excl_check(ytd, ytd_excl)
+ytd["Status"] = np.where((ytd.Diff_Rows == 0) & (ytd.Diff_Amt.abs() <= TOL)
+                         & (ytd.Final_minus_Included.abs() <= TOL) & (ytd.Entity_minus_Total.abs() <= TOL)
+                         & (ytd.Excl_Count_Diff == 0) & (ytd.Excl_Amt_Diff.abs() <= TOL),
+                         "PASS", "FAIL")
+
+# =====================================================================
+# PART 2: QTD
+#   2a raw -> included for every raw file QTD touches
+#   2b (CY included - matched PY) vs final QTD parquet
+# =====================================================================
+qtd_excl  = pd.concat([excluded(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+
+qtd_files = pd.concat([recon(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+qtd_files = add_excl_check(qtd_files, qtd_excl)
+qtd_files["Status"] = np.where((qtd_files.Diff_Rows == 0) & (qtd_files.Diff_Amt.abs() <= TOL)
+                               & (qtd_files.Excl_Count_Diff == 0) & (qtd_files.Excl_Amt_Diff.abs() <= TOL),
+                               "PASS", "FAIL")
+
+rows = []
+for cur, pri in QTD_PAIRS.items():
+    c, _ = prep(cur, QTD_SHEETS)
+    p, _ = prep(pri, QTD_SHEETS if SRC[pri]["kind"] == "links" else None)
+    cy   = c.filter(F.col("__ok") & F.col("__GV"))
+    pa   = p.filter("__ok").groupBy("__A").agg(F.sum("__V").alias("d"))
+    unm  = pa.join(c.filter("__ok").select("__A").distinct(), "__A", "left_anti")      # PY acct not in CY
+    dup  = cy.groupBy("__A").agg(F.countDistinct("__G").alias("g")).filter("g > 1").count()
+    cy_amt  = ssum(cy, "__V")
+    matched = ssum(pa.join(cy.select("__A").distinct(), "__A", "left_semi"), "d")
+    ft, fe  = fin_sum("QTD", cur)
+    rows.append({"CY": cur, "PY": pri, "CY_Included": cy_amt, "PY_Matched": matched,
+                 "Expected": cy_amt - matched, "Final": ft,
+                 "Final_minus_Expected": round(ft - (cy_amt - matched), 2),
+                 "Entity_minus_Total": round(fe - ft, 2),
+                 "PY_Unmatched_Keys": unm.count(), "PY_Unmatched_Amt": ssum(unm, "d"),
+                 "CY_Dup_Accts": dup})
+qtd_tie = pd.DataFrame(rows)
+qtd_tie["Status"] = np.where((qtd_tie.Final_minus_Expected.abs() <= TOL) & (qtd_tie.Entity_minus_Total.abs() <= TOL)
+                             & (qtd_tie.CY_Dup_Accts == 0), "PASS", "FAIL")
+
+# =====================================================================
+# UNLISTED COLUMNS (numeric cols in raw, not in entity list)
+# =====================================================================
+unl = pd.DataFrame([{"File": l, "Sheets": str(s) if s else "default", "Unlisted_Cols": len(ex),
+                     "Unlisted_Total": sum(ex.values()), "Names": ", ".join(ex)[:500]}
+                    for l, s in {**{x: None for x in YTD_LABELS}, **QTD_FILES}.items()
+                    for ex in [prep(l, s)[1]]])
+unl["Status"] = np.where(unl.Unlisted_Cols > 0, "WARN", "PASS")
+
+# =====================================================================
+# OUTPUT
+# =====================================================================
+write_excel(data={"P1_YTD": ytd, "P1_YTD_Excluded": ytd_excl,
+                  "P2a_QTD_Files": qtd_files, "P2b_QTD_TieOut": qtd_tie, "P2_QTD_Excluded": qtd_excl,
+                  "Unlisted_Cols": unl}, path=VALID_XLSX)
+
+for name, t in [("P1 YTD", ytd), ("P2a QTD raw files", qtd_files), ("P2b QTD tie-out", qtd_tie), ("Unlisted", unl)]:
+    print(f"{name}: {t.Status.value_counts().to_dict()}")
+    display(spark.createDataFrame(t.astype(str)))
+
