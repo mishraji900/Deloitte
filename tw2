@@ -1,3 +1,226 @@
+# ============================================================================
+# CONFIGURATION OBJECTS
+# ============================================================================
+
+IS_SHEET = "2) Income Statement"          # QTD on top, YTD stacked below
+YTD_GAP_ROWS = 4                          # blank rows between QTD total and YTD banner
+BANNER_LAST_COLUMN = 16                   # banners span full sheet width (column P)
+SECTION_BANNERS = {
+    "IS_QTD": "A. QUARTER-TO-DATE (QTD) ANALYSIS",
+    "IS_YTD": "B. YEAR-TO-DATE (YTD) ANALYSIS",
+}
+SECTION_FILL = PatternFill(fill_type="solid", fgColor="1F3864")
+SECTION_FONT = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+LINK_FONT = Font(name="Calibri", size=9, underline="single", color="0563C1")
+
+
+@dataclass
+class ComparisonBlock:
+    merge_range: str
+    dollar_column: str
+    percent_column: str
+    flag_column: str
+    current_role: str
+    comparison_role: str
+    yes_list_column: str = ""
+
+
+@dataclass
+class SheetConfig:
+    sheet_id: str
+    output_sheet: str
+    subtitle: str
+    title_label: str
+    total_label: str
+    source_key: str
+    raw_amount_columns: tuple[str, ...]
+    role_to_excel_column: dict[str, str]
+    comparison_blocks: tuple[ComparisonBlock, ...]
+    legal_entity_sheet_names: dict[tuple[str, str], str]
+    materiality_dollar_anchor: str
+    materiality_percent_anchor: str
+    first_data_row: int
+    max_data_column: int
+    spacer_columns: set[int]
+    tickmark_column: str
+    materiality_label_column: str
+    materiality_value_column: str
+    procedure_merge_range: str
+    column_widths: dict[str, int]
+    classifier: str
+    all_comparison_blocks: tuple[ComparisonBlock, ...] | None = None
+    grouping_sheet: str = ""          # sheet name in grouping file: "BS" or "IS"
+    header_prefix: str = ""           # e.g. "QTD " / "YTD " in column headers
+
+    def __post_init__(self) -> None:
+        # If no separate block list is supplied, use all comparison blocks.
+        if self.all_comparison_blocks is None:
+            self.all_comparison_blocks = self.comparison_blocks
+
+
+def block(
+    merge_range: str,
+    dollar_column: str,
+    percent_column: str,
+    flag_column: str,
+    current_role: str,
+    comparison_role: str,
+    yes_list_column: str = "",
+) -> ComparisonBlock:
+    return ComparisonBlock(
+        merge_range,
+        dollar_column,
+        percent_column,
+        flag_column,
+        current_role,
+        comparison_role,
+        yes_list_column,
+    )
+
+
+def build_sheet_configs() -> list[SheetConfig]:
+    # Layout per block: $ var, % var, flag, "Accounts Flagged (Yes)", then spacer.
+    bs_blocks = (
+        block("H10:K10", "H", "I", "J", "current", "prior_year_end",      "K"),
+        block("M10:P10", "M", "N", "O", "current", "prior_quarter",       "P"),
+        block("R10:U10", "R", "S", "T", "current", "prior_year_same_qtr", "U"),
+    )
+
+    # YTD section sits under QTD on the same sheet, with its own compact header.
+    is_ytd_blocks = (
+        block("G10:J10", "G", "H", "I", "current", "prior_year_same_qtr", "J"),
+    )
+
+    is_qtd_blocks = (
+        block("G10:J10", "G", "H", "I", "current", "prior_quarter",       "J"),
+        block("L10:O10", "L", "M", "N", "current", "prior_year_same_qtr", "O"),
+    )
+
+    # Order matters: QTD must be written before YTD (YTD stacks under it).
+    return [
+        SheetConfig(
+            sheet_id="BS",
+            output_sheet="1) Balance Sheet",
+            subtitle="Balance Sheet Analytics",
+            title_label="Balance Sheet",
+            total_label="Total Balance Sheet",
+            source_key="TB_Final_BS",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_12312025",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_year_end": "D",
+                "prior_quarter": "E",
+                "prior_year_same_qtr": "F",
+            },
+            comparison_blocks=bs_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_year_end"): "BS LE - Cur vs PYE",
+                ("current", "prior_quarter"): "BS LE - Cur vs PQ",
+                ("current", "prior_year_same_qtr"): "BS LE - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$I$3",
+            materiality_percent_anchor="$I$4",
+            first_data_row=14,
+            max_data_column=23,                    # W = tickmark
+            spacer_columns={7, 12, 17, 22},        # G, L, Q, V
+            tickmark_column="W",
+            materiality_label_column="H",
+            materiality_value_column="I",
+            procedure_merge_range="B6:J8",
+            column_widths={
+                "A": 3, "B": 42, "C": 15, "D": 15, "E": 15, "F": 15,
+                "G": 3, "H": 17, "I": 11, "J": 22, "K": 28,
+                "L": 3, "M": 17, "N": 11, "O": 22, "P": 28,
+                "Q": 3, "R": 17, "S": 11, "T": 22, "U": 28,
+                "V": 3, "W": 10,
+            },
+            classifier="bs",
+            grouping_sheet="BS",
+        ),
+        SheetConfig(
+            sheet_id="IS_QTD",
+            output_sheet=IS_SHEET,
+            subtitle="Income Statement Analytics",
+            title_label="Income Statement QTD",
+            total_label="Total Income Statement QTD",
+            source_key="TB_Final_QTD",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_12312025",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_quarter": "D",
+                "prior_year_same_qtr": "E",
+            },
+            comparison_blocks=is_qtd_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_quarter"): "IS LE QTD - Cur vs PQ",
+                ("current", "prior_year_same_qtr"): "IS LE QTD - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$H$3",      # shared by QTD and YTD sections
+            materiality_percent_anchor="$H$4",
+            first_data_row=14,
+            max_data_column=16,                    # P = tickmark
+            spacer_columns={6, 11},                # F, K
+            tickmark_column="P",
+            materiality_label_column="G",
+            materiality_value_column="H",
+            procedure_merge_range="B6:M8",
+            column_widths={
+                "A": 3, "B": 42, "C": 15, "D": 15, "E": 15,
+                "F": 3, "G": 17, "H": 11, "I": 22, "J": 28,
+                "K": 3, "L": 17, "M": 11, "N": 22, "O": 28,
+                "P": 10,
+            },
+            classifier="is_qtd",
+            grouping_sheet="IS",
+            header_prefix="QTD ",
+        ),
+        SheetConfig(
+            sheet_id="IS_YTD",
+            output_sheet=IS_SHEET,
+            subtitle="Income Statement Analytics",
+            title_label="Income Statement YTD",
+            total_label="Total Income Statement YTD",
+            source_key="TB_Final_IS_YTD",
+            raw_amount_columns=(
+                "Total Amount_03312026",
+                "Total Amount_06302025",
+            ),
+            role_to_excel_column={
+                "current": "C",
+                "prior_year_same_qtr": "D",
+            },
+            comparison_blocks=is_ytd_blocks,
+            legal_entity_sheet_names={
+                ("current", "prior_year_same_qtr"): "IS LE - Cur vs PYQ",
+            },
+            materiality_dollar_anchor="$H$3",      # QTD section's cells
+            materiality_percent_anchor="$H$4",
+            first_data_row=0,                      # computed when stacked
+            max_data_column=12,                    # L = tickmark
+            spacer_columns={5, 6, 11},             # E, F, K = gaps
+            tickmark_column="L",
+            materiality_label_column="G",
+            materiality_value_column="H",
+            procedure_merge_range="B6:J8",
+            column_widths={},
+            classifier="is",
+            grouping_sheet="IS",
+            header_prefix="YTD ",
+        ),
+    ]
+
+
+# ============================================================================
+# GROUPING FILE: ORDER + GROUP TOTAL ROWS
+# ============================================================================
 import unicodedata
 
 _INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
@@ -162,14 +385,473 @@ def _selfcheck() -> None:
         assert rows == [14, 17, 18] and grand == 21
         assert totals == [(15, "X", [14]), (19, "P", [17, 18, 15])]
 
-    # NEW: punctuation / spacing / case never break a match
+    # punctuation / spacing / case never break a match
     assert _norm_2("Gains / Losses  / Impairments") == _norm_2("gains/losses/impairments")
     assert _norm_2("Common Stock") == _norm_2("COMMON-STOCK")
 
-    # NEW: orphan subtotal between two siblings is adopted by their parent
-    g = (("FX", "FX"), ("EQ", "EQ"), ("G", "G"), ("EBT", "FX"), ("EBT", "G"))
-    assert ("EBT", "EQ") in adopt_orphans(g)
+    # orphan subtotal between two siblings is adopted by their parent
+    g = adopt_orphans(
+        (("FX", "FX"), ("EQ", "EQ"), ("G", "G"), ("EBT", "FX"), ("EBT", "G"))
+    )
+    assert ("EBT", "EQ") in g
     df = pd.DataFrame({ACCOUNT_GROUP_COLUMN: ["FX", "EQ", "G"]})
-    _, totals, _ = plan_rows(df, 14, adopt_orphans(g))
-    assert [t for t in totals if t[1] == "EBT"][0][2] == [14, 17, 20] or len(
-        [t for t in totals if t[1] == "EBT"][0][2]) == 3
+    _, totals, _ = plan_rows(df, 14, g)
+    assert sorted([t for t in totals if t[1] == "EBT"][0][2]) == [15, 18, 21]
+
+
+def apply_conditional_formatting(
+    worksheet,
+    comparisons: list[ComparisonBlock],
+    first_row: int,
+    last_row: int,
+) -> None:
+    # No reset here: stacked sections share one sheet. write_summary_sheet resets once.
+    for comparison in comparisons:
+        for row in range(first_row, last_row + 1):
+            reference = f"{comparison.flag_column}{row}"
+            formula = f'{absolute_coordinate(reference)}="{YES_VALUE}"'
+            rule = FormulaRule(formula=[formula], stopIfTrue=True)
+            rule.dxf = YES_FILL
+            rule.priority = 1
+            worksheet.conditional_formatting.add(reference, rule)
+
+
+def shift_range(rng: str, top: int) -> str:
+    """'B6:M8' -> same columns, first row = top, height kept."""
+    left, right = rng.split(":")
+    row_a, row_b = (int(re.sub(r"\D", "", part)) for part in (left, right))
+    col_a, col_b = (re.sub(r"\d+", "", part) for part in (left, right))
+    return f"{col_a}{top}:{col_b}{top + row_b - row_a}"
+
+
+def put_banner(worksheet, row: int, text: str, last_column: int) -> None:
+    for column in range(2, last_column + 1):
+        put_rc(
+            worksheet, row, column, text if column == 2 else None,
+            font=SECTION_FONT, fill=SECTION_FILL, alignment=LEFT_ALIGN,
+        )
+    worksheet.row_dimensions[row].height = 20
+
+
+def write_summary_sheet(
+    worksheet,
+    config: SheetConfig,
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    comparisons: list[ComparisonBlock],
+    grouping,
+    below: int | None = None,
+    banner: str | None = None,
+) -> int:
+    """Write one analytics section. below=None -> first section on the sheet
+    (clears sheet, writes title + materiality). below=row -> stacked under that
+    row, reusing the sheet's materiality cells. Returns the section's total row."""
+    stacked = below is not None
+
+    if stacked:
+        banner_row = below + YTD_GAP_ROWS
+        procedure_row = banner_row + 2
+        block_row = procedure_row + 4
+    else:
+        banner_row = 9
+        procedure_row = 6
+        block_row = SUMMARY_BLOCK_ROW
+    header_row = block_row + 1
+    first_row = header_row + 1 if stacked else config.first_data_row
+
+    # ---- first section only: wipe template, title, shared materiality -------
+    if not stacked:
+        for merged_range in list(worksheet.merged_cells.ranges):
+            if (
+                merged_range.min_row == block_row
+                or merged_range.max_row >= first_row
+            ):
+                worksheet.unmerge_cells(str(merged_range))
+
+        for row in worksheet.iter_rows(
+            min_row=first_row,
+            max_row=max(worksheet.max_row, first_row),
+            min_col=2,
+            max_col=config.max_data_column,
+        ):
+            for cell in row:
+                cell.value = None
+
+        for row in (block_row, header_row):
+            for column in range(2, config.max_data_column + 1):
+                worksheet.cell(row=row, column=column).value = None
+
+        worksheet.sheet_view.showGridLines = False
+        worksheet.conditional_formatting._cf_rules = {}
+        for row in range(2, 5):
+            for column in range(3, 10):  # C:I
+                worksheet.cell(row=row, column=column).value = None
+
+        put(worksheet, "B1", CLIENT_NAME, font=BOLD_FONT)
+        put(worksheet, "B2", config.subtitle, font=BOLD_FONT)
+        put(worksheet, "B3", PERIOD_LABEL, font=BOLD_FONT)
+
+        put(worksheet, f"{config.materiality_label_column}2",
+            "Materiality", font=BOLD_FONT)
+        put(worksheet, f"{config.materiality_label_column}3",
+            "Threshold (in $)", font=BOLD_FONT)
+        put(worksheet, f"{config.materiality_label_column}4",
+            "Threshold (in %)", font=BOLD_FONT)
+        put(worksheet, f"{config.materiality_value_column}2",
+            MATERIALITY, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+            number_format=NUMBER_FORMAT)
+        put(worksheet, f"{config.materiality_value_column}3",
+            THRESHOLD_DOLLARS, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+            number_format=NUMBER_FORMAT)
+        put(worksheet, f"{config.materiality_value_column}4",
+            THRESHOLD_PERCENT, font=BOLD_FONT, fill=RED_HIGHLIGHT_FILL,
+            number_format=PERCENT_FORMAT)
+
+    # ---- section indicator ----------------------------------------------------
+    if banner:
+        put_banner(worksheet, banner_row, banner, BANNER_LAST_COLUMN)
+    if stacked:
+        target = f"'{worksheet.title}'!B{banner_row}"
+        put(worksheet, "B4", f'=HYPERLINK("#{target}","Jump to YTD section >>")',
+            font=LINK_FONT)
+
+    # ---- procedure box --------------------------------------------------------
+    put(
+        worksheet, f"B{procedure_row}", PROCEDURE_TEXT,
+        font=NORMAL_FONT, fill=PROCEDURE_FILL, alignment=LEFT_WRAP,
+    )
+    worksheet.merge_cells(shift_range(config.procedure_merge_range, procedure_row))
+
+    # ---- column headers -------------------------------------------------------
+    put(
+        worksheet, f"B{header_row}",
+        "Account Description",
+        font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+    for role, col in config.role_to_excel_column.items():
+        put(
+            worksheet, f"{col}{header_row}",
+            f"{config.header_prefix}{display_roles[role]}",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+
+    for item in comparisons:
+        put(
+            worksheet, f"{item.dollar_column}{block_row}",
+            f"{config.header_prefix}{display_roles[item.current_role]} vs "
+            f"{config.header_prefix}{display_roles[item.comparison_role]}",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        worksheet.merge_cells(shift_range(item.merge_range, block_row))
+
+        put(
+            worksheet, f"{item.dollar_column}{header_row}",
+            "$ Variance",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        put(
+            worksheet, f"{item.percent_column}{header_row}",
+            "% Variance",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        put(
+            worksheet, f"{item.flag_column}{header_row}",
+            "Further explain at\nLE level?",
+            font=HEADER_FONT, fill=HEADER_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        if item.yes_list_column:
+            put(
+                worksheet, f"{item.yes_list_column}{header_row}",
+                "Accounts Flagged\n(Yes)",
+                font=HEADER_FONT, fill=YES_HEADER_FILL,
+                border=THIN_BORDER, alignment=CENTER_WRAP,
+            )
+
+    put(
+        worksheet, f"{config.tickmark_column}{header_row}",
+        "Tickmark",
+        font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+
+    worksheet.row_dimensions[block_row].height = 30
+    worksheet.row_dimensions[header_row].height = 42
+
+    # ---- detail rows ----------------------------------------------------------
+    detail_rows, totals, total_row = plan_rows(dataframe, first_row, grouping)
+    last_data_row = total_row - 1
+
+    for row_number, (_, source_row) in zip(detail_rows, dataframe.iterrows()):
+        put(
+            worksheet, f"B{row_number}",
+            source_row[ACCOUNT_GROUP_COLUMN],
+            font=NORMAL_FONT, alignment=LEFT_ALIGN,
+        )
+
+        for role, column in config.role_to_excel_column.items():
+            put(
+                worksheet,
+                f"{column}{row_number}",
+                float(source_row[display_roles[role]]),
+                font=NORMAL_FONT,
+                alignment=RIGHT_ALIGN,
+                number_format=NUMBER_FORMAT,
+            )
+
+        write_variance_cells(
+            worksheet,
+            variance_formulas(row_number, config, comparisons),
+            comparisons,
+            NORMAL_FONT,
+        )
+
+        put(
+            worksheet, f"{config.tickmark_column}{row_number}",
+            None, font=RED_BOLD_FONT, alignment=CENTER_ALIGN,
+        )
+        worksheet.row_dimensions[row_number].height = 18
+
+    # ---- group total rows -----------------------------------------------------
+    skip_cols = config.spacer_columns | {
+        column_index_from_string(item.yes_list_column)
+        for item in comparisons if item.yes_list_column
+    }
+    subtotal_rows = {sub_row for sub_row, _, _ in totals}
+    spacer_rows = {sub_row + 1 for sub_row in subtotal_rows}
+
+    for sub_row, label, members in totals:
+        for col in range(2, config.max_data_column + 1):
+            if col not in skip_cols:
+                worksheet.cell(row=sub_row, column=col).border = SUBTOTAL_BORDER
+        put(
+            worksheet, f"B{sub_row}", label,
+            font=BOLD_FONT, fill=PROCEDURE_FILL, alignment=LEFT_ALIGN,
+        )
+        for column in config.role_to_excel_column.values():
+            put(
+                worksheet, f"{column}{sub_row}",
+                sum_formula(column, members) if members else 0,
+                font=BOLD_FONT, fill=PROCEDURE_FILL,
+                alignment=RIGHT_ALIGN, number_format=NUMBER_FORMAT,
+            )
+        worksheet.row_dimensions[sub_row].height = 18
+
+    # ---- Accounts Flagged (Yes): one merged cell + array formula per block ---
+    if len(dataframe):
+        for item in comparisons:
+            col = item.yes_list_column
+            if not col:
+                continue
+            flag_range = (
+                f"{item.flag_column}{first_row}:{item.flag_column}{last_data_row}"
+            )
+            cell = worksheet[f"{col}{first_row}"]
+            cell.value = ArrayFormula(
+                f"{col}{first_row}",
+                f'=_xlfn.TEXTJOIN(CHAR(10),TRUE,IF({flag_range}="{YES_VALUE}",'
+                f'$B${first_row}:$B${last_data_row},""))',
+            )
+            cell.font = NORMAL_FONT
+            cell.border = THIN_BORDER
+            cell.alignment = Alignment(
+                wrap_text=True, vertical="top", horizontal="left"
+            )
+            worksheet.merge_cells(f"{col}{first_row}:{col}{last_data_row}")
+
+    # ---- grand total row ------------------------------------------------------
+    put(
+        worksheet, f"B{total_row}", config.total_label,
+        font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_ALIGN,
+    )
+
+    for column in config.role_to_excel_column.values():
+        value = sum_formula(column, detail_rows) if detail_rows else 0
+        put(
+            worksheet, f"{column}{total_row}", value,
+            font=BOLD_FONT, border=TOTAL_BORDER,
+            alignment=RIGHT_ALIGN, number_format=NUMBER_FORMAT,
+        )
+
+    write_variance_cells(
+        worksheet,
+        variance_formulas(total_row, config, comparisons),
+        comparisons,
+        BOLD_FONT,
+        TOTAL_BORDER,
+    )
+
+    for item in comparisons:
+        if item.yes_list_column:
+            put(
+                worksheet, f"{item.yes_list_column}{total_row}",
+                None, font=BOLD_FONT, border=TOTAL_BORDER,
+                alignment=CENTER_ALIGN,
+            )
+
+    put(
+        worksheet, f"{config.tickmark_column}{total_row}",
+        None, font=BOLD_FONT, border=TOTAL_BORDER,
+        alignment=CENTER_ALIGN,
+    )
+
+    # ---- borders, filter (first section only), conditional formatting --------
+    for row in worksheet.iter_rows(
+        min_row=first_row,
+        max_row=total_row,
+        min_col=2,
+        max_col=config.max_data_column,
+    ):
+        if row[0].row in subtotal_rows or row[0].row in spacer_rows:
+            continue
+        for cell in row:
+            if cell.column not in config.spacer_columns and cell.border == Border():
+                cell.border = THIN_BORDER
+
+    if not stacked:  # one auto-filter per sheet: QTD / first section only
+        worksheet.auto_filter.ref = f"B{header_row}:{config.tickmark_column}{total_row}"
+    apply_conditional_formatting(worksheet, comparisons, first_row, total_row)
+
+    return total_row
+
+# ============================================================================
+# WORKBOOK ORCHESTRATION
+# ============================================================================
+
+def load_template(path: str | Path):
+    return cp.openpyxl.read(str(path))
+
+
+def save_template(workbook, path: str | Path) -> None:
+    cp.openpyxl.write(workbook, str(path), register=True)
+
+
+def merge_is_sheets(workbook) -> None:
+    """Template has separate QTD / YTD IS sheets. Keep one."""
+    old_qtd, old_ytd = "2) Income Statement QTD", "3) Income Statement YTD"
+    if IS_SHEET not in workbook.sheetnames and old_qtd in workbook.sheetnames:
+        workbook[old_qtd].title = IS_SHEET
+    if old_ytd in workbook.sheetnames:
+        del workbook[old_ytd]
+
+
+def run(
+    template_path: str | Path,
+    output_directory: str | Path,
+    sources: dict[str, Any],
+    groupings: dict[str, Any],
+) -> None:
+    _selfcheck()
+    configs = build_sheet_configs()
+    workbook = load_template(template_path)
+    merge_is_sheets(workbook)
+
+    missing_sheets = [
+        config.output_sheet
+        for config in configs
+        if config.output_sheet not in workbook.sheetnames
+    ]
+    if missing_sheets:
+        raise KeyError(
+            f"Missing required template worksheets: {missing_sheets}"
+        )
+
+    summaries = []
+    end_rows: dict[str, int] = {}   # sheet -> last total row written (for stacking)
+
+    for config in configs:
+        print(f"\nPreparing {config.sheet_id}...")
+
+        grouping = read_grouping(
+            groupings[config.grouping_sheet],
+            GROUPING_NAMES[config.grouping_sheet],
+        )
+        dataframe, display_roles, raw_roles, raw_df = prepare_data(
+            config, sources, grouping
+        )
+        comparisons = (
+            active_blocks(config, raw_roles)
+            if config.classifier == "bs"
+            else list(config.comparison_blocks)
+        )
+
+        end_rows[config.output_sheet] = write_summary_sheet(
+            workbook[config.output_sheet],
+            config,
+            dataframe,
+            display_roles,
+            comparisons,
+            grouping,
+            below=end_rows.get(config.output_sheet),
+            banner=SECTION_BANNERS.get(config.sheet_id),
+        )
+
+        render_legal_entity_sheets(
+            workbook,
+            config,
+            dataframe,
+            display_roles,
+            raw_roles,
+            raw_df,
+            comparisons,
+        )
+
+        summaries.append({
+            "sheet": config.output_sheet,
+            "rows": len(dataframe),
+            "comparisons": [item.merge_range for item in comparisons],
+            "periods": display_roles,
+        })
+
+    try:
+        workbook.calculation.fullCalcOnLoad = True
+        workbook.calculation.forceFullCalc = True
+    except AttributeError:
+        pass
+
+    output_path = Path(output_directory)
+    output_path.mkdir(parents=True, exist_ok=True)
+    output_file = output_path / OUTPUT_FILE_NAME
+    save_template(workbook, output_file)
+
+    print("\nAll sheets written successfully.")
+    print(f"Output: {output_file}")
+    for summary in summaries:
+        print(f"{summary['sheet']}: {summary['rows']} accounts")
+        print(f"Comparisons: {summary['comparisons']}")
+        print(f"Periods: {summary['periods']}")
+
+
+def main() -> None:
+    # Runtime inputs remain external; this script only processes them.
+    runtime = globals()
+    required_names = (
+        "TEMPLATE_PATH", "OUTPUT_DIRECTORY", *GROUPING_NAMES.values(), *INPUT_NAMES
+    )
+    missing = [name for name in required_names if runtime.get(name) is None]
+
+    if missing:
+        raise RuntimeError(
+            "Define these runtime inputs before calling main(): "
+            + ", ".join(missing)
+        )
+
+    run(
+        template_path=runtime["TEMPLATE_PATH"],
+        output_directory=runtime["OUTPUT_DIRECTORY"],
+        sources={
+            "TB_Final_BS": runtime["TB_Final_BS"],
+            "TB_Final_IS_YTD": runtime["TB_Final_IS_YTD"],
+            "TB_Final_QTD": runtime["TB_Final_QTD"],
+        },
+        groupings={key: runtime[name] for key, name in GROUPING_NAMES.items()},
+    )
+
+
+if __name__ == "__main__":
+    main()
