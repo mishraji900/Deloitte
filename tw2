@@ -1,3 +1,140 @@
+# MAGIC %md
+# MAGIC ## Automation Excel Formating and Automation starts Here
+
+# COMMAND ----------
+
+GROUPING_BS = read_excel(grouping_list, sheet_name=["BS"],header=0, naming_convention="neutral", trim=True)
+GROUPING_IS = read_excel(grouping_list, sheet_name=["IS"],header=0, naming_convention="neutral", trim=True)
+
+# COMMAND ----------
+
+# DBTITLE 1,Imports and Utils
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import date, datetime
+from itertools import groupby
+from pathlib import Path
+from typing import Any
+import calendar
+import re
+
+import openpyxl
+import pandas as pd
+from openpyxl.formatting.rule import FormulaRule
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles.differential import DifferentialStyle
+from openpyxl.utils import column_index_from_string, get_column_letter
+from openpyxl.utils.cell import absolute_coordinate
+from openpyxl.worksheet.formula import ArrayFormula
+
+# ============================================================================
+# CENTRAL SETTINGS
+# ============================================================================
+
+ACCOUNT_GROUP_COLUMN = "Account Grouping"
+YES_VALUE = "Yes"
+NO_VALUE = "No"
+PROCEDURE_TEXT = "Please Fill Procedures Box."
+TOTAL_LABEL = "Total"
+UNMAPPED_ACCOUNT = "Unmapped"
+DATE_COLUMN_PREFIX = "Total Amount_"
+DATE_FORMAT = "%m%d%Y"
+PY_MATCH_DAYS = 45
+
+CLIENT_NAME = "Broadridge Financial Solutions, Inc." ## Edit Client Name as needed
+PERIOD_LABEL = "Q3-26" ## Edit Period Name as needed
+OUTPUT_FILE_NAME = f"Broadridge Consolidated Analytical Review {PERIOD_LABEL}.xlsx" ## Edit File Name as needed
+FISCAL_YEAR_END = (6, 30)
+
+## Edit Materiality as needed
+
+MATERIALITY = 59_500_000
+THRESHOLD_DOLLARS = 14_875_000
+THRESHOLD_PERCENT = 0.15
+
+NUMBER_FORMAT = "#,##0;(#,##0);-"
+PERCENT_FORMAT = "0%;(0%);-"
+
+INPUT_NAMES = ("TB_Final_BS", "TB_Final_IS_YTD", "TB_Final_QTD") ## Edit Input Dataframe Name as needed
+GROUPING_NAMES = {"BS": "GROUPING_BS", "IS": "GROUPING_IS"} ## Edit grouping dataset names as needed (IS used for YTD + QTD)
+ENTITY_SKIP_PREFIXES = ("__sheet__", "row_count_", DATE_COLUMN_PREFIX)
+
+SUMMARY_HEADER_ROW = 11
+SUMMARY_BLOCK_ROW = 10
+SUMMARY_FIRST_DATA_ROW = 14
+SUMMARY_FREEZE_CELL = "C12"
+
+LE_TITLE_ROW = 1
+LE_SUBTITLE_ROW = 2
+LE_MATERIALITY_ROW = 4
+LE_FLAG_COUNT_ROW = 5
+LE_ACCOUNT_HEADER_ROW = 7
+LE_SUB_HEADER_ROW = 8
+LE_DATA_START_ROW = 9
+LE_FIRST_DATA_COLUMN = 3
+LE_COLUMNS_PER_ACCOUNT = 6
+LE_SPACER_WIDTH = 2
+LE_DOLLAR_THRESHOLD_CELL = "$E$4"
+LE_PERCENT_THRESHOLD_CELL = "$G$4"
+
+
+# ============================================================================
+# FORMATTING CONSTANTS
+# ============================================================================
+
+BLACK = "000000"
+GRAY = "BFBFBF"
+LIGHT_GRAY = "F2F2F2"
+GREEN = "92D050"
+LIGHT_BLUE = "DEEAF1"
+
+THIN_SIDE = Side(style="thin", color=BLACK)
+MEDIUM_SIDE = Side(style="medium", color=BLACK)
+
+THIN_BORDER = Border(
+    left=THIN_SIDE, right=THIN_SIDE,
+    top=THIN_SIDE, bottom=THIN_SIDE,
+)
+TOTAL_BORDER = Border(top=MEDIUM_SIDE, bottom=MEDIUM_SIDE)
+SUBTOTAL_BORDER = Border(top=THIN_SIDE, bottom=Side(style="double", color=BLACK))
+
+HEADER_FILL = PatternFill(fill_type="solid", fgColor=GRAY)
+PROCEDURE_FILL = PatternFill(fill_type="solid", fgColor=LIGHT_GRAY)
+LE_ACCOUNT_FILL = PatternFill(fill_type="solid", fgColor=LIGHT_BLUE)
+YES_HEADER_FILL = PatternFill(fill_type="solid", fgColor=GREEN)   # NEW
+
+YES_FILL = DifferentialStyle(
+    fill=PatternFill(fill_type="solid", fgColor=GREEN, bgColor=GREEN)
+)
+
+NORMAL_FONT = Font(name="Calibri", size=9)
+BOLD_FONT = Font(name="Calibri", size=9, bold=True)
+HEADER_FONT = Font(name="Calibri", size=9, bold=True, italic=True)
+RED_BOLD_FONT = Font(name="Calibri", size=9, bold=True, color="FF0000")
+LE_TITLE_FONT = Font(name="Calibri", size=12, bold=True)
+
+LEFT_ALIGN = Alignment(horizontal="left", vertical="center")
+RIGHT_ALIGN = Alignment(horizontal="right", vertical="center")
+CENTER_ALIGN = Alignment(horizontal="center", vertical="center")
+CENTER_WRAP = Alignment(horizontal="center", vertical="center", wrap_text=True)
+LEFT_WRAP = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+RED_HIGHLIGHT_FILL = PatternFill(
+    fill_type="solid",
+    fgColor="FFB3B3",   # â† swap this to whatever lighter red hex you prefer
+)
+
+RED_BOLD_VALUE_FONT = Font(
+    name="Calibri",
+    size=11,
+    bold=True,
+    color="000000",     # â† black text
+)
+
+# COMMAND ----------
+
+# DBTITLE 1,Config
 # ============================================================================
 # CONFIGURATION OBJECTS
 # ============================================================================
@@ -218,6 +355,196 @@ def build_sheet_configs() -> list[SheetConfig]:
     ]
 
 
+# COMMAND ----------
+
+# DBTITLE 1,Data and Period Helpers
+# ============================================================================
+# DATA AND PERIOD HELPERS
+# ============================================================================
+
+def convert_to_pandas(source: Any, source_name: str) -> pd.DataFrame:
+    if hasattr(source, "toPandas"):
+        return source.toPandas()
+    if isinstance(source, pd.DataFrame):
+        return source.copy()
+    raise TypeError(f"{source_name} must be a pandas or Spark DataFrame.")
+
+
+def parse_date(column_name: str) -> date:
+    return datetime.strptime(str(column_name)[-8:], DATE_FORMAT).date()
+
+
+def subtract_months(value: date, months: int) -> date:
+    total_months = value.year * 12 + value.month - 1 - months
+    year, month = divmod(total_months, 12)
+    month += 1
+    return date(year, month, min(value.day, calendar.monthrange(year, month)[1]))
+
+
+def closest_date(target: date, dated_columns: dict[str, date]) -> str:
+    return min(
+        dated_columns,
+        key=lambda column: abs((dated_columns[column] - target).days),
+    )
+
+
+def most_recent_fiscal_year_end(
+    dated_columns: dict[str, date],
+    current_date: date,
+) -> str | None:
+    month, day = FISCAL_YEAR_END
+    candidates = {
+        column: value
+        for column, value in dated_columns.items()
+        if value.month == month and value.day == day and value < current_date
+    }
+    return max(candidates, key=candidates.get) if candidates else None
+
+
+def log_classification(
+    label: str,
+    roles: dict[str, str],
+    dated: dict[str, date],
+    target_quarter: date | None = None,
+    target_pyq: date | None = None,
+    pyq_delta: int | None = None,
+    used_fallback: bool = False,
+) -> None:
+    role_labels = {
+        "current": "Current quarter",
+        "prior_year_end": "Prior year-end",
+        "prior_quarter": "Prior quarter",
+        "prior_year_same_qtr": "PY same quarter",
+    }
+
+    print(f"\n--- {label} period classification ---")
+    for role, column in roles.items():
+        note = ""
+        if role == "prior_quarter" and target_quarter:
+            note = f" | target: {target_quarter}"
+        if role == "prior_year_same_qtr" and pyq_delta is not None:
+            note += f" | target: {target_pyq} | delta: {pyq_delta} days"
+            if used_fallback:
+                note += " | fallback used"
+        print(f"{role_labels.get(role, role)}: {column} [{dated[column]}]{note}")
+    print("------------------------------------\n")
+
+
+def classify_bs_periods(raw_columns: list[str]) -> dict[str, str]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
+
+    if not others:
+        raise ValueError("BS needs at least two date columns.")
+
+    prior_year_end = most_recent_fiscal_year_end(others, current_date)
+    if prior_year_end is None:
+        prior_year_end = closest_date(
+            date(current_date.year - 1, *FISCAL_YEAR_END),
+            others,
+        )
+
+    prior_quarter_target = subtract_months(current_date, 3)
+    prior_quarter = closest_date(prior_quarter_target, others)
+
+    pyq_target = subtract_months(current_date, 12)
+    best_pyq = closest_date(pyq_target, others)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+    prior_year_same_qtr = (
+        prior_year_end if pyq_delta > PY_MATCH_DAYS else best_pyq
+    )
+
+    roles = {
+        "current": current_column,
+        "prior_year_end": prior_year_end,
+        "prior_quarter": prior_quarter,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    log_classification(
+        "BS", roles, dated, prior_quarter_target,
+        pyq_target, pyq_delta, pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles
+
+
+def classify_is_periods(
+    raw_columns: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
+
+    if not others:
+        raise ValueError("IS needs at least two date columns.")
+
+    pyq_target = subtract_months(current_date, 12)
+    best_pyq = closest_date(pyq_target, others)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+
+    if pyq_delta <= PY_MATCH_DAYS:
+        prior_year_same_qtr = best_pyq
+    else:
+        prior_year_same_qtr = most_recent_fiscal_year_end(
+            others, current_date
+        ) or closest_date(date(current_date.year - 1, *FISCAL_YEAR_END), others)
+
+    roles = {
+        "current": current_column,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    discarded = [column for column in others if column != prior_year_same_qtr]
+    log_classification(
+        "IS", roles, dated, target_pyq=pyq_target,
+        pyq_delta=pyq_delta, used_fallback=pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles, discarded
+
+
+def classify_is_qtd_periods(
+    raw_columns: list[str],
+) -> tuple[dict[str, str], list[str]]:
+    dated = {column: parse_date(column) for column in raw_columns}
+    current_column = max(dated, key=dated.get)
+    current_date = dated[current_column]
+    others = {c: d for c, d in dated.items() if c != current_column}
+
+    if len(others) < 2:
+        raise ValueError("IS QTD needs at least three date columns.")
+
+    prior_quarter_target = subtract_months(current_date, 3)
+    prior_quarter = closest_date(prior_quarter_target, others)
+
+    pyq_target = subtract_months(current_date, 12)
+    pyq_pool = {c: d for c, d in others.items() if c != prior_quarter}
+    pyq_pool = pyq_pool or others
+
+    best_pyq = closest_date(pyq_target, pyq_pool)
+    pyq_delta = abs((dated[best_pyq] - pyq_target).days)
+
+    if pyq_delta <= PY_MATCH_DAYS:
+        prior_year_same_qtr = best_pyq
+    else:
+        prior_year_same_qtr = (
+            most_recent_fiscal_year_end(pyq_pool, current_date)
+            or closest_date(date(current_date.year - 1, *FISCAL_YEAR_END), pyq_pool)
+        )
+
+    roles = {
+        "current": current_column,
+        "prior_quarter": prior_quarter,
+        "prior_year_same_qtr": prior_year_same_qtr,
+    }
+    discarded = [column for column in raw_columns if column not in roles.values()]
+    log_classification(
+        "IS QTD", roles, dated, prior_quarter_target,
+        pyq_target, pyq_delta, pyq_delta > PY_MATCH_DAYS,
+    )
+    return roles, discarded
+
+
 # ============================================================================
 # GROUPING FILE: ORDER + GROUP TOTAL ROWS
 # ============================================================================
@@ -226,15 +553,11 @@ import unicodedata
 _INVISIBLE = dict.fromkeys(map(ord, "\u200b\u200c\u200d\u2060\ufeff\u00ad"), None)
 
 
-def _norm_2(value: Any) -> str:
+def _norm(value: Any) -> str:
     """Match key: NFKC, drop invisibles, casefold, keep letters/digits only.
     'Common Stock' == 'Common  Stock' == 'Common-Stock' == 'Gains / Losses'."""
     text = unicodedata.normalize("NFKC", str(value)).translate(_INVISIBLE)
     return re.sub(r"[\W_]+", "", text.casefold())
-
-
-_norm = _norm_2  # apply_grouping uses the same key
-
 
 def adopt_orphans(grouping):
     """Subtotal that is nobody's child -> parent its neighbouring subtotals share.
@@ -242,16 +565,16 @@ def adopt_orphans(grouping):
     Earnings Before Taxes), so it joins Earnings Before Taxes."""
     out, parent = list(grouping), {}
     for t, g in grouping:
-        if t and _norm_2(g) != _norm_2(t):
-            parent.setdefault(_norm_2(g), t)
+        if t and _norm(g) != _norm(t):
+            parent.setdefault(_norm(g), t)
     runs = [t for t, _ in groupby(grouping, key=lambda x: x[0])]
     for i in range(1, len(runs) - 1):
         t = runs[i]
-        a = parent.get(_norm_2(runs[i - 1]))
-        if t and _norm_2(t) not in parent and a and a == parent.get(_norm_2(runs[i + 1])):
+        a = parent.get(_norm(runs[i - 1]))
+        if t and _norm(t) not in parent and a and a == parent.get(_norm(runs[i + 1])):
             last = max(k for k, (p, _) in enumerate(out) if p == a)
             out.insert(last + 1, (a, t))
-            parent[_norm_2(t)] = a
+            parent[_norm(t)] = a
             print(f"Adopted orphan total {t!r} -> {a!r}")
     return tuple(out)
 
@@ -304,16 +627,16 @@ def plan_rows(dataframe, first_row, grouping):
     Both parts are handled independently. Totals can nest to any depth."""
     idx: dict[str, list[int]] = {}
     for i, name in enumerate(dataframe[ACCOUNT_GROUP_COLUMN]):
-        idx.setdefault(_norm_2(name), []).append(i)
-    labels = {_norm_2(t) for t, _ in grouping if t}
+        idx.setdefault(_norm(name), []).append(i)
+    labels = {_norm(t) for t, _ in grouping if t}
 
     detail_rows = [0] * len(dataframe)
     placed, blocks, row = set(), [], first_row
 
     for total, items in groupby(grouping, key=lambda x: x[0]):
-        t_norm, own, kids = _norm_2(total), [], []
+        t_norm, own, kids = _norm(total), [], []
         for _, g in items:
-            n = _norm_2(g)
+            n = _norm(g)
             for i in idx.get(n, []):                     # 1) actual TB account
                 if i not in placed:
                     detail_rows[i] = row
@@ -331,12 +654,12 @@ def plan_rows(dataframe, first_row, grouping):
             detail_rows[i] = row
             row += 1
 
-    names = [_norm_2(label) for _, label, _, _ in blocks]
+    names = [_norm(label) for _, label, _, _ in blocks]
     repeated = sorted({n for n in names if names.count(n) > 1})
     if repeated:
         print(f"WARNING Grouping Total split into separate runs (keep rows together): {repeated}")
 
-    where = {_norm_2(label): r for r, label, _, _ in blocks}
+    where = {_norm(label): r for r, label, _, _ in blocks}
     unresolved = sorted({k for *_, kids in blocks for k in kids if k not in where})
     if unresolved:
         print(f"WARNING subtotal references with no rows (skipped in parent): {unresolved}")
@@ -386,8 +709,8 @@ def _selfcheck() -> None:
         assert totals == [(15, "X", [14]), (19, "P", [17, 18, 15])]
 
     # punctuation / spacing / case never break a match
-    assert _norm_2("Gains / Losses  / Impairments") == _norm_2("gains/losses/impairments")
-    assert _norm_2("Common Stock") == _norm_2("COMMON-STOCK")
+    assert _norm("Gains / Losses  / Impairments") == _norm("gains/losses/impairments")
+    assert _norm("Common Stock") == _norm("COMMON-STOCK")
 
     # orphan subtotal between two siblings is adopted by their parent
     g = adopt_orphans(
@@ -397,6 +720,197 @@ def _selfcheck() -> None:
     df = pd.DataFrame({ACCOUNT_GROUP_COLUMN: ["FX", "EQ", "G"]})
     _, totals, _ = plan_rows(df, 14, g)
     assert sorted([t for t in totals if t[1] == "EBT"][0][2]) == [15, 18, 21]
+
+
+def prepare_data(
+    config: SheetConfig,
+    sources: dict[str, Any],
+    grouping: tuple[tuple[str, str], ...],
+) -> tuple[pd.DataFrame, dict[str, str], dict[str, str], pd.DataFrame]:
+    df = convert_to_pandas(sources[config.source_key], config.source_key)
+
+    required_columns = [ACCOUNT_GROUP_COLUMN, *config.raw_amount_columns]
+    missing = [column for column in required_columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"[{config.sheet_id}] Missing columns: {missing}")
+
+    df[ACCOUNT_GROUP_COLUMN] = (
+        df[ACCOUNT_GROUP_COLUMN]
+        .fillna(UNMAPPED_ACCOUNT)
+        .astype(str)
+        .str.strip()
+        .replace("", UNMAPPED_ACCOUNT)
+    )
+
+    # Convert only the required summary columns to numbers.
+    for column in config.raw_amount_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    raw_df = df.copy()
+
+    if config.classifier == "bs":
+        raw_roles = classify_bs_periods(list(config.raw_amount_columns))
+        discarded = []
+    elif config.classifier == "is_qtd":
+        raw_roles, discarded = classify_is_qtd_periods(
+            list(config.raw_amount_columns)
+        )
+    else:
+        raw_roles, discarded = classify_is_periods(
+            list(config.raw_amount_columns)
+        )
+
+    used_columns = [
+        column for column in config.raw_amount_columns
+        if column not in discarded
+    ]
+
+    grouped = (
+        df.groupby(ACCOUNT_GROUP_COLUMN, sort=False, as_index=False)
+        [list(config.raw_amount_columns)]
+        .sum()
+    )
+    grouped = grouped.drop(columns=discarded, errors="ignore")
+
+    rename_map = {
+        column: f"{parse_date(column).month}/"
+        f"{parse_date(column).day}/"
+        f"{parse_date(column).year}"
+        for column in used_columns
+    }
+
+    grouped = grouped.rename(columns=rename_map)
+    grouped = apply_grouping(grouped, grouping)
+    display_roles = {
+        role: rename_map[column]
+        for role, column in raw_roles.items()
+        if column in rename_map
+    }
+
+    return grouped, display_roles, raw_roles, raw_df
+
+
+def active_blocks(
+    config: SheetConfig,
+    raw_roles: dict[str, str],
+) -> list[ComparisonBlock]:
+    result = []
+    for comparison in config.comparison_blocks:
+        if raw_roles.get(comparison.current_role) != raw_roles.get(
+            comparison.comparison_role
+        ):
+            result.append(comparison)
+        else:
+            print(
+                f"Skipping {comparison.current_role} vs "
+                f"{comparison.comparison_role}: both use "
+                f"{raw_roles.get(comparison.current_role)}."
+            )
+    return result
+
+
+# COMMAND ----------
+
+# DBTITLE 1,Excel Helper
+# ============================================================================
+# EXCEL WRITING HELPERS
+# ============================================================================
+
+def write_cell(
+    cell,
+    value: Any = None,
+    font=None,
+    fill=None,
+    border=None,
+    alignment=None,
+    number_format: str | None = None,
+) -> None:
+    cell.value = value
+    if font is not None:
+        cell.font = font
+    if fill is not None:
+        cell.fill = fill
+    if border is not None:
+        cell.border = border
+    if alignment is not None:
+        cell.alignment = alignment
+    if number_format is not None:
+        cell.number_format = number_format
+
+
+def put(
+    worksheet,
+    reference: str,
+    value: Any = None,
+    **style,
+) -> None:
+    write_cell(worksheet[reference], value, **style)
+
+
+def put_rc(
+    worksheet,
+    row: int,
+    column: int,
+    value: Any = None,
+    **style,
+) -> None:
+    write_cell(worksheet.cell(row=row, column=column), value, **style)
+
+
+def variance_formulas(
+    row: int,
+    config: SheetConfig,
+    comparisons: list[ComparisonBlock],
+) -> dict[str, str]:
+    current_column = config.role_to_excel_column["current"]
+    formulas = {}
+
+    for comparison in comparisons:
+        comparison_column = config.role_to_excel_column[
+            comparison.comparison_role
+        ]
+        dollar = comparison.dollar_column
+        percent = comparison.percent_column
+        flag = comparison.flag_column
+
+        formulas[f"{dollar}{row}"] = (
+            f"={current_column}{row}-{comparison_column}{row}"
+        )
+        formulas[f"{percent}{row}"] = (
+            f"=IFERROR({dollar}{row}/{comparison_column}{row},0)"
+        )
+        formulas[f"{flag}{row}"] = (
+            f'=IF(AND(ABS({dollar}{row})>{config.materiality_dollar_anchor},'
+            f'ABS({percent}{row})>{config.materiality_percent_anchor}),'
+            f'"{YES_VALUE}","{NO_VALUE}")'
+        )
+
+    return formulas
+
+
+def write_variance_cells(
+    worksheet,
+    formulas: dict[str, str],
+    comparisons: list[ComparisonBlock],
+    font,
+    border=None,
+) -> None:
+    percent_columns = {item.percent_column for item in comparisons}
+    flag_columns = {item.flag_column for item in comparisons}
+
+    for reference, formula in formulas.items():
+        column = re.sub(r"\d", "", reference)
+        put(
+            worksheet,
+            reference,
+            formula,
+            font=font,
+            border=border,
+            alignment=CENTER_ALIGN if column in flag_columns else RIGHT_ALIGN,
+            number_format=(
+                PERCENT_FORMAT if column in percent_columns else NUMBER_FORMAT
+            ),
+        )
 
 
 def apply_conditional_formatting(
@@ -719,6 +1233,442 @@ def write_summary_sheet(
 
     return total_row
 
+
+# ============================================================================
+# LEGAL-ENTITY DRILLDOWN
+# ============================================================================
+
+def entity_columns_for_date(columns: list[str], suffix: str) -> list[str]:
+    return [
+        column for column in columns
+        if str(column).endswith(f"_{suffix}")
+        and not str(column).startswith(ENTITY_SKIP_PREFIXES)
+    ]
+
+
+def strip_date_suffix(column: str, suffix: str) -> str:
+    return column[:-(len(suffix) + 1)].rstrip("_").strip()
+
+
+def identify_flagged_accounts(
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    role_a: str,
+    role_b: str,
+) -> list[str]:
+    current = pd.to_numeric(
+        dataframe[display_roles[role_a]], errors="coerce"
+    ).fillna(0)
+    comparison = pd.to_numeric(
+        dataframe[display_roles[role_b]], errors="coerce"
+    ).fillna(0)
+
+    dollar_change = current - comparison
+    percent_change = dollar_change.div(
+        comparison.replace(0, float("nan"))
+    ).fillna(0)
+
+    flagged = (
+        dollar_change.abs().gt(THRESHOLD_DOLLARS)
+        & percent_change.abs().gt(THRESHOLD_PERCENT)
+    )
+    return dataframe.loc[flagged, ACCOUNT_GROUP_COLUMN].tolist()
+
+
+def build_legal_entity_dataframe(
+    raw_df: pd.DataFrame,
+    flagged_accounts: list[str],
+    raw_current_column: str,
+    raw_comparison_column: str,
+) -> pd.DataFrame:
+    current_suffix = raw_current_column.split("_")[-1]
+    comparison_suffix = raw_comparison_column.split("_")[-1]
+
+    current_entity_columns = entity_columns_for_date(
+        list(raw_df.columns), current_suffix
+    )
+    comparison_entity_columns = entity_columns_for_date(
+        list(raw_df.columns), comparison_suffix
+    )
+
+    current_labels = {
+        strip_date_suffix(column, current_suffix): column
+        for column in current_entity_columns
+    }
+    comparison_labels = {
+        strip_date_suffix(column, comparison_suffix): column
+        for column in comparison_entity_columns
+    }
+
+    entity_labels = sorted(
+        set(current_labels) | set(comparison_labels),
+        key=str.lower,
+    )
+
+    filtered = raw_df[
+        raw_df[ACCOUNT_GROUP_COLUMN].isin(flagged_accounts)
+    ].copy()
+
+    all_entity_columns = current_entity_columns + comparison_entity_columns
+    for column in all_entity_columns:
+        if column in filtered.columns:
+            filtered[column] = pd.to_numeric(
+                filtered[column], errors="coerce"
+            ).fillna(0)
+
+    available_columns = [
+        column for column in all_entity_columns
+        if column in filtered.columns
+    ]
+
+    grouped = (
+        filtered.groupby(ACCOUNT_GROUP_COLUMN, sort=False)[available_columns]
+        .sum()
+    )
+
+    rows = []
+    for entity in entity_labels:
+        row = {"entity_label": entity}
+        has_value = False
+
+        for account in flagged_accounts:
+            if account not in grouped.index:
+                current_value = comparison_value = 0.0
+            else:
+                current_column = current_labels.get(entity)
+                comparison_column = comparison_labels.get(entity)
+                current_value = (
+                    float(grouped.loc[account, current_column])
+                    if current_column in grouped.columns else 0.0
+                )
+                comparison_value = (
+                    float(grouped.loc[account, comparison_column])
+                    if comparison_column in grouped.columns else 0.0
+                )
+
+            dollar_change = current_value - comparison_value
+            percent_change = (
+                dollar_change / comparison_value
+                if comparison_value != 0 else 0.0
+            )
+
+            row[f"{account}__current"] = current_value
+            row[f"{account}__comparison"] = comparison_value
+            row[f"{account}__dollar"] = dollar_change
+            row[f"{account}__percent"] = percent_change
+
+            has_value |= current_value != 0 or comparison_value != 0
+
+        if has_value:
+            rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def write_legal_entity_sheet(
+    workbook,
+    sheet_name: str,
+    config: SheetConfig,
+    role_a: str,
+    role_b: str,
+    display_roles: dict[str, str],
+    flagged_accounts: list[str],
+    legal_entity_df: pd.DataFrame,
+) -> None:
+    if sheet_name in workbook.sheetnames:
+        del workbook[sheet_name]
+
+    worksheet = workbook.create_sheet(title=sheet_name)
+    worksheet.sheet_view.showGridLines = False
+
+    if not flagged_accounts or legal_entity_df.empty:
+        put(
+            worksheet, "B1",
+            "No accounts exceeded materiality threshold for this comparison.",
+            font=BOLD_FONT,
+        )
+        return
+
+    date_a         = display_roles[role_a]
+    date_b         = display_roles[role_b]
+    account_count  = len(flagged_accounts)
+    data_count     = len(legal_entity_df)
+
+    # â”€â”€ Column widths â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    account_start_columns = []
+    cursor = LE_FIRST_DATA_COLUMN
+
+    for index in range(account_count):
+        account_start_columns.append(cursor)
+        for offset, width in enumerate((14, 14, 14, 11, 12, 28)):
+            worksheet.column_dimensions[
+                get_column_letter(cursor + offset)
+            ].width = width
+        cursor += LE_COLUMNS_PER_ACCOUNT
+
+        if index < account_count - 1:
+            worksheet.column_dimensions[
+                get_column_letter(cursor)
+            ].width = LE_SPACER_WIDTH
+            cursor += 1
+
+    last_column = cursor - 1
+    worksheet.column_dimensions["A"].width = 2
+    worksheet.column_dimensions["B"].width = 45
+
+    # â”€â”€ Title and threshold details â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    worksheet.merge_cells(
+        start_row=LE_TITLE_ROW, start_column=2,
+        end_row=LE_TITLE_ROW,   end_column=last_column,
+    )
+    put_rc(
+        worksheet, LE_TITLE_ROW, 2,
+        f"{config.title_label} â€” Legal Entity Drill-Down",
+        font=LE_TITLE_FONT, alignment=LEFT_WRAP,
+    )
+
+    worksheet.merge_cells(
+        start_row=LE_SUBTITLE_ROW, start_column=2,
+        end_row=LE_SUBTITLE_ROW,   end_column=last_column,
+    )
+    put_rc(
+        worksheet, LE_SUBTITLE_ROW, 2,
+        f"Comparison: {date_a} (Current) vs. {date_b} | "
+        f"Flagged accounts: {account_count} ",
+        font=NORMAL_FONT, alignment=LEFT_WRAP,
+    )
+
+    put_rc(worksheet, 4, 2, "Materiality:", font=BOLD_FONT)
+    put_rc(worksheet, 4, 3, MATERIALITY,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=NUMBER_FORMAT)
+    put_rc(worksheet, 4, 4, "Threshold ($):", font=BOLD_FONT)
+    put_rc(worksheet, 4, 5, THRESHOLD_DOLLARS,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=NUMBER_FORMAT)
+    put_rc(worksheet, 4, 6, "Threshold (%):", font=BOLD_FONT)
+    put_rc(worksheet, 4, 7, THRESHOLD_PERCENT,
+           font=RED_BOLD_VALUE_FONT, fill=RED_HIGHLIGHT_FILL,
+           number_format=PERCENT_FORMAT)
+    put_rc(
+        worksheet, LE_FLAG_COUNT_ROW, 2,
+        f"Accounts exceeding threshold: {account_count}",
+        font=BOLD_FONT, alignment=LEFT_WRAP,
+    )
+
+    # â”€â”€ Header rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    worksheet.merge_cells(
+        start_row=LE_ACCOUNT_HEADER_ROW, start_column=2,
+        end_row=LE_SUB_HEADER_ROW,       end_column=2,
+    )
+    put_rc(
+        worksheet, LE_ACCOUNT_HEADER_ROW, 2,
+        "Legal Entity", font=HEADER_FONT, fill=HEADER_FILL,
+        border=THIN_BORDER, alignment=CENTER_WRAP,
+    )
+
+    for index, account in enumerate(flagged_accounts):
+        start_column = account_start_columns[index]
+        end_column   = start_column + LE_COLUMNS_PER_ACCOUNT - 1
+
+        worksheet.merge_cells(
+            start_row=LE_ACCOUNT_HEADER_ROW, start_column=start_column,
+            end_row=LE_ACCOUNT_HEADER_ROW,   end_column=end_column,
+        )
+        put_rc(
+            worksheet, LE_ACCOUNT_HEADER_ROW, start_column,
+            account, font=HEADER_FONT, fill=LE_ACCOUNT_FILL,
+            border=THIN_BORDER, alignment=CENTER_WRAP,
+        )
+        for col in range(start_column + 1, end_column + 1):
+            worksheet.cell(
+                row=LE_ACCOUNT_HEADER_ROW, column=col
+            ).fill   = LE_ACCOUNT_FILL
+            worksheet.cell(
+                row=LE_ACCOUNT_HEADER_ROW, column=col
+            ).border = THIN_BORDER
+
+        headers = (
+            date_a, date_b, "$ Change", "% Change",
+            "Investigate", "Legal Entities\nFlagged (Yes)",
+        )
+        for offset, header in enumerate(headers):
+            put_rc(
+                worksheet, LE_SUB_HEADER_ROW, start_column + offset,
+                header, font=HEADER_FONT, fill=HEADER_FILL,
+                border=THIN_BORDER, alignment=CENTER_WRAP,
+            )
+    le_yes_header_fill = PatternFill(fill_type="solid", fgColor="92D050")
+    for start_column in account_start_columns:
+        worksheet.cell(
+            row=LE_SUB_HEADER_ROW, column=start_column + 5
+        ).fill = le_yes_header_fill
+    # â”€â”€ Data rows â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    total_row = LE_DATA_START_ROW + data_count
+
+    for row_offset, (_, source_row) in enumerate(
+        legal_entity_df.iterrows(), LE_DATA_START_ROW
+    ):
+        put_rc(
+            worksheet, row_offset, 2, source_row["entity_label"],
+            font=NORMAL_FONT, border=THIN_BORDER, alignment=LEFT_WRAP,
+        )
+
+        for index, account in enumerate(flagged_accounts):
+            start_column = account_start_columns[index]
+
+            current    = source_row[f"{account}__current"]
+            comparison = source_row[f"{account}__comparison"]
+            dollar     = source_row[f"{account}__dollar"]
+            percent    = source_row[f"{account}__percent"]
+
+            for offset, (value, number_format) in enumerate(zip(
+                (current, comparison, dollar, percent),
+                (NUMBER_FORMAT, NUMBER_FORMAT, NUMBER_FORMAT, PERCENT_FORMAT),
+            )):
+                put_rc(
+                    worksheet, row_offset, start_column + offset,
+                    value, font=NORMAL_FONT, border=THIN_BORDER,
+                    alignment=RIGHT_ALIGN, number_format=number_format,
+                )
+
+            dollar_ref  = f"{get_column_letter(start_column + 2)}{row_offset}"
+            percent_ref = f"{get_column_letter(start_column + 3)}{row_offset}"
+            put_rc(
+                worksheet, row_offset, start_column + 4,
+                f'=IF(AND(ABS({dollar_ref})>{LE_DOLLAR_THRESHOLD_CELL},'
+                f'ABS({percent_ref})>{LE_PERCENT_THRESHOLD_CELL}),'
+                f'"{YES_VALUE}","{NO_VALUE}")',
+                font=NORMAL_FONT, border=THIN_BORDER, alignment=CENTER_ALIGN,
+            )
+
+            put_rc(
+                worksheet, row_offset, start_column + 5,
+                None, font=NORMAL_FONT, border=THIN_BORDER,
+                alignment=LEFT_WRAP,
+            )
+
+    # â”€â”€ Yes-list merged cells â€” one per account block â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    for index, account in enumerate(flagged_accounts):
+        start_column   = account_start_columns[index]
+        yes_col        = start_column + 5
+        inv_col_letter = get_column_letter(start_column + 4)
+        yes_col_letter = get_column_letter(yes_col)
+        merge_top      = LE_DATA_START_ROW
+        merge_bottom   = total_row - 1
+
+        # Style first so the border spreads over the merge.
+        top_left = worksheet.cell(row=merge_top, column=yes_col)
+        top_left.value = ArrayFormula(
+            f"{yes_col_letter}{merge_top}",
+            f'=IFERROR(_xlfn.TEXTJOIN(CHAR(10), TRUE, '
+            f'IF({inv_col_letter}{merge_top}:{inv_col_letter}{merge_bottom}'
+            f'="{YES_VALUE}", '
+            f'$B${merge_top}:$B${merge_bottom}, "")), "â€”")',
+        )
+        top_left.font      = NORMAL_FONT
+        top_left.border    = THIN_BORDER
+        top_left.alignment = Alignment(
+            wrap_text=True, vertical="top", horizontal="left"
+        )
+        worksheet.merge_cells(
+            start_row=merge_top,  start_column=yes_col,
+            end_row=merge_bottom, end_column=yes_col,
+        )
+
+    # â”€â”€ Total row â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    put_rc(
+        worksheet, total_row, 2, TOTAL_LABEL,
+        font=BOLD_FONT, border=TOTAL_BORDER, alignment=LEFT_WRAP,
+    )
+
+    for index in range(account_count):
+        start_column = account_start_columns[index]
+        for offset in range(LE_COLUMNS_PER_ACCOUNT):
+            col = get_column_letter(start_column + offset)
+            if offset in (4, 5):          # Investigate + Yes-list: no total
+                value = number_format = None
+            elif offset == 3:             # % = total $ change / total comparison
+                dollar_col     = get_column_letter(start_column + 2)
+                comparison_col = get_column_letter(start_column + 1)
+                value = (
+                    f"=IFERROR({dollar_col}{total_row}"
+                    f"/{comparison_col}{total_row},0)"
+                )
+                number_format = PERCENT_FORMAT
+            else:
+                value = (
+                    f"=SUM({col}{LE_DATA_START_ROW}:{col}{total_row - 1})"
+                )
+                number_format = NUMBER_FORMAT
+            put_rc(
+                worksheet, total_row, start_column + offset,
+                value, font=BOLD_FONT, border=TOTAL_BORDER,
+                alignment=RIGHT_ALIGN, number_format=number_format,
+            )
+
+    # â”€â”€ Conditional formatting â€” highlight Investigate = Yes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    worksheet.conditional_formatting._cf_rules = {}
+    for start_column in account_start_columns:
+        inv_col = get_column_letter(start_column + 4)
+        for row in range(LE_DATA_START_ROW, total_row):
+            ref  = f"{inv_col}{row}"
+            rule = FormulaRule(
+                formula=[f'{absolute_coordinate(ref)}="{YES_VALUE}"'],
+                stopIfTrue=True,
+            )
+            rule.dxf      = YES_FILL
+            rule.priority = 1
+            worksheet.conditional_formatting.add(ref, rule)
+
+
+def render_legal_entity_sheets(
+    workbook,
+    config: SheetConfig,
+    dataframe: pd.DataFrame,
+    display_roles: dict[str, str],
+    raw_roles: dict[str, str],
+    raw_df: pd.DataFrame,
+    comparisons: list[ComparisonBlock],
+) -> None:
+    for comparison in comparisons:
+        sheet_name = config.legal_entity_sheet_names.get(
+            (comparison.current_role, comparison.comparison_role)
+        )
+        if not sheet_name:
+            continue
+
+        flagged_accounts = identify_flagged_accounts(
+            dataframe,
+            display_roles,
+            comparison.current_role,
+            comparison.comparison_role,
+        )
+
+        if flagged_accounts:
+            legal_entity_df = build_legal_entity_dataframe(
+                raw_df,
+                flagged_accounts,
+                raw_roles[comparison.current_role],
+                raw_roles[comparison.comparison_role],
+            )
+        else:
+            legal_entity_df = pd.DataFrame()
+
+        write_legal_entity_sheet(
+            workbook,
+            sheet_name,
+            config,
+            comparison.current_role,
+            comparison.comparison_role,
+            display_roles,
+            flagged_accounts,
+            legal_entity_df,
+        )
+
+# COMMAND ----------
+
+# DBTITLE 1,Output Creation
 # ============================================================================
 # WORKBOOK ORCHESTRATION
 # ============================================================================
@@ -731,15 +1681,6 @@ def save_template(workbook, path: str | Path) -> None:
     cp.openpyxl.write(workbook, str(path), register=True)
 
 
-def merge_is_sheets(workbook) -> None:
-    """Template has separate QTD / YTD IS sheets. Keep one."""
-    old_qtd, old_ytd = "2) Income Statement QTD", "3) Income Statement YTD"
-    if IS_SHEET not in workbook.sheetnames and old_qtd in workbook.sheetnames:
-        workbook[old_qtd].title = IS_SHEET
-    if old_ytd in workbook.sheetnames:
-        del workbook[old_ytd]
-
-
 def run(
     template_path: str | Path,
     output_directory: str | Path,
@@ -749,7 +1690,6 @@ def run(
     _selfcheck()
     configs = build_sheet_configs()
     workbook = load_template(template_path)
-    merge_is_sheets(workbook)
 
     missing_sheets = [
         config.output_sheet
@@ -762,7 +1702,6 @@ def run(
         )
 
     summaries = []
-    end_rows: dict[str, int] = {}   # sheet -> last total row written (for stacking)
 
     for config in configs:
         print(f"\nPreparing {config.sheet_id}...")
@@ -780,15 +1719,13 @@ def run(
             else list(config.comparison_blocks)
         )
 
-        end_rows[config.output_sheet] = write_summary_sheet(
+        write_summary_sheet(
             workbook[config.output_sheet],
             config,
             dataframe,
             display_roles,
             comparisons,
             grouping,
-            below=end_rows.get(config.output_sheet),
-            banner=SECTION_BANNERS.get(config.sheet_id),
         )
 
         render_legal_entity_sheets(
@@ -855,3 +1792,209 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+# COMMAND ----------
+
+# Code Generated by Sidekick is for learning and experimentation purposes only.
+# filename: tb-validation-raw-to-final.py
+
+# ============ VALIDATION: RAW -> FINAL PARQUET ============
+from functools import reduce
+from pathlib import Path
+import numpy as np, pandas as pd
+from pyspark.sql import Window, functions as F
+from pyod.fs import read, read_excel, write_excel
+
+# ---------- CONFIG ----------
+TOL        = 0.01
+VALID_XLSX = f"{OUTPUT_DIRECTORY}/TB_Validation.xlsx"
+BS_SHEET   = "Balance Sheet TB Links"
+QTD_SHEETS = ("Income Statement TB Links",)
+LINK_SHEETS = ["Balance Sheet TB Links", "Income Statement TB Links"]
+META = {"Account", "Linked TB Account #", "__sheet__", "row_id"}
+
+SRC = {
+    "03312026": dict(path=excel_path_03312026, sheets=LINK_SHEETS, header=1, cols=Columns_03312026, kind="links"),
+    "12312025": dict(path=excel_path_12312025, sheets=LINK_SHEETS, header=1, cols=Columns_12312025, kind="links"),
+    "06302025": dict(path=excel_path_06302025, sheets=LINK_SHEETS, header=1, cols=Columns_06302025, kind="links"),
+    "09302025": dict(path="User Imported Data/EFT_UP/FY27/Broadridge_-_Risk_Assessment/"
+                          "Broadridge_-_Risk_Assessment.zip/TB_09_30_FY26.xlsx",
+                     sheets=["3) 9.30.2025"], header=8, cols=Columns_09302025_QTD, kind="plain", key="BALANCE SHEET"),
+    "03312025": dict(path=excel_path_03312025_2, sheets=["Sheet2"], header=0,
+                     cols=Columns_03312025_QTD, kind="plain", key="Account"),
+}
+YTD_LABELS = ["03312026", "12312025", "06302025"]
+QTD_PAIRS  = {"03312026": "12312025", "12312025": "09302025", "06302025": "03312025"}   # CY: PY
+QTD_FILES  = {"03312026": QTD_SHEETS, "12312025": QTD_SHEETS, "06302025": QTD_SHEETS,
+              "09302025": None, "03312025": None}
+
+FIN = {k: read(Path(OUTPUT_DIRECTORY) / f"{v}.parquet")
+       for k, v in {"BS": "TB_Final_BS", "IS": "TB_Final_IS_YTD", "QTD": "TB_Final_QTD"}.items()}
+
+# ---------- HELPERS ----------
+def bt(c): return F.col("`" + c.replace("`", "``") + "`")
+
+_cache = {}
+def prep(label, sheets=None):
+    """Raw Excel -> slim df: __A account, __G group, __S sheet, __V row net,
+    __ok has acct#, __GV group non-blank, __R raw row order.
+    Also returns unlisted non-zero numeric cols."""
+    k = (label, sheets)
+    if k in _cache: return _cache[k]
+    s = SRC[label]
+    raw = (read_excel(s["path"], sheet_name=list(sheets or s["sheets"]), header=s["header"],
+                      naming_convention="neutral", trim=True)
+           .withColumn("row_id", F.monotonically_increasing_id()))
+    net = reduce(lambda a, b: a + b, [F.coalesce(bt(c).cast("double"), F.lit(0.0)) for c in s["cols"]])
+
+    if s["kind"] == "links":
+        w, acct = Window.orderBy("row_id").rowsBetween(Window.unboundedPreceding, 0), F.col("Linked TB Account #")
+        d = (raw.withColumn("__ok", acct.isNotNull() & (acct != ""))
+                .withColumn("__A", F.upper(F.concat_ws(": ", F.split(acct, r"\.").getItem(0), F.col("Account"))))
+                .withColumn("__G", F.last(F.when(~F.col("__ok"), F.col("Account")), ignorenulls=True).over(w))
+                .withColumn("__S", F.when(F.col("__sheet__") == BS_SHEET, "BS").otherwise("IS")))
+    else:
+        d = (raw.withColumn("__ok", F.lit(True)).withColumn("__A", F.upper(bt(s["key"])))
+                .withColumn("__G", F.lit("-")).withColumn("__S", F.lit("IS")))
+
+    d = (d.withColumn("__GV", F.col("__G").isNotNull() & (F.trim(F.col("__G")) != ""))
+          .withColumn("__V", net)
+          .withColumn("__R", F.col("row_id")))
+
+    extra = [c for c in raw.columns if c not in s["cols"] and c not in META and c != s.get("key")]
+    ex = {}
+    if extra:
+        r = d.filter("__ok").agg(*[F.expr("sum(try_cast(`%s` as double))" % c.replace("`", "``")).alias(f"c{i}")
+                                   for i, c in enumerate(extra)]).first()
+        ex = {c: r[i] for i, c in enumerate(extra) if r[i]}
+    _cache[k] = (d.select("__A", "__G", "__S", "__V", "__ok", "__GV", "__R"), ex)
+    return _cache[k]
+
+def fin_sum(key, lab):
+    """Final parquet -> (Total Amount, sum of entity cols) for period lab."""
+    df, tc = FIN[key], f"Total Amount_{lab}"
+    ent = [c for c in df.columns if c.endswith(f"_{lab}") and not c.startswith(("Total Amount_", "row_count_"))]
+    r = df.agg(F.sum(bt(tc)), *[F.sum(bt(c)) for c in ent]).first()
+    return float(r[0] or 0.0), float(sum(x or 0.0 for x in r[1:]))
+
+def recon(label, sheets=None):
+    """Raw -> NoAcct -> NoGroup -> Included. Rows + amount per sheet. Diff must be 0.
+    Excluded tab is expected to hold NoAcct + NoGroup rows (zero / blank rows included)."""
+    d, _ = prep(label, sheets)
+    ok, gv, v = F.col("__ok"), F.col("__GV"), F.col("__V")
+    buckets = {"Raw": F.lit(True), "NoAcct": ~ok, "NoGroup": ok & ~gv, "Included": ok & gv,
+               "Excl_Zero": ~(ok & gv) & (v == 0)}            # informational: zero/blank rows inside Excluded
+    aggs = []
+    for k, c in buckets.items():
+        aggs += [F.sum(F.when(c, 1).otherwise(0)).alias(f"{k}_Rows"),
+                 F.sum(F.when(c, v).otherwise(0.0)).alias(f"{k}_Amt")]
+    p = d.groupBy("__S").agg(*aggs).toPandas().rename(columns={"__S": "Sheet"})
+    p.insert(0, "File", label)
+    p["Diff_Rows"] = p.Raw_Rows - p.NoAcct_Rows - p.NoGroup_Rows - p.Included_Rows
+    p["Diff_Amt"]  = (p.Raw_Amt - p.NoAcct_Amt - p.NoGroup_Amt - p.Included_Amt).round(2)
+    p["Excl_Expected_Rows"] = p.NoAcct_Rows + p.NoGroup_Rows
+    p["Excl_NonZero_Rows"]  = p.Excl_Expected_Rows - p.Excl_Zero_Rows
+    return p.drop(columns=["Excl_Zero_Amt"])                   # zero rows sum to 0 by definition
+
+def excluded(label, sheets=None):
+    """Every row that did not land in Included, including blank / zero-value rows."""
+    d, _ = prep(label, sheets)
+    seq      = F.row_number().over(Window.partitionBy("__S").orderBy("__R"))   # position within raw sheet
+    reason   = F.when(~F.col("__ok"), "No Account #").otherwise("No Group")
+    row_type = F.when(F.col("__V") == 0, "Zero / Blank").otherwise("Non-zero")
+    return (d.withColumn("__N", seq)
+             .filter(~(F.col("__ok") & F.col("__GV")))
+             .orderBy("__S", "__N")
+             .select(F.lit(label).alias("File"), F.col("__S").alias("Sheet"),
+                     F.col("__A").alias("Account"), F.col("__G").alias("Group"),
+                     reason.alias("Reason"), row_type.alias("Row_Type"),
+                     F.col("__V").alias("Amount"), F.col("__N").alias("Raw_Row_Seq"))
+             .toPandas())
+
+def add_excl_check(summary, excl):
+    """Attach actual Excluded-tab row count / amount and compare to the recon expectation."""
+    g = (excl.groupby(["File", "Sheet"])
+             .agg(Excluded_Sheet_Rows=("Amount", "size"), Excluded_Sheet_Amt=("Amount", "sum"))
+             .reset_index())
+    out = summary.merge(g, on=["File", "Sheet"], how="left")
+    out["Excluded_Sheet_Rows"] = out.Excluded_Sheet_Rows.fillna(0).astype(int)
+    out["Excluded_Sheet_Amt"]  = out.Excluded_Sheet_Amt.fillna(0.0)
+    out["Excl_Count_Diff"] = out.Excluded_Sheet_Rows - out.Excl_Expected_Rows                     # must be 0
+    out["Excl_Amt_Diff"]   = (out.Excluded_Sheet_Amt - (out.NoAcct_Amt + out.NoGroup_Amt)).round(2)  # must be 0
+    return out
+
+def ssum(df, col): return float(df.agg(F.coalesce(F.sum(col), F.lit(0.0))).first()[0])
+
+# =====================================================================
+# PART 1: YTD  (raw -> included -> final BS / IS parquet)
+# =====================================================================
+ytd_excl = pd.concat([excluded(l) for l in YTD_LABELS], ignore_index=True)
+
+ytd = pd.concat([recon(l) for l in YTD_LABELS], ignore_index=True)
+fs = [fin_sum(r.Sheet, r.File) for r in ytd.itertuples()]
+ytd["Final_Amt"]            = [x[0] for x in fs]
+ytd["Final_minus_Included"] = (ytd.Final_Amt - ytd.Included_Amt).round(2)
+ytd["Entity_minus_Total"]   = [round(x[1] - x[0], 2) for x in fs]
+ytd = add_excl_check(ytd, ytd_excl)
+ytd["Status"] = np.where((ytd.Diff_Rows == 0) & (ytd.Diff_Amt.abs() <= TOL)
+                         & (ytd.Final_minus_Included.abs() <= TOL) & (ytd.Entity_minus_Total.abs() <= TOL)
+                         & (ytd.Excl_Count_Diff == 0) & (ytd.Excl_Amt_Diff.abs() <= TOL),
+                         "PASS", "FAIL")
+
+# =====================================================================
+# PART 2: QTD
+#   2a raw -> included for every raw file QTD touches
+#   2b (CY included - matched PY) vs final QTD parquet
+# =====================================================================
+qtd_excl  = pd.concat([excluded(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+
+qtd_files = pd.concat([recon(l, s) for l, s in QTD_FILES.items()], ignore_index=True)
+qtd_files = add_excl_check(qtd_files, qtd_excl)
+qtd_files["Status"] = np.where((qtd_files.Diff_Rows == 0) & (qtd_files.Diff_Amt.abs() <= TOL)
+                               & (qtd_files.Excl_Count_Diff == 0) & (qtd_files.Excl_Amt_Diff.abs() <= TOL),
+                               "PASS", "FAIL")
+
+rows = []
+for cur, pri in QTD_PAIRS.items():
+    c, _ = prep(cur, QTD_SHEETS)
+    p, _ = prep(pri, QTD_SHEETS if SRC[pri]["kind"] == "links" else None)
+    cy   = c.filter(F.col("__ok") & F.col("__GV"))
+    pa   = p.filter("__ok").groupBy("__A").agg(F.sum("__V").alias("d"))
+    unm  = pa.join(c.filter("__ok").select("__A").distinct(), "__A", "left_anti")      # PY acct not in CY
+    dup  = cy.groupBy("__A").agg(F.countDistinct("__G").alias("g")).filter("g > 1").count()
+    cy_amt  = ssum(cy, "__V")
+    matched = ssum(pa.join(cy.select("__A").distinct(), "__A", "left_semi"), "d")
+    ft, fe  = fin_sum("QTD", cur)
+    rows.append({"CY": cur, "PY": pri, "CY_Included": cy_amt, "PY_Matched": matched,
+                 "Expected": cy_amt - matched, "Final": ft,
+                 "Final_minus_Expected": round(ft - (cy_amt - matched), 2),
+                 "Entity_minus_Total": round(fe - ft, 2),
+                 "PY_Unmatched_Keys": unm.count(), "PY_Unmatched_Amt": ssum(unm, "d"),
+                 "CY_Dup_Accts": dup})
+qtd_tie = pd.DataFrame(rows)
+qtd_tie["Status"] = np.where((qtd_tie.Final_minus_Expected.abs() <= TOL) & (qtd_tie.Entity_minus_Total.abs() <= TOL)
+                             & (qtd_tie.CY_Dup_Accts == 0), "PASS", "FAIL")
+
+# =====================================================================
+# UNLISTED COLUMNS (numeric cols in raw, not in entity list)
+# =====================================================================
+unl = pd.DataFrame([{"File": l, "Sheets": str(s) if s else "default", "Unlisted_Cols": len(ex),
+                     "Unlisted_Total": sum(ex.values()), "Names": ", ".join(ex)[:500]}
+                    for l, s in {**{x: None for x in YTD_LABELS}, **QTD_FILES}.items()
+                    for ex in [prep(l, s)[1]]])
+unl["Status"] = np.where(unl.Unlisted_Cols > 0, "WARN", "PASS")
+
+# =====================================================================
+# OUTPUT
+# =====================================================================
+write_excel(data={"P1_YTD": ytd, "P1_YTD_Excluded": ytd_excl,
+                  "P2a_QTD_Files": qtd_files, "P2b_QTD_TieOut": qtd_tie, "P2_QTD_Excluded": qtd_excl,
+                  "Unlisted_Cols": unl}, path=VALID_XLSX)
+
+for name, t in [("P1 YTD", ytd), ("P2a QTD raw files", qtd_files), ("P2b QTD tie-out", qtd_tie), ("Unlisted", unl)]:
+    print(f"{name}: {t.Status.value_counts().to_dict()}")
+    display(spark.createDataFrame(t.astype(str)))
+
+
+# COMMAND ----------
+
